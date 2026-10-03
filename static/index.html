@@ -1,0 +1,92 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta
+      name="description"
+      content="Manage vehicles, drivers, assignments, trips, fuel, and maintenance."
+    />
+    <title>Good Luck Forwarding Systems Inc. Fleet Management System</title>
+    <script src="/static/theme.js"></script>
+    <link rel="stylesheet" href="/static/style.css" />
+    <script src="/static/app.js" defer></script>
+  </head>
+  <body>
+    <div class="app-shell">
+      <aside class="sidebar" id="sidebar">
+        <a class="brand" href="#dashboard" aria-label="Fleet management home">
+          <span class="brand-mark" aria-hidden="true">GL</span>
+          <span class="brand-copy">
+            <strong>Good Luck Forwarding</strong>
+            <small>Systems Inc. · Fleet Management System</small>
+          </span>
+        </a>
+
+        <p class="nav-label">WORKSPACE</p>
+        <nav class="nav" aria-label="Main navigation">
+          <a class="nav-link" href="#dashboard" data-page="dashboard">
+            <span class="nav-icon" aria-hidden="true">▦</span>Dashboard
+          </a>
+          <a class="nav-link" href="#vehicles" data-page="vehicles">
+            <span class="nav-icon" aria-hidden="true">▰</span>Vehicles
+          </a>
+          <a class="nav-link" href="#drivers" data-page="drivers">
+            <span class="nav-icon" aria-hidden="true">♙</span>Drivers
+          </a>
+          <a class="nav-link" href="#assignments" data-page="assignments">
+            <span class="nav-icon" aria-hidden="true">⇄</span>Assignments
+          </a>
+          <a class="nav-link" href="#maintenance" data-page="maintenance">
+            <span class="nav-icon" aria-hidden="true">⚙</span>Maintenance
+          </a>
+          <a class="nav-link" href="#fuel" data-page="fuel">
+            <span class="nav-icon" aria-hidden="true">◉</span>Fuel logs
+          </a>
+          <a class="nav-link" href="#trips" data-page="trips">
+            <span class="nav-icon" aria-hidden="true">⌁</span>Trips
+          </a>
+        </nav>
+
+        <div class="sidebar-footer">
+          <span class="status-dot"></span>
+          <span>Fleet workspace</span>
+        </div>
+      </aside>
+
+      <div class="main-column">
+        <header class="topbar">
+          <button
+            class="icon-button menu-toggle"
+            id="menu-toggle"
+            type="button"
+            aria-label="Toggle navigation"
+            aria-expanded="false"
+          >☰</button>
+          <div class="topbar-spacer"></div>
+          <a class="button button-secondary button-small" href="/api/export">
+            <span aria-hidden="true">↓</span> Export report
+          </a>
+          <button class="button button-secondary button-small theme-toggle" id="theme-toggle" type="button">
+            <span class="theme-icon" aria-hidden="true">☾</span>
+            <span class="theme-label">Dark mode</span>
+          </button>
+          <span class="signed-in-user" id="signed-in-user" aria-live="polite"></span>
+          <button class="button button-secondary button-small" id="sign-out" type="button">Sign out</button>
+          <div class="avatar" aria-label="Fleet manager">FM</div>
+        </header>
+
+        <main class="main-content">
+          <div id="toast-region" class="toast-region" aria-live="polite"></div>
+          <section id="app-view" aria-live="polite" aria-busy="true">
+            <div class="loading-card">Loading fleet information…</div>
+          </section>
+        </main>
+        <footer class="footer">
+          <span>Good Luck Forwarding Systems Inc. · Fleet operations workspace</span>
+          <small class="watermark">Designed &amp; Developed By: Edwin Angelo Catequista <span aria-hidden="true">·</span> Powered By: GLFS Incorporated</small>
+        </footer>
+      </div>
+    </div>
+  </body>
+</html>
