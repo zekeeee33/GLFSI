@@ -7,10 +7,11 @@ import os
 import secrets
 from typing import Any
 
-from flask import Flask, g, jsonify, redirect, request, send_from_directory, session, url_for
+from flask import Flask, g, jsonify, redirect, request, send_file, send_from_directory, session, url_for
 from dotenv import dotenv_values
 from supabase import Client, create_client
 
+from excel_report import build_excel_report
 from fleet_management import (
     FleetManagementError,
     FleetManager,
@@ -464,10 +465,11 @@ def export_report() -> Any:
         "fuel_logs": fleet.list_fuel_logs(),
         "dashboard": fleet.dashboard(),
     }
-    return app.response_class(
-        json.dumps(report, indent=2),
-        mimetype="application/json",
-        headers={"Content-Disposition": "attachment; filename=fleet_report.json"},
+    return send_file(
+        build_excel_report(report),
+        mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        as_attachment=True,
+        download_name="fleet_system_report.xlsx",
     )
 
 

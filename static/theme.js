@@ -30,6 +30,7 @@
   document.addEventListener("DOMContentLoaded", () => {
     const button = document.querySelector("#theme-toggle");
     if (!button) return;
+    applyTheme(document.documentElement.dataset.theme);
     button.addEventListener("click", () => {
       const nextTheme = document.documentElement.dataset.theme === "dark" ? "light" : "dark";
       applyTheme(nextTheme);

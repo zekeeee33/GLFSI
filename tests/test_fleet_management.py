@@ -2,11 +2,13 @@ import json
 import os
 import tempfile
 import unittest
+from io import BytesIO
 from types import SimpleNamespace
 from unittest.mock import patch
 
 import app as web_app
 from fleet_management import FleetManagementError, FleetManager, _supabase_project_url
+from openpyxl import load_workbook
 
 
 class FakeAuthApiError(Exception):
@@ -95,7 +97,11 @@ class FakeQuery:
         if self.row_range is not None:
             start, end = self.row_range
             result = result[start : end + 1]
-        if self.columns not in ("*",) and "driver:" not in self.columns:
+        if (
+            self.columns not in ("*",)
+            and "driver:" not in self.columns
+            and "vehicle:" not in self.columns
+        ):
             selected = [column.strip() for column in self.columns.split(",")]
             result = [{key: row.get(key) for key in selected} for row in result]
         for row in result:
@@ -230,12 +236,58 @@ class FleetManagerTests(unittest.TestCase):
         self.manager.add_vehicle("ZZZ-001", "Ford", "Transit", 2023)
         self.manager.add_driver("Esther Kofi", "DL-4411")
         with tempfile.TemporaryDirectory() as temp_dir:
-            output_path = os.path.join(temp_dir, "report.json")
+            output_path = os.path.join(temp_dir, "report.xlsx")
             result = self.manager.export_report(output_path)
             self.assertTrue(os.path.exists(result["output_path"]))
             self.assertGreater(result["records_written"], 0)
-            with open(output_path, encoding="utf-8") as handle:
-                self.assertEqual(len(json.load(handle)["vehicles"]), 1)
+            workbook = load_workbook(output_path, data_only=True)
+            self.assertEqual(workbook["Vehicles"]["B5"].value, "ZZZ-001")
+
+    def test_web_export_returns_preformatted_system_wide_excel_workbook(self):
+        vehicle = self.manager.add_vehicle("XLS-001", "Toyota", "Hiace", 2024)
+        driver = self.manager.add_driver("Excel Driver", "XLS-DL-1")
+        self.manager.assign_vehicle(driver["id"], vehicle["id"])
+        self.manager.add_maintenance(
+            vehicle["id"], "Service", '=HYPERLINK("https://example.com","Open")', 1250.5
+        )
+        self.manager.add_fuel(vehicle["id"], "Diesel", 50, 60.25)
+        self.manager.add_trip(
+            vehicle["id"], driver["id"], "Manila to Cavite", 100, 150,
+            origin="Manila", destination="Cavite",
+        )
+        web_app.manager = self.manager
+        web_app.app.config["TESTING"] = True
+        client = web_app.app.test_client()
+        self.sign_in(client)
+
+        response = client.get("/api/export")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(
+            response.mimetype,
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )
+        self.assertIn("fleet_system_report.xlsx", response.headers["Content-Disposition"])
+        workbook = load_workbook(BytesIO(response.data), data_only=True)
+        self.assertEqual(
+            workbook.sheetnames,
+            ["Dashboard", "Vehicles", "Drivers", "Assignments", "Maintenance", "Fuel Logs", "Trips"],
+        )
+        vehicles = workbook["Vehicles"]
+        self.assertEqual(vehicles["B4"].value, "Plate Number")
+        self.assertEqual(vehicles["B5"].value, "XLS-001")
+        self.assertEqual(vehicles.freeze_panes, "A5")
+        self.assertEqual(vehicles.auto_filter.ref, "A4:K5")
+        self.assertEqual(workbook["Fuel Logs"]["G5"].value, 3012.5)
+        self.assertIn("₱", workbook["Fuel Logs"]["G5"].number_format)
+        self.assertEqual(workbook["Maintenance"]["E5"].data_type, "s")
+        self.assertEqual(workbook["Trips"]["G5"].value, "Manila")
+
+    def test_cli_export_report_defaults_to_excel_file(self):
+        from fleet_management import _build_cli
+
+        args = _build_cli().parse_args(["export-report"])
+        self.assertEqual(args.output, "fleet_system_report.xlsx")
 
     def test_missing_supabase_configuration_is_reported(self):
         with patch.dict(os.environ, {}, clear=True):

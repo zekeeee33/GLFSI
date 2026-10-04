@@ -30,6 +30,10 @@ APIs, and report exports reject unauthenticated requests. State-changing API
 requests also require a CSRF token. For an HTTPS deployment, set
 `COOKIE_SECURE=true`; leave it `false` for local HTTP development.
 
+The **Export Excel report** action downloads a pre-formatted `.xlsx` workbook
+with a dashboard summary and separate worksheets for vehicles, drivers,
+assignments, maintenance, fuel logs, and trips.
+
 ## Run the app
 
 ```powershell
@@ -49,7 +53,12 @@ The same Supabase project is used by the command-line interface:
 ```powershell
 python fleet_management.py dashboard
 python fleet_management.py add-vehicle --plate-number ABC-123 --make Toyota --model Hiace --year 2022
+python fleet_management.py export-report
 ```
+
+The CLI export writes the same pre-formatted Excel workbook as the web export
+to `fleet_system_report.xlsx` by default. Use `--output` to choose another file
+path (the file contents remain an Excel workbook).
 
 ## Data tables
 

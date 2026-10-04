@@ -472,6 +472,8 @@ class FleetManager:
         }
 
     def export_report(self, output_path: str) -> Dict[str, Any]:
+        from excel_report import build_excel_report
+
         data = {
             "vehicles": self.list_vehicles(),
             "drivers": self.list_drivers(),
@@ -481,8 +483,8 @@ class FleetManager:
             "fuel_logs": self.list_fuel_logs(),
             "dashboard": self.dashboard(),
         }
-        with open(output_path, "w", encoding="utf-8") as handle:
-            json.dump(data, handle, indent=2)
+        with open(output_path, "wb") as handle:
+            handle.write(build_excel_report(data).getvalue())
         return {
             "output_path": output_path,
             "records_written": sum(
@@ -555,8 +557,8 @@ def _build_cli() -> argparse.ArgumentParser:
     subparsers.add_parser("list-trips", help="List recorded trips")
     subparsers.add_parser("dashboard", help="Display fleet summary")
 
-    export = subparsers.add_parser("export-report", help="Export fleet data to JSON")
-    export.add_argument("--output", default="fleet_report.json")
+    export = subparsers.add_parser("export-report", help="Export fleet data to formatted Excel")
+    export.add_argument("--output", default="fleet_system_report.xlsx")
     return parser
 
 
