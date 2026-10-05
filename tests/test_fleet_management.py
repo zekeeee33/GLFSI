@@ -1,6 +1,7 @@
 import json
 import os
 import tempfile
+import time
 import unittest
 from decimal import Decimal
 from io import BytesIO
@@ -706,6 +707,14 @@ class FleetManagerTests(unittest.TestCase):
         )
         self.assertEqual(response.status_code, 200)
         self.assertIn("HttpOnly", response.headers.get("Set-Cookie", ""))
+        cookies = response.headers.getlist("Set-Cookie")
+        for name in ("glfs_access_token", "glfs_refresh_token"):
+            auth_cookie = next(cookie for cookie in cookies if cookie.startswith(f"{name}="))
+            self.assertNotIn("Max-Age=", auth_cookie)
+            self.assertNotIn("Expires=", auth_cookie)
+        with client.session_transaction() as browser_session:
+            self.assertFalse(browser_session.permanent)
+            self.assertIn("last_activity", browser_session)
         return response
 
     def test_app_and_api_require_authentication_but_login_assets_are_public(self):
@@ -809,6 +818,39 @@ class FleetManagerTests(unittest.TestCase):
         response = client.get("/api/auth/me")
         self.assertEqual(response.status_code, 200)
         self.assertIn("refreshed-access-token", response.headers.get("Set-Cookie", ""))
+
+    def test_idle_session_expires_after_three_minutes_and_clears_auth_cookies(self):
+        web_app.app.config["TESTING"] = True
+        client = web_app.app.test_client()
+        self.sign_in(client)
+        with client.session_transaction() as browser_session:
+            browser_session["last_activity"] = (
+                time.time() - web_app.SESSION_IDLE_TIMEOUT_SECONDS - 1
+            )
+
+        response = client.get("/api/bootstrap")
+
+        self.assertEqual(response.status_code, 401)
+        self.assertIn(b"inactivity", response.data)
+        self.assertTrue(any(
+            "glfs_refresh_token=;" in cookie
+            for cookie in response.headers.getlist("Set-Cookie")
+        ))
+
+    def test_expired_browser_redirect_forces_login_page(self):
+        web_app.app.config["TESTING"] = True
+        client = web_app.app.test_client()
+        self.sign_in(client)
+
+        response = client.get("/login?expired=1")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertIn(b"Welcome back", response.data)
+        self.assertTrue(any(
+            "glfs_access_token=;" in cookie
+            for cookie in response.headers.getlist("Set-Cookie")
+        ))
+        response.close()
 
 
 if __name__ == "__main__":

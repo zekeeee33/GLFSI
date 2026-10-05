@@ -25,10 +25,12 @@ by default, and remembers the selected theme in the browser.
    user's email/password account. Public sign-up is not enabled by this app.
 
 The web app requires Supabase email/password authentication. Its access and
-refresh tokens are stored in HttpOnly, SameSite cookies; protected pages, data
-APIs, and report exports reject unauthenticated requests. State-changing API
-requests also require a CSRF token. For an HTTPS deployment, set
-`COOKIE_SECURE=true`; leave it `false` for local HTTP development.
+refresh tokens are stored in HttpOnly, SameSite browser-session cookies;
+protected pages, data APIs, and report exports reject unauthenticated requests.
+Sessions expire after three minutes of inactivity, and the open page returns to
+sign-in when idle. State-changing API requests also require a CSRF token. For an
+HTTPS deployment, set `COOKIE_SECURE=true`; leave it `false` for local HTTP
+development.
 
 ## Deploy on Vercel
 

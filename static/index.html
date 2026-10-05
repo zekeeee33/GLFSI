@@ -14,7 +14,7 @@
   </head>
   <body>
     <div class="app-shell">
-      <aside class="sidebar" id="sidebar">
+      <aside class="sidebar" id="sidebar" aria-label="Main navigation">
         <a class="brand" href="#dashboard" aria-label="Fleet management home">
           <span class="brand-mark" aria-hidden="true">GL</span>
           <span class="brand-copy">
@@ -25,29 +25,29 @@
 
         <p class="nav-label">WORKSPACE</p>
         <nav class="nav" aria-label="Main navigation">
-          <a class="nav-link" href="#dashboard" data-page="dashboard">
-            <span class="nav-icon" aria-hidden="true">▦</span>Dashboard
+          <a class="nav-link" href="#dashboard" data-page="dashboard" aria-label="Dashboard" title="Dashboard">
+            <span class="nav-icon" aria-hidden="true">▦</span><span class="nav-link-label">Dashboard</span>
           </a>
-          <a class="nav-link" href="#vehicles" data-page="vehicles">
-            <span class="nav-icon" aria-hidden="true">▰</span>Vehicles
+          <a class="nav-link" href="#vehicles" data-page="vehicles" aria-label="Vehicles" title="Vehicles">
+            <span class="nav-icon" aria-hidden="true">▰</span><span class="nav-link-label">Vehicles</span>
           </a>
-          <a class="nav-link" href="#drivers" data-page="drivers">
-            <span class="nav-icon" aria-hidden="true">♙</span>Drivers
+          <a class="nav-link" href="#drivers" data-page="drivers" aria-label="Drivers" title="Drivers">
+            <span class="nav-icon" aria-hidden="true">♙</span><span class="nav-link-label">Drivers</span>
           </a>
-          <a class="nav-link" href="#assignments" data-page="assignments">
-            <span class="nav-icon" aria-hidden="true">⇄</span>Assignments
+          <a class="nav-link" href="#assignments" data-page="assignments" aria-label="Assignments" title="Assignments">
+            <span class="nav-icon" aria-hidden="true">⇄</span><span class="nav-link-label">Assignments</span>
           </a>
-          <a class="nav-link" href="#maintenance" data-page="maintenance">
-            <span class="nav-icon" aria-hidden="true">⚙</span>Maintenance
+          <a class="nav-link" href="#maintenance" data-page="maintenance" aria-label="Maintenance" title="Maintenance">
+            <span class="nav-icon" aria-hidden="true">⚙</span><span class="nav-link-label">Maintenance</span>
           </a>
-          <a class="nav-link" href="#fuel" data-page="fuel">
-            <span class="nav-icon" aria-hidden="true">◉</span>Fuel logs
+          <a class="nav-link" href="#fuel" data-page="fuel" aria-label="Fuel logs" title="Fuel logs">
+            <span class="nav-icon" aria-hidden="true">◉</span><span class="nav-link-label">Fuel logs</span>
           </a>
-          <a class="nav-link" href="#trips" data-page="trips">
-            <span class="nav-icon" aria-hidden="true">⌁</span>Trips
+          <a class="nav-link" href="#trips" data-page="trips" aria-label="Trips" title="Trips">
+            <span class="nav-icon" aria-hidden="true">⌁</span><span class="nav-link-label">Trips</span>
           </a>
-          <a class="nav-link" href="#payroll" data-page="payroll">
-            <span class="nav-icon" aria-hidden="true">₱</span>Payroll
+          <a class="nav-link" href="#payroll" data-page="payroll" aria-label="Payroll" title="Payroll">
+            <span class="nav-icon" aria-hidden="true">₱</span><span class="nav-link-label">Payroll</span>
           </a>
         </nav>
 
@@ -56,6 +56,13 @@
           <span>Fleet workspace</span>
         </div>
       </aside>
+      <button
+        class="sidebar-backdrop"
+        id="sidebar-backdrop"
+        type="button"
+        aria-label="Close navigation"
+        tabindex="-1"
+      ></button>
 
       <div class="main-column">
         <header class="topbar">
@@ -63,7 +70,8 @@
             class="icon-button menu-toggle"
             id="menu-toggle"
             type="button"
-            aria-label="Toggle navigation"
+            aria-label="Collapse navigation"
+            aria-controls="sidebar"
             aria-expanded="false"
           >☰</button>
           <div class="topbar-spacer"></div>

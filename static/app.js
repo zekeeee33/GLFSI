@@ -161,6 +161,8 @@ function isoDate(date) {
 }
 
 const today = new Date();
+const SESSION_IDLE_TIMEOUT_MS = 3 * 60 * 1000;
+const SESSION_ACTIVITY_PING_INTERVAL_MS = 30 * 1000;
 const state = {
   data: null,
   page: "dashboard",
@@ -176,6 +178,30 @@ const state = {
   payrollFilters: { driver_id: "", ism_no: "", origin: "", destination: "" },
 };
 const view = document.querySelector("#app-view");
+let idleLogoutTimer;
+let lastActivityPing = 0;
+
+function returnToSignIn() {
+  window.location.replace("/login?expired=1");
+}
+
+function registerSessionActivity() {
+  window.clearTimeout(idleLogoutTimer);
+  idleLogoutTimer = window.setTimeout(returnToSignIn, SESSION_IDLE_TIMEOUT_MS);
+
+  const now = Date.now();
+  if (now - lastActivityPing < SESSION_ACTIVITY_PING_INTERVAL_MS) return;
+  lastActivityPing = now;
+  fetch("/api/auth/me", { cache: "no-store" })
+    .then((response) => {
+      if (response.status === 401) returnToSignIn();
+    })
+    .catch(() => showToast("Could not verify the session. Check your connection.", "error"));
+}
+
+for (const eventName of ["pointerdown", "keydown", "scroll", "touchstart"]) {
+  window.addEventListener(eventName, registerSessionActivity, { passive: true });
+}
 
 function escapeHtml(value) {
   return String(value ?? "").replace(/[&<>"']/g, (character) => ({
@@ -245,6 +271,7 @@ async function loadData() {
     state.data = await api("/api/bootstrap");
     state.csrfToken = state.data.csrf_token || "";
     document.querySelector("#signed-in-user").textContent = state.data.user?.email || "";
+    registerSessionActivity();
     render();
   } catch (error) {
     view.innerHTML = `
@@ -893,18 +920,59 @@ view.addEventListener("change", (event) => {
   render();
 });
 
+const appShell = document.querySelector(".app-shell");
+const sidebar = document.querySelector("#sidebar");
+const menuToggle = document.querySelector("#menu-toggle");
+const sidebarBackdrop = document.querySelector("#sidebar-backdrop");
+const mobileNavigation = window.matchMedia("(max-width: 760px)");
+
+function setSidebarOpen(open) {
+  if (mobileNavigation.matches) {
+    sidebar.classList.toggle("sidebar-open", open);
+    sidebarBackdrop.classList.toggle("sidebar-backdrop-open", open);
+    menuToggle.setAttribute("aria-expanded", String(open));
+    menuToggle.setAttribute("aria-label", open ? "Close navigation" : "Open navigation");
+    if (open) sidebar.querySelector(".nav-link")?.focus();
+    return;
+  }
+
+  appShell.classList.toggle("sidebar-collapsed", !open);
+  menuToggle.setAttribute("aria-expanded", String(open));
+  menuToggle.setAttribute("aria-label", open ? "Collapse navigation" : "Expand navigation");
+}
+
+setSidebarOpen(!mobileNavigation.matches && !appShell.classList.contains("sidebar-collapsed"));
+
 document.querySelectorAll(".nav-link").forEach((link) => {
   link.addEventListener("click", () => {
     state.search = "";
-    document.querySelector("#sidebar").classList.remove("sidebar-open");
-    document.querySelector("#menu-toggle").setAttribute("aria-expanded", "false");
+    if (mobileNavigation.matches) setSidebarOpen(false);
   });
 });
 
-document.querySelector("#menu-toggle").addEventListener("click", (event) => {
-  const sidebar = document.querySelector("#sidebar");
-  const open = sidebar.classList.toggle("sidebar-open");
-  event.currentTarget.setAttribute("aria-expanded", String(open));
+menuToggle.addEventListener("click", () => {
+  if (mobileNavigation.matches) {
+    setSidebarOpen(!sidebar.classList.contains("sidebar-open"));
+  } else {
+    setSidebarOpen(appShell.classList.contains("sidebar-collapsed"));
+  }
+});
+
+sidebarBackdrop.addEventListener("click", () => setSidebarOpen(false));
+document.addEventListener("keydown", (event) => {
+  if (event.key === "Escape" && sidebar.classList.contains("sidebar-open")) {
+    setSidebarOpen(false);
+    menuToggle.focus();
+  }
+});
+mobileNavigation.addEventListener("change", () => {
+  sidebar.classList.remove("sidebar-open");
+  sidebarBackdrop.classList.remove("sidebar-backdrop-open");
+  menuToggle.setAttribute("aria-expanded", String(!appShell.classList.contains("sidebar-collapsed")));
+  menuToggle.setAttribute(
+    "aria-label",
+    appShell.classList.contains("sidebar-collapsed") ? "Expand navigation" : "Collapse navigation",
+  );
 });
 
 document.querySelector("#sign-out").addEventListener("click", async (event) => {
@@ -920,7 +988,7 @@ document.querySelector("#sign-out").addEventListener("click", async (event) => {
       const payload = await response.json().catch(() => ({}));
       throw new Error(payload.error || `Sign out failed (${response.status}).`);
     }
-    window.location.replace("/login");
+    returnToSignIn();
   } catch (error) {
     showToast(error.message, "error");
     button.disabled = false;

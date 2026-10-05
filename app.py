@@ -5,6 +5,8 @@ import hmac
 import logging
 import os
 import secrets
+import time
+from datetime import timedelta
 from typing import Any
 
 from flask import Flask, g, jsonify, redirect, request, send_file, send_from_directory, session, url_for
@@ -29,7 +31,8 @@ app.config["SESSION_COOKIE_SAMESITE"] = "Lax"
 app.config["SESSION_COOKIE_SECURE"] = os.environ.get("COOKIE_SECURE", "").strip().lower() in {
     "1", "true", "yes", "on",
 }
-app.config["PERMANENT_SESSION_LIFETIME"] = 60 * 60 * 24 * 14
+SESSION_IDLE_TIMEOUT_SECONDS = 3 * 60
+app.config["PERMANENT_SESSION_LIFETIME"] = timedelta(seconds=SESSION_IDLE_TIMEOUT_SECONDS)
 
 manager: FleetManager | None = None
 logger = logging.getLogger(__name__)
@@ -97,6 +100,24 @@ def enforce_authentication() -> Any:
     if request.endpoint == "auth_logout" and request.method == "POST":
         return None
 
+    protected_path = (
+        request.path in {"/", "/static/index.html"}
+        or request.path.startswith("/api/")
+    )
+    if (
+        protected_path
+        and not (app.testing and app.config.get("TEST_AUTH_BYPASS"))
+        and session.get("user_id")
+        and time.time() - session.get("last_activity", 0) >= SESSION_IDLE_TIMEOUT_SECONDS
+    ):
+        _clear_auth()
+        if request.path.startswith("/api/") and request.endpoint not in {
+            "auth_csrf", "auth_login", "auth_logout",
+        }:
+            return _json_error("Your session expired due to inactivity. Please sign in again.", 401)
+        if request.path in {"/", "/static/index.html"}:
+            return redirect(url_for("login_page"))
+
     if request.method in {"POST", "PUT", "PATCH", "DELETE"} and request.path.startswith("/api/"):
         expected = session.get("csrf_token", "")
         supplied = request.headers.get("X-CSRF-Token", "")
@@ -109,10 +130,6 @@ def enforce_authentication() -> Any:
     if request.endpoint in public_endpoints:
         return None
 
-    protected_path = (
-        request.path in {"/", "/static/index.html"}
-        or request.path.startswith("/api/")
-    )
     if not protected_path:
         return None
 
@@ -135,6 +152,7 @@ def enforce_authentication() -> Any:
             user_response = auth.get_user(access_token)
             user = getattr(user_response, "user", None)
             if user and str(getattr(user, "id", "")) == str(session.get("user_id")):
+                session["last_activity"] = time.time()
                 g.current_user = {
                     "id": str(user.id),
                     "email": getattr(user, "email", None) or session.get("email", ""),
@@ -150,6 +168,7 @@ def enforce_authentication() -> Any:
             user = getattr(refreshed, "user", None)
             if refreshed_session and user and str(getattr(user, "id", "")) == str(session.get("user_id")):
                 g.auth_tokens = refreshed_session
+                session["last_activity"] = time.time()
                 g.current_user = {
                     "id": str(user.id),
                     "email": getattr(user, "email", None) or session.get("email", ""),
@@ -180,7 +199,6 @@ def set_auth_cookies(response: Any) -> Any:
             response.set_cookie(
                 "glfs_access_token",
                 access_token,
-                max_age=getattr(auth_tokens, "expires_in", 3600),
                 httponly=True,
                 secure=secure,
                 samesite="Lax",
@@ -190,7 +208,6 @@ def set_auth_cookies(response: Any) -> Any:
             response.set_cookie(
                 "glfs_refresh_token",
                 refresh_token,
-                max_age=60 * 60 * 24 * 30,
                 httponly=True,
                 secure=secure,
                 samesite="Lax",
@@ -230,6 +247,9 @@ def index() -> Any:
 
 @app.route("/login")
 def login_page() -> Any:
+    if request.args.get("expired") == "1":
+        _clear_auth()
+        return send_from_directory(STATIC_DIR, "login.html")
     if session.get("user_id"):
         return redirect(url_for("index"))
     return send_from_directory(STATIC_DIR, "login.html")
@@ -270,10 +290,10 @@ def auth_login() -> Any:
         return _json_error("Supabase did not return a valid sign-in session.", 502)
 
     session.clear()
-    session.permanent = True
     session["user_id"] = str(user.id)
     session["email"] = getattr(user, "email", None) or email
     session["csrf_token"] = secrets.token_urlsafe(32)
+    session["last_activity"] = time.time()
     g.auth_tokens = auth_session
     return jsonify(
         {

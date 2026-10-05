@@ -8,12 +8,14 @@
   --login-muted: #73809a;
   --login-border: #e4e9f2;
   --login-input: #dfe5f0;
+  --ease-ui: cubic-bezier(.2, .75, .25, 1);
   font-family: "DM Sans", "Segoe UI", sans-serif;
   color: var(--login-ink);
   background: var(--login-canvas);
   font-synthesis: none;
   text-rendering: optimizeLegibility;
   -webkit-font-smoothing: antialiased;
+  scroll-behavior: smooth;
 }
 
 :root[data-theme="dark"] {
@@ -68,8 +70,9 @@ button:focus-visible, a:focus-visible, input:focus-visible { outline: 3px solid 
   cursor: pointer;
   font-size: 11px;
   font-weight: 600;
+  transition: background .18s ease, border-color .18s ease, color .18s ease, transform .2s var(--ease-ui);
 }
-.login-theme-toggle:hover { color: var(--login-ink); }
+.login-theme-toggle:hover { color: var(--login-ink); transform: translateY(-1px); }
 .login-theme-toggle .theme-icon { font-size: 14px; }
 .login-brand { display: flex; align-items: center; gap: 12px; color: inherit; text-decoration: none; }
 .login-brand-mark {
@@ -123,8 +126,10 @@ h1 { margin: 0; font-family: Manrope, "Segoe UI", sans-serif; font-size: 29px; f
   color: white;
   cursor: pointer;
   font-weight: 600;
+  transition: background .2s ease, box-shadow .2s ease, transform .2s var(--ease-ui);
 }
-.login-submit:hover:not(:disabled) { background: linear-gradient(135deg, #3157d3, #2549c5); }
+.login-submit:hover:not(:disabled) { background: linear-gradient(135deg, #3157d3, #2549c5); box-shadow: 0 7px 17px rgb(49 89 219 / 24%); transform: translateY(-1px); }
+.login-submit:active:not(:disabled) { transform: translateY(1px); }
 .login-submit:disabled { cursor: wait; opacity: .65; }
 .login-help { margin: 21px 0 0; color: var(--login-muted); font-size: 11px; text-align: center; }
 .login-footer { margin-top: 25px; color: var(--login-muted); font-size: 9px; text-align: center; }
@@ -143,4 +148,13 @@ h1 { margin: 0; font-family: Manrope, "Segoe UI", sans-serif; font-size: 29px; f
 @media (max-width: 480px) {
   .login-card { padding: 27px 22px; }
   .login-heading { margin-top: 31px; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    scroll-behavior: auto !important;
+    animation-duration: .01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: .01ms !important;
+  }
 }
