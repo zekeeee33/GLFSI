@@ -30,9 +30,61 @@ APIs, and report exports reject unauthenticated requests. State-changing API
 requests also require a CSRF token. For an HTTPS deployment, set
 `COOKIE_SECURE=true`; leave it `false` for local HTTP development.
 
+## Deploy on Vercel
+
+Vercel does not use your local `.env` file. In the Vercel project, open
+**Settings → Environment Variables** and add these server-side variables for
+every environment you deploy (Production, and Preview if applicable):
+
+- `SUPABASE_URL`: the project URL from Supabase **Settings → API**.
+- `SUPABASE_ANON_KEY`: the project's anon/publishable key, used for sign-in.
+- `SUPABASE_SERVICE_ROLE_KEY`: the service-role/secret key, used by the server
+  to read and update fleet records. Never add this key to frontend code.
+- `SECRET_KEY`: a long, random value used to sign session cookies. Generate a
+  value locally with `python -c "import secrets; print(secrets.token_hex(32))"`
+  and enter it directly in Vercel; do not commit it.
+- `COOKIE_SECURE`: `true` for the HTTPS Vercel deployment.
+
+After saving or changing environment variables, redeploy the project so the
+serverless functions receive them. A `503` from `/api/auth/login` means the
+server could not initialize Supabase Auth; check the response's JSON `error`
+and confirm the Vercel `SUPABASE_URL` and `SUPABASE_ANON_KEY` values. If sign-in
+then returns `401`, the Supabase connection is working, but the account
+credentials were rejected.
+
 The **Export Excel report** action downloads a pre-formatted `.xlsx` workbook
 with a dashboard summary and separate worksheets for vehicles, drivers,
 assignments, maintenance, fuel logs, and trips.
+
+## Payroll setup and workflow
+
+After creating the fleet/trips tables, run
+[`supabase_payroll_migration.sql`](./supabase_payroll_migration.sql) in the
+Supabase SQL Editor. This adds payroll periods, immutable reviewed trip/rate
+snapshots, driver summaries, cash advances, overdraft transactions, and audit
+history. Payroll uses the existing trip and driver IDs and does not copy or
+modify trip records. The migration's database function finalizes payroll
+atomically and prevents a trip from being finalized in more than one period.
+
+Payroll is available to signed-in users, matching the existing app-wide access
+model (the current app does not define separate user roles). Payroll eligibility
+uses the route fields and does not require `time_in` or `time_out`. Shipment date
+is taken from `shipment_date`, then the legacy `trip_date` or `record_date`.
+When `driver_id` is missing, a unique, case-insensitive full-name or last-name
+match is used if available; ambiguous matches remain under the imported name.
+Matched trips are grouped under the registered driver's full name.
+Trips with missing origin/destination, unknown routes, or already finalized
+elsewhere are flagged and excluded. A registered driver and ISM number are
+required to review and save payroll.
+
+Rates are ₱200 for DAV2–PLAS, DAV1–DAV2, and DAV1–PLAS, and ₱900 for
+GENSAN–DAV2, GENSAN–PLAS, and GENSAN–DAV1, in either direction. Payroll review
+snapshots each eligible trip and its rate. Finalized payroll retains those
+values if trips or route rules later change. Cash advances must be recorded before
+review; overdrafts are recorded as explicit opening/new ledger entries and are
+never inferred from negative pay. Overdraft settlement is separately confirmed
+at finalization. Claims are shown as Coming Soon and do not affect pay.
+Payroll reports can be printed or exported as CSV.
 
 ## Run the app
 

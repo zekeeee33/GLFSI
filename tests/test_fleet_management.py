@@ -2,6 +2,7 @@ import json
 import os
 import tempfile
 import unittest
+from decimal import Decimal
 from io import BytesIO
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -9,6 +10,277 @@ from unittest.mock import patch
 import app as web_app
 from fleet_management import FleetManagementError, FleetManager, _supabase_project_url
 from openpyxl import load_workbook
+from payroll import calculate_driver_payroll, period_date, trip_rate
+from werkzeug.exceptions import MethodNotAllowed
+
+
+class PayrollCalculationTests(unittest.TestCase):
+    def test_payroll_get_route_is_not_claimed_by_generic_resource_routes(self):
+        adapter = web_app.app.url_map.bind("127.0.0.1")
+
+        self.assertEqual(adapter.match("/api/payroll", method="GET")[0], "payroll_report")
+        with self.assertRaises(MethodNotAllowed):
+            adapter.match("/api/payroll", method="POST")
+        self.assertEqual(adapter.match("/api/trips", method="POST")[0], "create_record")
+
+    def test_known_route_rates_are_bidirectional_and_case_insensitive(self):
+        routes = [
+            ("DAV2", "PLAS", "200.00"),
+            ("PLAS", "DAV2", "200.00"),
+            ("DAV1", "DAV2", "200.00"),
+            ("DAV2", "DAV1", "200.00"),
+            ("DAV1", "PLAS", "200.00"),
+            ("PLAS", "DAV1", "200.00"),
+            ("GENSAN", "DAV2", "900.00"),
+            ("DAV2", "GENSAN", "900.00"),
+            ("GENSAN", "PLAS", "900.00"),
+            ("PLAS", "GENSAN", "900.00"),
+            ("GENSAN", "DAV1", "900.00"),
+            ("DAV1", "GENSAN", "900.00"),
+            ("gensan", "plas", "900.00"),
+        ]
+        for origin, destination, expected in routes:
+            with self.subTest(origin=origin, destination=destination):
+                self.assertEqual(str(trip_rate(origin, destination)), expected)
+        self.assertIsNone(trip_rate(None, "DAV2"))
+
+    def test_payroll_net_and_explicit_overdraft_settlement(self):
+        trips = [{"rate": "900.00"}, {"rate": "200.00"}]
+        advances = [{"amount": "300.00"}]
+        before_settlement = calculate_driver_payroll(trips, advances, "500.00")
+        self.assertEqual(before_settlement["gross_pay"], Decimal("1100.00"))
+        self.assertEqual(before_settlement["net_before_overdraft"], Decimal("800.00"))
+        self.assertEqual(before_settlement["overdraft_deduction"], Decimal("0.00"))
+        settled = calculate_driver_payroll(
+            trips, advances, "500.00", settle_overdraft=True
+        )
+        self.assertEqual(settled["overdraft_deduction"], Decimal("500.00"))
+        self.assertEqual(settled["final_net_pay"], Decimal("300.00"))
+        negative = calculate_driver_payroll(
+            [{"rate": "200.00"}], [{"amount": "300.00"}], "500.00"
+        )
+        self.assertEqual(negative["net_before_overdraft"], Decimal("-100.00"))
+        self.assertEqual(negative["remaining_amount_due"], Decimal("100.00"))
+        self.assertEqual(negative["overdraft_deduction"], Decimal("0.00"))
+
+    def test_payroll_period_dates_are_validated(self):
+        self.assertEqual(period_date("2026-10-01", "Start date").isoformat(), "2026-10-01")
+        with self.assertRaisesRegex(ValueError, "valid date"):
+            period_date("not-a-date", "Start date")
+
+    def test_payroll_report_uses_routes_without_requiring_trip_times(self):
+        client = FakeSupabaseClient()
+        manager = FleetManager(client=client)
+        vehicle = manager.add_vehicle("PAY-001", "Toyota", "Hiace", 2022)
+        driver = manager.add_driver("Payroll Driver", "PAY-DL-1")
+        manager.add_trip(
+            vehicle["id"], driver["id"], "DAV2 to PLAS", 0, 0,
+            ism_no="ISM-200", shipment_date="2026-10-02",
+            time_in="08:00", time_out="10:00", origin="DAV2", destination="PLAS",
+        )
+        manager.add_trip(
+            vehicle["id"], driver["id"], "DAV1 to PLAS", 0, 0,
+            ism_no="ISM-201", shipment_date="2026-10-03",
+            time_in="08:00", time_out="10:00", origin="DAV1", destination="PLAS",
+        )
+        manager.add_trip(
+            vehicle["id"], driver["id"], "DAV1 to DAV2", 0, 0,
+            ism_no="ISM-202", shipment_date="2026-10-04",
+            time_in="08:00", origin="DAV1", destination="DAV2",
+        )
+        manager.add_trip(
+            vehicle["id"], driver["id"], "DAV1 to UNKNOWN", 0, 0,
+            ism_no="ISM-203", shipment_date="2026-10-05",
+            time_in="08:00", time_out="10:00", origin="DAV1", destination="UNKNOWN",
+        )
+
+        report = manager.payroll_report("2026-10-01", "2026-10-15")
+
+        self.assertEqual(report["drivers"][0]["gross_pay"], "600.00")
+        self.assertEqual(len([trip for trip in report["trips"] if trip["eligible"]]), 3)
+        self.assertEqual(
+            {trip["issue"] for trip in report["issues"]},
+            {"Unconfigured Route"},
+        )
+
+    def test_payroll_matches_imported_trip_driver_name_when_driver_id_is_missing(self):
+        client = FakeSupabaseClient()
+        manager = FleetManager(client=client)
+        vehicle = manager.add_vehicle("PAY-IMPORT", "Toyota", "Hiace", 2022)
+        driver = manager.add_driver("Imported Driver", "PAY-DL-IMPORT")
+        manager.add_trip(
+            vehicle["id"], driver["id"], "DAV1 to PLAS", 0, 0,
+            ism_no="ISM-IMPORT", shipment_date="2026-10-03",
+            origin="DAV1", destination="PLAS",
+        )
+        client.tables["trips"][0]["driver_id"] = None
+        client.tables["trips"][0]["driver_name"] = "  imported   DRIVER "
+
+        report = manager.payroll_report("2026-10-01", "2026-10-15")
+
+        self.assertEqual(report["trips"][0]["driver_id"], driver["id"])
+        self.assertTrue(report["trips"][0]["eligible"])
+        self.assertEqual(report["trips"][0]["rate"], "200.00")
+        self.assertEqual(report["drivers"][0]["gross_pay"], "200.00")
+
+    def test_payroll_matches_unique_imported_last_name_to_registered_driver(self):
+        client = FakeSupabaseClient()
+        manager = FleetManager(client=client)
+        driver = manager.add_driver("Rey Madamba", "PAY-DL-MADAMBA")
+        client.tables["trips"] = [{
+            "id": 21,
+            "driver_id": None,
+            "driver_name": "  MADAMBA ",
+            "ism_no": "ISM-MADAMBA",
+            "shipment_date": "2026-10-03",
+            "origin": "DAV1",
+            "destination": "PLAS",
+            "time_in": None,
+            "time_out": None,
+        }]
+
+        report = manager.payroll_report("2026-10-01", "2026-10-15")
+
+        self.assertEqual(report["trips"][0]["driver_id"], driver["id"])
+        self.assertEqual(report["trips"][0]["driver_name"], "Rey Madamba")
+        self.assertEqual(report["trips"][0]["driver_key"], f"id:{driver['id']}")
+        self.assertEqual(report["drivers"][0]["gross_pay"], "200.00")
+        self.assertEqual(report["drivers"][0]["total_trips"], 1)
+
+    def test_payroll_does_not_guess_when_imported_last_name_is_ambiguous(self):
+        client = FakeSupabaseClient()
+        manager = FleetManager(client=client)
+        manager.add_driver("Rey Madamba", "PAY-DL-MADAMBA-1")
+        manager.add_driver("Jose Madamba", "PAY-DL-MADAMBA-2")
+        client.tables["trips"] = [{
+            "id": 22,
+            "driver_id": None,
+            "driver_name": "Madamba",
+            "ism_no": "ISM-MADAMBA-AMBIGUOUS",
+            "shipment_date": "2026-10-03",
+            "origin": "DAV1",
+            "destination": "PLAS",
+            "time_in": None,
+            "time_out": None,
+        }]
+
+        report = manager.payroll_report("2026-10-01", "2026-10-15")
+
+        self.assertIsNone(report["trips"][0]["driver_id"])
+        self.assertEqual(report["trips"][0]["driver_name"], "Madamba")
+        self.assertEqual(report["trips"][0]["rate"], "200.00")
+        self.assertEqual(
+            [driver["gross_pay"] for driver in report["drivers"]],
+            ["0.00", "0.00", "200.00"],
+        )
+
+    def test_payroll_calculates_unassigned_import_by_route_without_ism_or_times(self):
+        client = FakeSupabaseClient()
+        manager = FleetManager(client=client)
+        manager.add_driver("Registered Driver", "PAY-DL-REGISTERED")
+        client.tables["trips"] = [{
+            "id": 12,
+            "driver_id": None,
+            "driver_name": "Manifest Only Driver",
+            "ism_no": None,
+            "shipment_date": "2026-10-03",
+            "origin": "PLAS",
+            "destination": "DAV1",
+            "time_in": None,
+            "time_out": None,
+        }]
+
+        report = manager.payroll_report("2026-10-01", "2026-10-15")
+
+        self.assertEqual(report["trips"][0]["rate"], "200.00")
+        self.assertTrue(report["trips"][0]["eligible"])
+        self.assertEqual(report["trips"][0]["issue"], None)
+        self.assertEqual(report["drivers"][1]["driver_name"], "Manifest Only Driver")
+        self.assertEqual(report["drivers"][1]["gross_pay"], "200.00")
+
+    def test_review_rejects_unassigned_trip_after_showing_route_earnings(self):
+        client = FakeSupabaseClient()
+        manager = FleetManager(client=client)
+        client.tables["trips"] = [{
+            "id": 12,
+            "driver_id": None,
+            "driver_name": "Manifest Only Driver",
+            "ism_no": "ISM-IMPORT",
+            "shipment_date": "2026-10-03",
+            "origin": "GENSAN",
+            "destination": "PLAS",
+            "time_in": None,
+            "time_out": None,
+        }]
+
+        report = manager.payroll_report("2026-10-01", "2026-10-15")
+        self.assertEqual(report["drivers"][0]["gross_pay"], "900.00")
+        with self.assertRaisesRegex(ValueError, "registered driver"):
+            manager.review_payroll(
+                "2026-10-01", "2026-10-15",
+                "00000000-0000-0000-0000-000000000001",
+            )
+
+    def test_payroll_counts_configured_route_without_trip_times(self):
+        client = FakeSupabaseClient()
+        manager = FleetManager(client=client)
+        vehicle = manager.add_vehicle("PAY-INCOMPLETE", "Toyota", "Hiace", 2022)
+        driver = manager.add_driver("Incomplete Driver", "PAY-DL-INCOMPLETE")
+        manager.add_trip(
+            vehicle["id"], driver["id"], "GENSAN to PLAS", 0, 0,
+            ism_no="ISM-INCOMPLETE", shipment_date="2026-10-03",
+            time_in="08:00", origin="GENSAN", destination="PLAS",
+        )
+
+        report = manager.payroll_report("2026-10-01", "2026-10-15")
+
+        self.assertEqual(report["trips"][0]["rate"], "900.00")
+        self.assertTrue(report["trips"][0]["eligible"])
+        self.assertIsNone(report["trips"][0]["issue"])
+        self.assertEqual(report["drivers"][0]["gross_pay"], "900.00")
+
+    def test_review_snapshots_eligible_trip_rates(self):
+        client = FakeSupabaseClient()
+        manager = FleetManager(client=client)
+        vehicle = manager.add_vehicle("PAY-002", "Toyota", "Hiace", 2022)
+        driver = manager.add_driver("Reviewed Driver", "PAY-DL-2")
+        manager.add_trip(
+            vehicle["id"], driver["id"], "GENSAN to DAV2", 0, 0,
+            ism_no="ISM-900", shipment_date="2026-10-05",
+            time_in="08:00", time_out="16:00",
+            origin="GENSAN", destination="DAV2",
+        )
+
+        report = manager.review_payroll(
+            "2026-10-01", "2026-10-15", "00000000-0000-0000-0000-000000000001"
+        )
+
+        self.assertEqual(report["status"], "reviewed")
+        self.assertEqual(report["trips"][0]["rate"], "900.00")
+        self.assertEqual(report["drivers"][0]["gross_pay"], "900.00")
+        self.assertEqual(client.tables["payroll_items"][0]["trip_id"], 1)
+
+    def test_payroll_report_api_returns_existing_trip_line_items(self):
+        client = FakeSupabaseClient()
+        manager = FleetManager(client=client)
+        vehicle = manager.add_vehicle("PAY-003", "Toyota", "Hiace", 2022)
+        driver = manager.add_driver("API Payroll Driver", "PAY-DL-3")
+        manager.add_trip(
+            vehicle["id"], driver["id"], "DAV1 to DAV2", 0, 0,
+            ism_no="ISM-API", shipment_date="2026-10-06",
+            time_in="08:00", time_out="11:00",
+            origin="DAV1", destination="DAV2",
+        )
+        with patch.object(web_app, "manager", manager), patch.dict(
+            web_app.app.config, {"TESTING": True, "TEST_AUTH_BYPASS": True}
+        ):
+            response = web_app.app.test_client().get(
+                "/api/payroll?start_date=2026-10-01&end_date=2026-10-15"
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json["trips"][0]["ism_no"], "ISM-API")
+        self.assertEqual(response.json["trips"][0]["rate"], "200.00")
 
 
 class FakeAuthApiError(Exception):
@@ -70,11 +342,17 @@ class FakeQuery:
     def execute(self):
         rows = self.client.tables.setdefault(self.table_name, [])
         if self.action == "insert":
-            row = dict(self.values)
-            row["id"] = self.client.next_ids.get(self.table_name, 0) + 1
-            self.client.next_ids[self.table_name] = row["id"]
-            rows.append(row)
-            return SimpleNamespace(data=[dict(row)])
+            inserted = []
+            values = self.values if isinstance(self.values, list) else [self.values]
+            for value in values:
+                row = dict(value)
+                row["id"] = self.client.next_ids.get(self.table_name, 0) + 1
+                self.client.next_ids[self.table_name] = row["id"]
+                if self.table_name == "payroll_periods":
+                    row.setdefault("status", "draft")
+                rows.append(row)
+                inserted.append(dict(row))
+            return SimpleNamespace(data=inserted)
         if self.action == "update":
             updated = []
             for row in rows:

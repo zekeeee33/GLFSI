@@ -352,6 +352,91 @@ def _optional_text(payload: dict[str, Any], field: str) -> str | None:
     return str(value).strip() or None if value is not None else None
 
 
+def _payroll_period_from_request(payload: dict[str, Any]) -> tuple[str, str]:
+    start_date = _required_text(payload, "start_date")
+    end_date = _required_text(payload, "end_date")
+    return start_date, end_date
+
+
+@app.route("/api/payroll")
+def payroll_report() -> Any:
+    start_date = request.args.get("start_date", "")
+    end_date = request.args.get("end_date", "")
+    try:
+        return jsonify(get_manager().payroll_report(start_date, end_date))
+    except ValueError as exc:
+        return _json_error(str(exc), 400)
+
+
+@app.route("/api/payroll/review", methods=["POST"])
+def payroll_review() -> Any:
+    try:
+        payload = _body()
+        start_date, end_date = _payroll_period_from_request(payload)
+        result = get_manager().review_payroll(
+            start_date, end_date, str(g.current_user["id"])
+        )
+    except ValueError as exc:
+        return _json_error(str(exc), 400)
+    return jsonify(result)
+
+
+@app.route("/api/payroll/cash-advances", methods=["POST"])
+def payroll_cash_advance() -> Any:
+    try:
+        payload = _body()
+        start_date, end_date = _payroll_period_from_request(payload)
+        result = get_manager().add_cash_advance(
+            start_date=start_date,
+            end_date=end_date,
+            driver_id=_integer(payload, "driver_id"),
+            advance_date=_required_text(payload, "advance_date"),
+            amount=payload.get("amount"),
+            remarks=_optional_text(payload, "remarks"),
+            reference=_optional_text(payload, "reference"),
+            actor_id=str(g.current_user["id"]),
+        )
+    except ValueError as exc:
+        return _json_error(str(exc), 400)
+    return jsonify({"data": result}), 201
+
+
+@app.route("/api/payroll/overdrafts", methods=["POST"])
+def payroll_overdraft() -> Any:
+    try:
+        payload = _body()
+        result = get_manager().add_overdraft(
+            driver_id=_integer(payload, "driver_id"),
+            transaction_type=_required_text(payload, "transaction_type"),
+            amount=payload.get("amount"),
+            effective_date=_required_text(payload, "effective_date"),
+            remarks=_optional_text(payload, "remarks"),
+            actor_id=str(g.current_user["id"]),
+        )
+    except ValueError as exc:
+        return _json_error(str(exc), 400)
+    return jsonify({"data": result}), 201
+
+
+@app.route("/api/payroll/finalize", methods=["POST"])
+def payroll_finalize() -> Any:
+    try:
+        payload = _body()
+        start_date, end_date = _payroll_period_from_request(payload)
+        settle_overdraft = payload.get("settle_overdraft", False)
+        if not isinstance(settle_overdraft, bool):
+            raise ValueError("settle_overdraft must be true or false")
+        result = get_manager().finalize_payroll(
+            start_date,
+            end_date,
+            settle_overdraft,
+            str(g.current_user["id"]),
+        )
+    except ValueError as exc:
+        return _json_error(str(exc), 400)
+    return jsonify(result)
+
+
 def _create_record(resource: str, payload: dict[str, Any]) -> dict[str, Any]:
     fleet = get_manager()
     if resource == "vehicles":
@@ -425,7 +510,10 @@ def _create_record(resource: str, payload: dict[str, Any]) -> dict[str, Any]:
     raise ValueError("Unknown resource")
 
 
-@app.route("/api/<resource>", methods=["POST"])
+@app.route(
+    "/api/<any(vehicles,drivers,assignments,maintenance,fuel,trips):resource>",
+    methods=["POST"],
+)
 def create_record(resource: str) -> Any:
     if resource not in {"vehicles", "drivers", "assignments", "maintenance", "fuel", "trips"}:
         return jsonify({"error": "Unknown resource"}), 404
@@ -436,7 +524,10 @@ def create_record(resource: str) -> Any:
     return jsonify({"data": record}), 201
 
 
-@app.route("/api/<resource>/<int:record_id>", methods=["DELETE"])
+@app.route(
+    "/api/<any(vehicles,drivers,assignments,maintenance,fuel,trips):resource>/<int:record_id>",
+    methods=["DELETE"],
+)
 def delete_record(resource: str, record_id: int) -> Any:
     method_names = {
         "vehicles": "delete_vehicle",

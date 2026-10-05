@@ -90,6 +90,14 @@ class FleetManager:
                     "supabase_trips_migration.sql in the Supabase SQL Editor, "
                     "then refresh the app."
                 ) from exc
+            if "payroll_periods" in combined_error and (
+                "does not exist" in combined_error or "schema cache" in combined_error
+            ):
+                raise FleetManagementError(
+                    "Payroll tables are not installed. Run "
+                    "supabase_payroll_migration.sql in the Supabase SQL Editor, "
+                    "then refresh the app."
+                ) from exc
             raise FleetManagementError(f"Supabase request failed: {exc}") from exc
 
     def _insert(self, table: str, values: Dict[str, Any]) -> Dict[str, Any]:
@@ -445,6 +453,64 @@ class FleetManager:
             "trips",
             "*,driver:drivers(name),vehicle:vehicles(plate_number,make,model)",
             ("shipment_date", "desc"),
+        )
+
+    def payroll_report(self, start_date: str, end_date: str) -> Dict[str, Any]:
+        from payroll import PayrollService
+
+        return PayrollService(self).report(start_date, end_date)
+
+    def review_payroll(
+        self, start_date: str, end_date: str, actor_id: str
+    ) -> Dict[str, Any]:
+        from payroll import PayrollService
+
+        return PayrollService(self).review(start_date, end_date, actor_id)
+
+    def add_cash_advance(
+        self,
+        start_date: str,
+        end_date: str,
+        driver_id: int,
+        advance_date: str,
+        amount: Any,
+        remarks: Optional[str],
+        reference: Optional[str],
+        actor_id: str,
+    ) -> Dict[str, Any]:
+        from payroll import PayrollService
+
+        return PayrollService(self).add_cash_advance(
+            start_date, end_date, driver_id, advance_date, amount, remarks,
+            reference, actor_id,
+        )
+
+    def add_overdraft(
+        self,
+        driver_id: int,
+        transaction_type: str,
+        amount: Any,
+        effective_date: str,
+        remarks: Optional[str],
+        actor_id: str,
+    ) -> Dict[str, Any]:
+        from payroll import PayrollService
+
+        return PayrollService(self).add_overdraft(
+            driver_id, transaction_type, amount, effective_date, remarks, actor_id
+        )
+
+    def finalize_payroll(
+        self,
+        start_date: str,
+        end_date: str,
+        settle_overdraft: bool,
+        actor_id: str,
+    ) -> Dict[str, Any]:
+        from payroll import PayrollService
+
+        return PayrollService(self).finalize(
+            start_date, end_date, settle_overdraft, actor_id
         )
 
     def delete_trip(self, trip_id: int) -> None:

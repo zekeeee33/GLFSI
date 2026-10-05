@@ -8,6 +8,7 @@ const TITLES = {
   maintenance: "Maintenance",
   fuel: "Fuel logs",
   trips: "Trips",
+  payroll: "Payroll",
 };
 
 const RESOURCE_CONFIG = {
@@ -152,7 +153,28 @@ const RESOURCE_CONFIG = {
   },
 };
 
-const state = { data: null, page: "dashboard", search: "", csrfToken: "" };
+function isoDate(date) {
+  const year = date.getFullYear();
+  const month = String(date.getMonth() + 1).padStart(2, "0");
+  const day = String(date.getDate()).padStart(2, "0");
+  return `${year}-${month}-${day}`;
+}
+
+const today = new Date();
+const state = {
+  data: null,
+  page: "dashboard",
+  search: "",
+  csrfToken: "",
+  payroll: null,
+  payrollKey: "",
+  payrollRequestedKey: "",
+  payrollPeriod: {
+    start_date: isoDate(new Date(today.getFullYear(), today.getMonth(), 1)),
+    end_date: isoDate(new Date(today.getFullYear(), today.getMonth() + 1, 0)),
+  },
+  payrollFilters: { driver_id: "", ism_no: "", origin: "", destination: "" },
+};
 const view = document.querySelector("#app-view");
 
 function escapeHtml(value) {
@@ -418,6 +440,207 @@ function renderResource(page) {
     </div>`;
 }
 
+function payrollOptionMarkup(records, selected, key, entityLabel, displayField) {
+  return `<option value="">All ${entityLabel}s</option>${records.map((record) =>
+    `<option value="${escapeHtml(record[key])}" ${String(record[key]) === String(selected) ? "selected" : ""}>${escapeHtml(record[displayField])}</option>`,
+  ).join("")}`;
+}
+
+function payrollCsvCell(value) {
+  return `"${String(value ?? "").replaceAll('"', '""')}"`;
+}
+
+function payrollRows() {
+  const report = state.payroll || { trips: [], drivers: [] };
+  const filters = state.payrollFilters;
+  const search = filters.ism_no.trim().toLocaleLowerCase();
+  return report.trips.filter((trip) =>
+    (!filters.driver_id || String(trip.driver_id) === filters.driver_id)
+    && (!search || String(trip.ism_no || "").toLocaleLowerCase().includes(search))
+    && (!filters.origin || trip.origin === filters.origin)
+    && (!filters.destination || trip.destination === filters.destination),
+  );
+}
+
+function sumCurrency(rows, field) {
+  const cents = rows.reduce((total, row) => total + Math.round(Number(row[field] || 0) * 100), 0);
+  return cents / 100;
+}
+
+function renderPayroll() {
+  const report = state.payroll;
+  const [startDate, endDate] = [state.payrollPeriod.start_date, state.payrollPeriod.end_date];
+  const key = `${startDate}:${endDate}`;
+  if (state.payrollKey !== key && state.payrollRequestedKey !== key) {
+    state.payrollRequestedKey = key;
+    api(`/api/payroll?start_date=${encodeURIComponent(startDate)}&end_date=${encodeURIComponent(endDate)}`)
+      .then((result) => {
+        state.payroll = result;
+        state.payrollKey = key;
+        if (state.page === "payroll") render();
+      })
+      .catch((error) => {
+        state.payrollRequestedKey = "";
+        if (state.page === "payroll") {
+          view.innerHTML = `${header("PAYROLL", "Payroll", "Driver earnings and payroll review.")}<div class="error-card"><p>${escapeHtml(error.message)}</p><button class="button button-primary" data-action="payroll-reload" type="button">Retry</button></div>`;
+        }
+      });
+  }
+
+  const drivers = report?.drivers || [];
+  const allTrips = report?.trips || [];
+  const visibleTrips = payrollRows();
+  const selectedDriver = state.payrollFilters.driver_id;
+  const driverSummaries = drivers.filter((driver) =>
+    !selectedDriver || String(driver.driver_id) === selectedDriver,
+  );
+  const totals = {
+    gross: sumCurrency(driverSummaries, "gross_pay"),
+    advances: sumCurrency(driverSummaries, "cash_advances"),
+    overdraft: sumCurrency(driverSummaries.map((driver) => ({
+      outstanding: driver.remaining_overdraft ?? driver.overdraft_balance,
+    })), "outstanding"),
+    net: sumCurrency(driverSummaries.map((driver) => ({
+      payable: driver.final_net_pay ?? Math.max(Number(driver.net_before_overdraft || 0), 0),
+    })), "payable"),
+  };
+  const eligibleIds = new Set(visibleTrips.filter((trip) => trip.eligible).map((trip) => String(trip.id)));
+  const visibleSummary = driverSummaries.map((driver) => ({
+    ...driver,
+    total_trips: (report?.trips || []).filter((trip) =>
+      (trip.driver_key || `id:${trip.driver_id}`) === (driver.driver_key || `id:${driver.driver_id}`)
+      && trip.eligible && eligibleIds.has(String(trip.id)),
+    ).length,
+  }));
+  const status = report?.status || "draft";
+  const isDraft = status === "draft";
+  const tripColumns = [
+    ["payroll_date", "Date"],
+    ["driver_name", "Driver Name"],
+    ["ism_no", "ISM Number"],
+    ["origin", "Origin"],
+    ["destination", "Destination"],
+    ["rate", "Trip Rate", (value) => value == null ? "Unconfigured Route" : formatCurrency(value)],
+    ["issue", "Review"],
+  ];
+  const origins = [...new Set(allTrips.map((trip) => trip.origin).filter(Boolean))].sort();
+  const destinations = [...new Set(allTrips.map((trip) => trip.destination).filter(Boolean))].sort();
+  const driverCards = visibleSummary.map((driver) => {
+    const driverKey = driver.driver_key || `id:${driver.driver_id}`;
+    const driverTrips = visibleTrips.filter((trip) =>
+      (trip.driver_key || `id:${trip.driver_id}`) === driverKey,
+    );
+    const cashAdvances = report?.cash_advances?.filter((advance) =>
+      String(advance.driver_id) === String(driver.driver_id),
+    ) || [];
+    return `
+      <details class="payroll-driver-details">
+        <summary>
+          <span><strong>${escapeHtml(driver.driver_name)}</strong><small>${formatNumber(driver.total_trips)} eligible trips</small></span>
+          <span class="payroll-summary-amount">${formatCurrency(driver.gross_pay)}</span>
+          <span class="badge badge-${escapeHtml(status)}">${escapeHtml(status)}</span>
+          <span class="button button-secondary button-small">View Details</span>
+        </summary>
+        <div class="payroll-driver-body">
+          ${tableMarkup(driverTrips, tripColumns, null, { empty: "No trips for this driver in the selected filters" })}
+          <div class="payroll-financial-grid">
+            <span>Gross pay <strong>${formatCurrency(driver.gross_pay)}</strong></span>
+            <span>Cash advances <strong>${formatCurrency(driver.cash_advances)}</strong></span>
+            <span>Claims <strong>Coming Soon</strong></span>
+            <span>Opening overdraft <strong>${formatCurrency(driver.opening_overdraft)}</strong></span>
+            <span>New overdraft <strong>${formatCurrency(driver.new_overdraft)}</strong></span>
+            <span>Overdraft deduction <strong>${formatCurrency(driver.overdraft_deduction)}</strong></span>
+            <span>Net before overdraft <strong>${formatCurrency(driver.net_before_overdraft)}</strong></span>
+            <span>Final net pay <strong>${formatCurrency(driver.final_net_pay ?? Math.max(Number(driver.net_before_overdraft || 0), 0))}</strong></span>
+            <span>Remaining amount due <strong>${formatCurrency(driver.remaining_amount_due)}</strong></span>
+            <span>Outstanding overdraft <strong>${formatCurrency(driver.remaining_overdraft ?? driver.overdraft_balance)}</strong></span>
+          </div>
+          ${driver.overdraft_transactions?.length ? `<div><p class="eyebrow">OVERDRAFT TRANSACTION HISTORY</p>${tableMarkup(driver.overdraft_transactions, [
+            ["effective_date", "Date"],
+            ["transaction_type", "Transaction"],
+            ["amount", "Amount", formatCurrency],
+            ["remarks", "Remarks"],
+          ], null, { empty: "No overdraft transactions" })}</div>` : ""}
+          ${cashAdvances.length ? `<p class="record-count">Cash advances: ${cashAdvances.map((advance) => `${escapeHtml(advance.advance_date)} · ${formatCurrency(advance.amount)}${advance.remarks ? ` · ${escapeHtml(advance.remarks)}` : ""}`).join(" | ")}</p>` : ""}
+        </div>
+      </details>`;
+  }).join("");
+  return `
+    ${header("FINANCE", "Payroll", "Review route-based earnings, advances, overdrafts, and driver payroll.", '<button class="button button-secondary" data-action="payroll-print" type="button">Print Payroll</button><button class="button button-secondary" data-action="payroll-export" type="button">Export CSV</button>')}
+    <div class="payroll-period-bar">
+      <form id="payroll-period-form" class="payroll-toolbar">
+        <label class="form-field"><span>Period start</span><input name="start_date" type="date" value="${escapeHtml(startDate)}" required /></label>
+        <label class="form-field"><span>Period end</span><input name="end_date" type="date" value="${escapeHtml(endDate)}" required /></label>
+        <button class="button button-primary" type="submit">Generate Report</button>
+        <span class="badge badge-${escapeHtml(status)}">${escapeHtml(status)}</span>
+      </form>
+      <div class="payroll-filter-grid">
+        <label class="form-field"><span>Driver</span><select id="payroll-driver-filter">${payrollOptionMarkup(state.data.drivers, selectedDriver, "id", "driver", "name")}</select></label>
+        <label class="form-field"><span>Search ISM number</span><input id="payroll-ism-filter" type="search" placeholder="Search ISM" value="${escapeHtml(state.payrollFilters.ism_no)}" /></label>
+        <label class="form-field"><span>Origin</span><select id="payroll-origin-filter"><option value="">All origins</option>${origins.map((origin) => `<option ${origin === state.payrollFilters.origin ? "selected" : ""} value="${escapeHtml(origin)}">${escapeHtml(origin)}</option>`).join("")}</select></label>
+        <label class="form-field"><span>Destination</span><select id="payroll-destination-filter"><option value="">All destinations</option>${destinations.map((destination) => `<option ${destination === state.payrollFilters.destination ? "selected" : ""} value="${escapeHtml(destination)}">${escapeHtml(destination)}</option>`).join("")}</select></label>
+      </div>
+    </div>
+    <div class="stats-grid payroll-stats">
+      ${statCard("Total Drivers", formatNumber(driverSummaries.length), "blue", "♙")}
+      ${statCard("Total Trips", formatNumber(visibleTrips.filter((trip) => trip.eligible).length), "teal", "⌁")}
+      ${statCard("Total Gross Payroll", formatCurrency(totals.gross), "green", "₱")}
+      ${statCard("Total Cash Advances", formatCurrency(totals.advances), "orange", "↓")}
+      ${statCard("Total Overdraft Balance", formatCurrency(totals.overdraft), "red", "↗")}
+      ${statCard("Total Net Payable", formatCurrency(totals.net), "purple", "✓")}
+    </div>
+    <section class="panel payroll-workflow">
+      <div><p class="eyebrow">PAYROLL WORKFLOW</p><h2>${escapeHtml(status === "finalized" ? "Payroll finalized" : status === "reviewed" ? "Ready for finalization" : "Draft payroll")}</h2><p class="page-description">Draft earnings use origin and destination only. A registered driver and ISM number are required when reviewing payroll. Claims are not deducted.</p></div>
+      <div class="page-heading-actions">
+        ${isDraft ? '<button class="button button-secondary" data-action="payroll-review" type="button">Review Payroll</button>' : ""}
+        ${status === "reviewed" ? '<label class="settlement-toggle"><input id="settle-overdraft" type="checkbox" /> Settle overdraft from payable amount</label><button class="button button-primary" data-action="payroll-finalize" type="button">Finalize Payroll</button>' : ""}
+      </div>
+    </section>
+    ${report?.issues?.length ? `<section class="panel payroll-issues"><div class="panel-heading"><div><p class="eyebrow">REQUIRES REVIEW</p><h2>${formatNumber(report.issues.length)} trips need attention</h2></div></div><p class="page-description">These trips are excluded from earnings. Resolve the origin, destination, route, or duplicate-payroll issue shown for each trip in the Trips data.</p>${tableMarkup(report.issues, tripColumns, null, { empty: "No review issues" })}</section>` : ""}
+    <section class="panel payroll-advances">
+      <div class="panel-heading"><div><p class="eyebrow">CASH ADVANCES</p><h2>Record an advance</h2></div></div>
+      ${isDraft ? `<form id="cash-advance-form" class="payroll-entry-form">
+        <label class="form-field"><span>Driver</span><select name="driver_id" required><option value="">Select driver</option>${state.data.drivers.map((driver) => `<option value="${escapeHtml(driver.id)}">${escapeHtml(driver.name)}</option>`).join("")}</select></label>
+        <label class="form-field"><span>Date</span><input name="advance_date" type="date" min="${escapeHtml(startDate)}" max="${escapeHtml(endDate)}" required /></label>
+        <label class="form-field"><span>Amount (₱)</span><input name="amount" type="number" min="0.01" step="0.01" required /></label>
+        <label class="form-field"><span>Reference (optional)</span><input name="reference" type="text" maxlength="100" /></label>
+        <label class="form-field"><span>Remarks (optional)</span><input name="remarks" type="text" maxlength="500" /></label>
+        <button class="button button-primary" type="submit">Add Advance</button>
+      </form>` : '<p class="page-description">Cash advances are locked after payroll review.</p>'}
+    </section>
+    <section class="panel payroll-advances">
+      <div class="panel-heading"><div><p class="eyebrow">OVERDRAFT LEDGER</p><h2>Record an approved overdraft transaction</h2></div></div>
+      <form id="overdraft-form" class="payroll-entry-form">
+        <label class="form-field"><span>Driver</span><select name="driver_id" required><option value="">Select driver</option>${state.data.drivers.map((driver) => `<option value="${escapeHtml(driver.id)}">${escapeHtml(driver.name)}</option>`).join("")}</select></label>
+        <label class="form-field"><span>Transaction</span><select name="transaction_type"><option value="opening">Opening balance</option><option value="new">New overdraft</option></select></label>
+        <label class="form-field"><span>Effective date</span><input name="effective_date" type="date" value="${escapeHtml(endDate)}" required /></label>
+        <label class="form-field"><span>Amount (₱)</span><input name="amount" type="number" min="0.01" step="0.01" required /></label>
+        <label class="form-field"><span>Remarks</span><input name="remarks" type="text" maxlength="500" required /></label>
+        <button class="button button-secondary" type="submit">Record Overdraft</button>
+      </form>
+      <p class="page-description">Overdraft entries require an explicit administrator action; negative payroll is never converted automatically.</p>
+    </section>
+    <section class="panel payroll-drivers">
+      <div class="panel-heading"><div><p class="eyebrow">DRIVER STATEMENTS</p><h2>Payroll by driver</h2></div><span class="record-count">${formatNumber(visibleSummary.length)} drivers</span></div>
+      ${driverCards || '<div class="empty-state"><span>₱</span><strong>No payroll results</strong><small>Select a period and generate the report.</small></div>'}
+    </section>
+    ${report?.audit_history?.length ? `<section class="panel payroll-issues"><div class="panel-heading"><div><p class="eyebrow">AUDIT HISTORY</p><h2>Payroll period activity</h2></div></div>${tableMarkup(report.audit_history.map((entry) => ({
+      created_at: entry.created_at,
+      action: entry.action,
+      actor_id: entry.actor_id,
+      details: JSON.stringify(entry.details || {}),
+    })), [
+      ["created_at", "Date"],
+      ["action", "Action"],
+      ["actor_id", "User"],
+      ["details", "Details"],
+    ], null, { empty: "No payroll changes recorded" })}</section>` : ""}
+    <section class="panel records-panel trips-report payroll-trip-report">
+      <div class="panel-heading"><div><p class="eyebrow">TRIP LINE ITEMS</p><h2>Payroll report detail</h2></div><span class="record-count">${formatNumber(visibleTrips.length)} trips</span></div>
+      ${tableMarkup(visibleTrips, tripColumns, null, { empty: "No trips in this payroll period" })}
+    </section>`;
+}
+
 function render() {
   if (!state.data) return;
   state.page = location.hash.slice(1) in TITLES ? location.hash.slice(1) : "dashboard";
@@ -428,7 +651,9 @@ function render() {
     if (active) link.setAttribute("aria-current", "page");
     else link.removeAttribute("aria-current");
   });
-  view.innerHTML = state.page === "dashboard" ? renderDashboard() : renderResource(state.page);
+  view.innerHTML = state.page === "dashboard"
+    ? renderDashboard()
+    : state.page === "payroll" ? renderPayroll() : renderResource(state.page);
 }
 
 async function submitForm(form) {
@@ -484,7 +709,127 @@ async function deleteRecord(button) {
   }
 }
 
+async function submitPayrollForm(form) {
+  const values = Object.fromEntries(new FormData(form).entries());
+  const submit = form.querySelector('button[type="submit"]');
+  submit.disabled = true;
+  try {
+    if (form.id === "payroll-period-form") {
+      if (values.start_date > values.end_date) {
+        throw new Error("Period start must be on or before period end.");
+      }
+      state.payrollPeriod = { start_date: values.start_date, end_date: values.end_date };
+      state.payroll = null;
+      state.payrollKey = "";
+      state.payrollRequestedKey = "";
+      render();
+      return;
+    }
+    if (form.id === "cash-advance-form") {
+      values.driver_id = Number(values.driver_id);
+      values.amount = Number(values.amount);
+      values.start_date = state.payrollPeriod.start_date;
+      values.end_date = state.payrollPeriod.end_date;
+      await api("/api/payroll/cash-advances", { method: "POST", body: JSON.stringify(values) });
+      showToast("Cash advance recorded.");
+    } else if (form.id === "overdraft-form") {
+      values.driver_id = Number(values.driver_id);
+      values.amount = Number(values.amount);
+      await api("/api/payroll/overdrafts", { method: "POST", body: JSON.stringify(values) });
+      showToast("Overdraft transaction recorded.");
+    }
+    await reloadPayroll();
+  } catch (error) {
+    showToast(error.message, "error");
+  } finally {
+    if (submit.isConnected) submit.disabled = false;
+  }
+}
+
+async function reloadPayroll() {
+  const { start_date: startDate, end_date: endDate } = state.payrollPeriod;
+  state.payroll = await api(
+    `/api/payroll?start_date=${encodeURIComponent(startDate)}&end_date=${encodeURIComponent(endDate)}`,
+  );
+  state.payrollKey = `${startDate}:${endDate}`;
+  state.payrollRequestedKey = state.payrollKey;
+  if (state.page === "payroll") render();
+}
+
+async function payrollWorkflowAction(action) {
+  const { start_date: startDate, end_date: endDate } = state.payrollPeriod;
+  const button = view.querySelector(`[data-action="${action}"]`);
+  if (button) button.disabled = true;
+  try {
+    if (action === "payroll-review") {
+      state.payroll = await api("/api/payroll/review", {
+        method: "POST",
+        body: JSON.stringify({ start_date: startDate, end_date: endDate }),
+      });
+      showToast("Payroll reviewed. Verify the details before finalizing.");
+    } else if (action === "payroll-finalize") {
+      const settleOverdraft = Boolean(view.querySelector("#settle-overdraft")?.checked);
+      if (!window.confirm("Finalize and lock this payroll period?")) {
+        if (button?.isConnected) button.disabled = false;
+        return;
+      }
+      state.payroll = await api("/api/payroll/finalize", {
+        method: "POST",
+        body: JSON.stringify({
+          start_date: startDate,
+          end_date: endDate,
+          settle_overdraft: settleOverdraft,
+        }),
+      });
+      showToast("Payroll finalized and locked.");
+    }
+    state.payrollKey = `${startDate}:${endDate}`;
+    state.payrollRequestedKey = state.payrollKey;
+    render();
+  } catch (error) {
+    showToast(error.message, "error");
+    if (button?.isConnected) button.disabled = false;
+  }
+}
+
+function exportPayrollCsv() {
+  const rows = payrollRows();
+  const headers = ["Date", "Driver Name", "ISM Number", "Origin", "Destination", "Trip Rate", "Review"];
+  const fields = ["payroll_date", "driver_name", "ism_no", "origin", "destination", "rate", "issue"];
+  const lines = [
+    headers.map(payrollCsvCell).join(","),
+    ...rows.map((trip) => fields.map((field) =>
+      payrollCsvCell(field === "rate" && trip.rate != null ? Number(trip.rate).toFixed(2) : trip[field]),
+    ).join(",")),
+    "",
+    ["Driver", "Trips", "Gross Pay", "Cash Advances", "Net Before Overdraft", "Overdraft Deduction", "Final Net Pay", "Remaining Due"].map(payrollCsvCell).join(","),
+    ...(state.payroll?.drivers || []).map((driver) => [
+      driver.driver_name,
+      driver.total_trips,
+      driver.gross_pay,
+      driver.cash_advances,
+      driver.net_before_overdraft,
+      driver.overdraft_deduction,
+      driver.final_net_pay ?? Math.max(Number(driver.net_before_overdraft || 0), 0),
+      driver.remaining_amount_due,
+    ].map(payrollCsvCell).join(",")),
+  ];
+  const blob = new Blob(["\uFEFF", lines.join("\r\n")], { type: "text/csv;charset=utf-8" });
+  const url = URL.createObjectURL(blob);
+  const anchor = document.createElement("a");
+  anchor.href = url;
+  anchor.download = `payroll-${state.payrollPeriod.start_date}-to-${state.payrollPeriod.end_date}.csv`;
+  anchor.click();
+  URL.revokeObjectURL(url);
+}
+
 view.addEventListener("submit", (event) => {
+  const payrollForm = event.target.closest("#payroll-period-form, #cash-advance-form, #overdraft-form");
+  if (payrollForm) {
+    event.preventDefault();
+    if (payrollForm.reportValidity()) submitPayrollForm(payrollForm);
+    return;
+  }
   const form = event.target.closest(".record-form");
   if (!form) return;
   event.preventDefault();
@@ -492,6 +837,15 @@ view.addEventListener("submit", (event) => {
 });
 
 view.addEventListener("input", (event) => {
+  if (event.target.id === "payroll-ism-filter") {
+    const position = event.target.selectionStart;
+    state.payrollFilters.ism_no = event.target.value;
+    render();
+    const nextInput = document.querySelector("#payroll-ism-filter");
+    nextInput?.focus();
+    nextInput?.setSelectionRange(position, position);
+    return;
+  }
   if (event.target.id !== "record-search") return;
   const position = event.target.selectionStart;
   state.search = event.target.value;
@@ -505,6 +859,15 @@ view.addEventListener("click", (event) => {
   const button = event.target.closest("[data-action]");
   if (!button) return;
   if (button.dataset.action === "retry" || button.dataset.action === "refresh") loadData();
+  if (button.dataset.action === "payroll-reload") {
+    state.payrollRequestedKey = "";
+    render();
+  }
+  if (button.dataset.action === "payroll-review" || button.dataset.action === "payroll-finalize") {
+    payrollWorkflowAction(button.dataset.action);
+  }
+  if (button.dataset.action === "payroll-print") window.print();
+  if (button.dataset.action === "payroll-export") exportPayrollCsv();
   if (button.dataset.action === "new-record") {
     const dialog = view.querySelector(".record-dialog");
     if (dialog && !dialog.open) {
@@ -516,6 +879,18 @@ view.addEventListener("click", (event) => {
     button.closest("dialog")?.close();
   }
   if (button.dataset.action === "delete") deleteRecord(button);
+});
+
+view.addEventListener("change", (event) => {
+  const filterMap = {
+    "payroll-driver-filter": "driver_id",
+    "payroll-origin-filter": "origin",
+    "payroll-destination-filter": "destination",
+  };
+  const key = filterMap[event.target.id];
+  if (!key) return;
+  state.payrollFilters[key] = event.target.value;
+  render();
 });
 
 document.querySelectorAll(".nav-link").forEach((link) => {
