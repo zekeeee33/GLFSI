@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 import hmac
 import logging
 import os
@@ -29,9 +28,11 @@ STATIC_DIR = os.path.join(BASE_DIR, "static")
 
 app = Flask(__name__, static_folder=STATIC_DIR, static_url_path="/static")
 app.config["SECRET_KEY"] = os.environ.get("SECRET_KEY") or secrets.token_hex(32)
-app.config["MAX_CONTENT_LENGTH"] = 16 * 1024 * 1024
 app.config["DOCUMENT_IMAGE_MAX_BYTES"] = int(
     os.environ.get("DOCUMENT_IMAGE_MAX_BYTES", str(10 * 1024 * 1024))
+)
+app.config["MAX_CONTENT_LENGTH"] = max(
+    16 * 1024 * 1024, app.config["DOCUMENT_IMAGE_MAX_BYTES"] + 1024 * 1024
 )
 app.config["DOCUMENT_IMAGE_BUCKET"] = os.environ.get(
     "DOCUMENT_IMAGE_BUCKET", "fleet-trip-documents"
@@ -307,6 +308,11 @@ def handle_method_not_allowed(_error: Any) -> tuple[Any, int]:
     return jsonify({"error": "Method not allowed"}), 405
 
 
+@app.errorhandler(413)
+def handle_request_too_large(_error: Any) -> tuple[Any, int]:
+    return _json_error("The uploaded image exceeds the request size limit.", 413)
+
+
 @app.route("/")
 def index() -> Any:
     return send_from_directory(STATIC_DIR, "index.html")
@@ -542,8 +548,10 @@ def _handle_document_image(kind: str, record_id: int) -> Any:
         owner_id = str(record.get("created_by") or (g.current_user or {}).get("id") or "admin")
         object_path = f"{kind}s/{record_id}/{owner_id}/{uuid.uuid4().hex}.{extension}"
         storage = get_manager().client.storage.from_(app.config["DOCUMENT_IMAGE_BUCKET"])
+        uploaded = False
         try:
             storage.upload(object_path, image_bytes, {"content-type": mime_type})
+            uploaded = True
             if is_trip:
                 get_manager().set_trip_manifest_path(
                     record_id, object_path, user_id=_document_user_id()
@@ -553,8 +561,16 @@ def _handle_document_image(kind: str, record_id: int) -> Any:
                     record_id, object_path, user_id=_document_user_id()
                 )
             if record.get(path_field):
-                storage.remove([record[path_field]])
+                try:
+                    storage.remove([record[path_field]])
+                except Exception:
+                    logger.warning("Could not remove replaced document object.", exc_info=True)
         except Exception:
+            if uploaded:
+                try:
+                    storage.remove([object_path])
+                except Exception:
+                    logger.exception("Could not clean up an unlinked document object.")
             logger.exception("Could not store a trip document image.")
             return _json_error("Could not save the image. Please retry.", 503)
         return jsonify({"message": "Image uploaded successfully."}), 201

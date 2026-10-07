@@ -342,7 +342,10 @@ function tableMarkup(rows, columns, resource, options = {}) {
     const action = resource
       ? `<td class="action-column"><button class="icon-button delete-button" type="button" data-action="delete" data-resource="${escapeHtml(resource)}" data-id="${escapeHtml(row.id)}" aria-label="Delete record">×</button></td>`
       : "";
-    return `<tr>${cells}${action}</tr>`;
+    const rowAttributes = options.rowAction
+      ? `tabindex="0" role="button" class="clickable-row" data-action="${escapeHtml(options.rowAction)}" data-id="${escapeHtml(row.id)}" aria-label="View trip ${escapeHtml(row.ism_no || row.id)}"`
+      : "";
+    return `<tr ${rowAttributes}>${cells}${action}</tr>`;
   }).join("");
   return `<div class="table-wrap"><table><thead><tr>${headings}${actionHeader}</tr></thead><tbody>${body}</tbody></table></div>`;
 }
@@ -376,10 +379,11 @@ function renderDashboard() {
           ["origin", "Origin"],
           ["destination", "Destination"],
           ["shipment_date", "Shipment date"],
-        ], null, { empty: "No trips recorded" }), "trips")}
+        ], null, { empty: "No trips recorded", rowAction: "trip-details" }), "trips")}
         ${panel("My fuel logs", tableMarkup(data.fuel_logs.slice(0, 5), RESOURCE_CONFIG.fuel.columns, null, { empty: "No fuel logs recorded" }), "fuel")}
         ${panel("My maintenance", tableMarkup(data.maintenance.slice(0, 5), RESOURCE_CONFIG.maintenance.columns, null, { empty: "No maintenance records" }), "maintenance")}
-      </div>`;
+      </div>
+      ${tripDetailsDialogMarkup()}`;
   }
   return `
     ${header("OPERATIONS", "Fleet overview", "Monitor vehicles, drivers, and daily fleet activity.")}
@@ -399,10 +403,11 @@ function renderDashboard() {
         ["plate_number", "Plate no"],
         ["driver_name", "Driver"],
         ["shipment_date", "Shipment date"],
-      ], null, { empty: "No trips recorded" }), "trips")}
+      ], null, { empty: "No trips recorded", rowAction: "trip-details" }), "trips")}
       ${panel("Vehicle assignments", tableMarkup(data.assignments.slice(0, 5), RESOURCE_CONFIG.assignments.columns, null, { empty: "No assignments yet" }), "assignments")}
       ${panel("Maintenance", tableMarkup(data.maintenance.slice(0, 5), RESOURCE_CONFIG.maintenance.columns, null, { empty: "No maintenance records" }), "maintenance")}
-    </div>`;
+    </div>
+    ${tripDetailsDialogMarkup()}`;
 }
 
 function optionMarkup(type) {
@@ -423,7 +428,7 @@ function fieldMarkup(field) {
   if (field.type === "select") {
     control = `<select id="field-${field.name}" name="${field.name}" ${required}>${field.options.map(([key, label]) => `<option value="${escapeHtml(key)}">${escapeHtml(label)}</option>`).join("")}</select>`;
   } else if (field.type === "file") {
-    control = `<input id="field-${field.name}" name="${field.name}" type="file" accept="${escapeHtml(field.accept)}" />`;
+    control = `<input id="field-${field.name}" name="${field.name}" type="file" accept="${escapeHtml(field.accept)}" /><small class="field-hint">JPG, PNG, or WEBP image</small>`;
   } else if (field.type === "vehicle" || field.type === "driver") {
     const records = field.type === "vehicle" ? state.data.vehicles : state.data.drivers;
     control = `<select id="field-${field.name}" name="${field.name}" ${required} ${records.length ? "" : "disabled"}>${optionMarkup(field.type)}</select>${records.length ? "" : `<small class="field-hint">Add a ${field.type} first.</small>`}`;
@@ -450,7 +455,10 @@ function groupedTripMarkup(rows, config) {
   ];
   const selectedGroup = groupOptions.find(([key]) => key === state.tripsGroupBy);
   if (!selectedGroup) {
-    return tableMarkup(rows, config.columns, null, { empty: "No trip records" });
+    return tableMarkup(rows, config.columns, null, {
+      empty: "No trip records",
+      rowAction: "trip-details",
+    });
   }
 
   const [groupKey, groupLabel] = selectedGroup;
@@ -469,9 +477,23 @@ function groupedTripMarkup(rows, config) {
           <h3>${escapeHtml(groupName)}</h3>
           <span class="record-count">${formatNumber(trips.length)} ${trips.length === 1 ? "trip" : "trips"}</span>
         </div>
-        ${tableMarkup(trips, config.columns, null, { empty: "No trip records" })}
+        ${tableMarkup(trips, config.columns, null, {
+          empty: "No trip records",
+          rowAction: "trip-details",
+        })}
       </section>`)
     .join("") || `<p class="trip-empty">No trip records</p>`;
+}
+
+function tripDetailsDialogMarkup() {
+  return `
+    <dialog class="record-dialog trip-details-dialog" aria-labelledby="trip-details-title">
+      <div class="dialog-header">
+        <div><p class="eyebrow">TRIP DETAILS</p><h2 id="trip-details-title">Trip</h2></div>
+        <button class="icon-button dialog-close" data-action="close-trip-details" type="button" aria-label="Close trip details">×</button>
+      </div>
+      <div class="trip-details-content"></div>
+    </dialog>`;
 }
 
 function renderResource(page) {
@@ -522,7 +544,8 @@ function renderResource(page) {
             <button class="button button-primary" type="submit" ${needsReferences ? "disabled" : ""}>Save trip</button>
           </div>
         </form>
-      </dialog>`;
+      </dialog>
+      ${tripDetailsDialogMarkup()}`;
   }
   return `
     ${header("FLEET DATA", config.title, `Create and review ${config.singular} records.`)}
@@ -773,6 +796,83 @@ function render() {
     : state.page === "payroll" ? renderPayroll() : renderResource(state.page);
 }
 
+function openTripDetails(tripId) {
+  const trip = state.data?.trips.find((record) => String(record.id) === String(tripId));
+  const dialog = view.querySelector(".trip-details-dialog");
+  if (!trip || !dialog) return;
+
+  const title = trip.ism_no ? `Trip ${trip.ism_no}` : `Trip #${trip.id}`;
+  dialog.querySelector("#trip-details-title").textContent = title;
+  const detailFields = [
+    ["Shipment date", trip.shipment_date],
+    ["Time in", trip.time_in],
+    ["Time out", trip.time_out],
+    ["Origin", trip.origin],
+    ["Destination", trip.destination],
+    ["Vehicle", [trip.plate_number, trip.make, trip.model].filter(Boolean).join(" · ")],
+    ["Driver", trip.driver_name],
+    ["Load", trip.load_details],
+    ["Trip/Fuel", trip.trip_fuel],
+    ["Route", trip.route],
+    ["Notes", trip.notes],
+  ];
+  const detailsMarkup = detailFields
+    .filter(([, value]) => value !== null && value !== undefined && String(value).trim())
+    .map(([label, value]) => `
+      <div class="trip-detail-item">
+        <dt>${escapeHtml(label)}</dt>
+        <dd>${escapeHtml(value)}</dd>
+      </div>`)
+    .join("");
+  const imageMarkup = trip.manifest_image_url
+    ? `<section class="trip-manifest-preview">
+        <h3>Load manifest</h3>
+        <a href="${escapeHtml(trip.manifest_image_url)}" target="_blank" rel="noopener">
+          <img src="${escapeHtml(trip.manifest_image_url)}" alt="Load manifest for ${escapeHtml(title)}" />
+        </a>
+      </section>`
+    : `<section class="trip-manifest-preview"><h3>Load manifest</h3><p>No manifest image uploaded yet.</p></section>`;
+  dialog.querySelector(".trip-details-content").innerHTML = `
+    <dl class="trip-details-grid">${detailsMarkup || "<p>No trip details available.</p>"}</dl>
+    ${imageMarkup}
+    <form class="trip-manifest-upload" data-trip-id="${escapeHtml(trip.id)}">
+      <label class="form-field">
+        <span>${trip.manifest_image_url ? "Replace load manifest image" : "Upload load manifest image"}</span>
+        <input name="image" type="file" accept="image/jpeg,image/png,image/webp" required />
+        <small class="field-hint">JPG, PNG, or WEBP image, up to 10 MB.</small>
+      </label>
+      <p class="dialog-error" role="alert" hidden></p>
+      <button class="button button-secondary" type="submit">${trip.manifest_image_url ? "Replace image" : "Upload image"}</button>
+    </form>`;
+  if (!dialog.open) dialog.showModal();
+}
+
+async function uploadTripManifest(form) {
+  if (!form.reportValidity()) return;
+  const tripId = form.dataset.tripId;
+  const image = form.elements.image.files[0];
+  const button = form.querySelector('button[type="submit"]');
+  const errorMessage = form.querySelector(".dialog-error");
+  const body = new FormData();
+  body.append("image", image);
+  button.disabled = true;
+  errorMessage.hidden = true;
+  try {
+    await api(`/api/trips/${encodeURIComponent(tripId)}/manifest`, {
+      method: "POST",
+      body,
+    });
+    const trip = state.data.trips.find((record) => String(record.id) === String(tripId));
+    if (trip) trip.manifest_image_url = `/api/trips/${encodeURIComponent(tripId)}/manifest`;
+    openTripDetails(tripId);
+    showToast("Load manifest image uploaded.");
+  } catch (error) {
+    errorMessage.textContent = error.message || "Could not upload the manifest image.";
+    errorMessage.hidden = false;
+    button.disabled = false;
+  }
+}
+
 async function submitForm(form) {
   const page = form.dataset.form;
   const config = RESOURCE_CONFIG[page];
@@ -992,6 +1092,12 @@ async function exportTripHistory() {
 }
 
 view.addEventListener("submit", (event) => {
+  const manifestForm = event.target.closest(".trip-manifest-upload");
+  if (manifestForm) {
+    event.preventDefault();
+    uploadTripManifest(manifestForm);
+    return;
+  }
   const payrollForm = event.target.closest("#payroll-period-form, #cash-advance-form, #overdraft-form");
   if (payrollForm) {
     event.preventDefault();
@@ -1026,6 +1132,11 @@ view.addEventListener("input", (event) => {
 view.addEventListener("click", (event) => {
   const button = event.target.closest("[data-action]");
   if (!button) return;
+  if (button.dataset.action === "trip-details") {
+    if (event.target.closest("a, button")) return;
+    openTripDetails(button.dataset.id);
+    return;
+  }
   if (button.dataset.action === "retry" || button.dataset.action === "refresh") loadData();
   if (button.dataset.action === "payroll-reload") {
     state.payrollRequestedKey = "";
@@ -1051,7 +1162,17 @@ view.addEventListener("click", (event) => {
   if (button.dataset.action === "close-record") {
     button.closest("dialog")?.close();
   }
+  if (button.dataset.action === "close-trip-details") {
+    button.closest("dialog")?.close();
+  }
   if (button.dataset.action === "delete") deleteRecord(button);
+});
+
+view.addEventListener("keydown", (event) => {
+  const row = event.target.closest('tr[data-action="trip-details"]');
+  if (!row || !["Enter", " "].includes(event.key)) return;
+  event.preventDefault();
+  openTripDetails(row.dataset.id);
 });
 
 view.addEventListener("change", (event) => {

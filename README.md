@@ -29,7 +29,12 @@ by default, and remembers the selected theme in the browser.
 Run [`supabase_dispatcher_ownership_migration.sql`](./supabase_dispatcher_ownership_migration.sql)
 in the Supabase SQL Editor before using dispatcher accounts. It adds immutable
 `created_by` ownership fields to trips, fuel logs, and maintenance records.
-Existing records remain unowned and are visible only to administrators.
+It also adds private image storage for trip load manifests and fuel invoices.
+If you ran an earlier version of this migration, run the updated file again;
+the changes are safe to reapply. The migration also advances the trip, fuel,
+and maintenance ID counters past existing records, which prevents duplicate
+IDs after CSV imports. Existing records remain unowned and are visible only to
+administrators.
 
 Set a dispatcher's role to `dispatcher` in that user's Supabase **User Metadata**
 to enable the compatibility role restriction. Prefer setting `role` in
@@ -42,6 +47,17 @@ Dispatchers can access their own trips, fuel logs, and maintenance records and
 the shared vehicle/driver choices needed to submit them. Payroll, system
 exports, fleet-wide pages, and delete requests are denied by the server as well
 as hidden in the dispatcher interface.
+
+Trip entry accepts an optional load-manifest image, and fuel-log entry accepts
+an optional invoice image. JPG, PNG, and WEBP files are decoded and validated
+on the server and limited to 10 MB by default. Set
+`DOCUMENT_IMAGE_MAX_BYTES` to change the server-side per-image limit (up to the
+bucket's 50 MB limit). Images are stored in a private Supabase Storage bucket
+and delivered through record-ownership-checked app endpoints; they are not
+public URLs. Selecting a trip row in the dashboard or Trips page opens a
+details popup with its route, vehicle, driver, shipment information, and
+uploaded load manifest when available. The popup also lets authorized users
+upload a missing manifest later or replace the current image.
 
 The web app requires Supabase email/password authentication. Its access and
 refresh tokens are stored in HttpOnly, SameSite browser-session cookies;

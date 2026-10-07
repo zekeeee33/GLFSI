@@ -354,6 +354,18 @@ tbody tr:hover { background: var(--table-hover); }
   box-shadow: 0 28px 90px rgb(13 24 48 / 28%);
 }
 .record-dialog::backdrop { background: rgb(12 20 38 / 55%); backdrop-filter: blur(3px); }
+.clickable-row { cursor: pointer; }
+.clickable-row:hover { background: var(--table-hover); }
+.clickable-row:focus-visible { outline: 2px solid var(--blue); outline-offset: -2px; }
+.trip-details-content { padding: 20px 24px 24px; }
+.trip-details-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; margin: 0; }
+.trip-detail-item { min-width: 0; padding: 12px; border: 1px solid var(--border); border-radius: 9px; background: var(--surface-soft); }
+.trip-detail-item dt { margin-bottom: 5px; color: var(--muted); font-size: 10px; font-weight: 700; text-transform: uppercase; }
+.trip-detail-item dd { margin: 0; color: var(--ink); font-size: 13px; overflow-wrap: anywhere; }
+.trip-manifest-preview { margin-top: 20px; }
+.trip-manifest-preview h3 { margin-bottom: 10px; font-size: 14px; }
+.trip-manifest-preview p { color: var(--muted); font-size: 12px; }
+.trip-manifest-preview img { display: block; width: 100%; max-height: 55vh; object-fit: contain; border: 1px solid var(--border); border-radius: 10px; background: var(--surface-soft); }
 .dialog-header { position: sticky; top: 0; z-index: 1; display: flex; align-items: center; justify-content: space-between; gap: 16px; padding: 21px 24px 17px; border-bottom: 1px solid var(--border); background: color-mix(in srgb, var(--surface) 96%, transparent); backdrop-filter: blur(12px); }
 .dialog-header .eyebrow { margin-bottom: 5px; }
 .dialog-header h2 { font-size: 19px; }
@@ -363,6 +375,11 @@ tbody tr:hover { background: var(--table-hover); }
 .dialog-fields .form-field:has(textarea) { grid-column: 1 / -1; }
 .dialog-error { margin: 0 0 14px; color: var(--red); font-size: 12px; line-height: 1.5; }
 .dialog-actions { display: flex; justify-content: flex-end; gap: 10px; padding-top: 17px; border-top: 1px solid var(--border); }
+
+@media (max-width: 560px) {
+  .trip-details-grid { grid-template-columns: 1fr; }
+  .trip-details-content { padding: 16px; }
+}
 
 .toast-region { position: fixed; top: 88px; right: 27px; z-index: 50; display: grid; gap: 8px; }
 .toast { max-width: min(420px, calc(100vw - 35px)); padding: 13px 17px; border: 1px solid; border-radius: 11px; background: var(--surface-raised); color: var(--ink); box-shadow: var(--shadow-hover); font-size: 12px; animation: toast-in .24s var(--ease-ui) both; }

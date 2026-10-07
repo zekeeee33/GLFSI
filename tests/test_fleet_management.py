@@ -885,18 +885,31 @@ class FleetManagerTests(unittest.TestCase):
             data={"image": (BytesIO(image_bytes), "invoice.png")},
             headers={"X-CSRF-Token": csrf},
         )
+        bootstrap = client.get("/api/bootstrap")
         manifest_view = client.get(f"/api/trips/{trip['id']}/manifest")
         invoice_view = client.get(f"/api/fuel/{fuel['id']}/invoice")
         other_manifest_view = client.get(f"/api/trips/{other_trip['id']}/manifest")
 
         self.assertEqual(manifest_upload.status_code, 201)
         self.assertEqual(invoice_upload.status_code, 201)
+        self.assertEqual(
+            bootstrap.json["trips"][0]["manifest_image_url"],
+            f"/api/trips/{trip['id']}/manifest",
+        )
+        self.assertTrue(bootstrap.json["fuel_logs"][0]["invoice_image_url"].endswith("/invoice"))
         self.assertEqual(manifest_view.status_code, 200)
         self.assertEqual(invoice_view.status_code, 200)
         self.assertEqual(manifest_view.mimetype, "image/png")
         self.assertEqual(manifest_view.data, image_bytes)
         self.assertEqual(invoice_view.data, image_bytes)
         self.assertEqual(other_manifest_view.status_code, 403)
+
+        other_manifest_upload = client.post(
+            f"/api/trips/{other_trip['id']}/manifest",
+            data={"image": (BytesIO(image_bytes), "manifest.png")},
+            headers={"X-CSRF-Token": csrf},
+        )
+        self.assertEqual(other_manifest_upload.status_code, 403)
 
         invalid_image = client.post(
             f"/api/trips/{trip['id']}/manifest",

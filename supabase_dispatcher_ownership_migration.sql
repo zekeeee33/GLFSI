@@ -17,6 +17,27 @@ create index if not exists trips_created_by_idx on public.trips(created_by);
 create index if not exists fuel_logs_created_by_idx on public.fuel_logs(created_by);
 create index if not exists maintenance_created_by_idx on public.maintenance(created_by);
 
+select setval(
+    pg_get_serial_sequence('public.trips', 'id'),
+    coalesce(max(id), 1),
+    max(id) is not null
+)
+from public.trips;
+
+select setval(
+    pg_get_serial_sequence('public.fuel_logs', 'id'),
+    coalesce(max(id), 1),
+    max(id) is not null
+)
+from public.fuel_logs;
+
+select setval(
+    pg_get_serial_sequence('public.maintenance', 'id'),
+    coalesce(max(id), 1),
+    max(id) is not null
+)
+from public.maintenance;
+
 create or replace function public.prevent_record_owner_change()
 returns trigger
 language plpgsql
@@ -49,7 +70,7 @@ values (
     'fleet-trip-documents',
     'fleet-trip-documents',
     false,
-    10485760,
+    52428800,
     array['image/jpeg', 'image/png', 'image/webp']
 )
 on conflict (id) do update
