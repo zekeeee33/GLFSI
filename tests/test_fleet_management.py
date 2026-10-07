@@ -772,6 +772,9 @@ class FleetManagerTests(unittest.TestCase):
         response = client.get("/api/bootstrap")
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json["vehicles"][0]["plate_number"], "WEB-123")
+        self.assertEqual(response.json["dashboard"]["total_vehicles"], 1)
+        self.assertEqual(response.json["dashboard"]["active_drivers"], 1)
+        self.assertEqual(response.json["dashboard"]["recent_trips"], 1)
         trip = response.json["trips"][0]
         self.assertEqual(trip["shipment_date"], "2026-10-03")
         self.assertEqual(trip["plate_number"], "WEB-123")

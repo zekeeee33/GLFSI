@@ -1,5 +1,3 @@
-@import url("https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&family=Manrope:wght@500;600;700;800&display=swap");
-
 :root {
   color-scheme: light;
   --login-canvas: #f3f6fc;
@@ -9,7 +7,7 @@
   --login-border: #e4e9f2;
   --login-input: #dfe5f0;
   --ease-ui: cubic-bezier(.2, .75, .25, 1);
-  font-family: "DM Sans", "Segoe UI", sans-serif;
+  font-family: "Segoe UI", system-ui, sans-serif;
   color: var(--login-ink);
   background: var(--login-canvas);
   font-synthesis: none;
@@ -94,7 +92,7 @@ button:focus-visible, a:focus-visible, input:focus-visible { outline: 3px solid 
 
 .login-heading { margin: 38px 0 24px; }
 .login-eyebrow { margin: 0 0 9px; color: #7181ae; font-size: 10px; font-weight: 700; letter-spacing: 1.1px; }
-h1 { margin: 0; font-family: Manrope, "Segoe UI", sans-serif; font-size: 29px; font-weight: 800; letter-spacing: -1px; }
+h1 { margin: 0; font-family: "Segoe UI", system-ui, sans-serif; font-size: 29px; font-weight: 800; letter-spacing: -1px; }
 .login-heading > p:last-child { margin: 9px 0 0; color: var(--login-muted); font-size: 13px; line-height: 1.5; }
 
 #login-form { display: grid; gap: 10px; }

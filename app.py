@@ -417,6 +417,8 @@ def bootstrap() -> Any:
         trips = fleet.list_trips(user_id=user_id)
         fuel_logs = fleet.list_fuel_logs(user_id=user_id)
         maintenance = fleet.list_maintenance(user_id=user_id)
+        vehicles = fleet.list_vehicles()
+        drivers = fleet.list_drivers()
         today = time.strftime("%Y-%m-%d")
         _add_document_links(trips, "manifest_object_path", "manifest_image_url", "trip_manifest_image")
         _add_document_links(fuel_logs, "invoice_object_path", "invoice_image_url", "fuel_invoice_image")
@@ -433,11 +435,11 @@ def bootstrap() -> Any:
                 },
                 "vehicles": [
                     {key: row.get(key) for key in ("id", "plate_number", "make", "model")}
-                    for row in fleet.list_vehicles()
+                    for row in vehicles
                 ],
                 "drivers": [
                     {key: row.get(key) for key in ("id", "name", "status")}
-                    for row in fleet.list_drivers()
+                    for row in drivers
                 ],
                 "assignments": [],
                 "maintenance": maintenance,
@@ -449,15 +451,27 @@ def bootstrap() -> Any:
         )
     trips = fleet.list_trips()
     fuel_logs = fleet.list_fuel_logs()
+    maintenance = fleet.list_maintenance()
+    vehicles = fleet.list_vehicles()
+    drivers = fleet.list_drivers()
+    assignments = fleet.list_assignments()
     _add_document_links(trips, "manifest_object_path", "manifest_image_url", "trip_manifest_image")
     _add_document_links(fuel_logs, "invoice_object_path", "invoice_image_url", "fuel_invoice_image")
+    dashboard = {
+        "total_vehicles": len(vehicles),
+        "active_drivers": sum(driver["status"] == "active" for driver in drivers),
+        "assigned_vehicles": sum(vehicle["status"] == "assigned" for vehicle in vehicles),
+        "total_fuel_spend": sum(float(item["total_cost"] or 0) for item in fuel_logs),
+        "total_maintenance": sum(float(item["cost"] or 0) for item in maintenance),
+        "recent_trips": len(trips),
+    }
     return jsonify(
         {
-            "dashboard": fleet.dashboard(),
-            "vehicles": fleet.list_vehicles(),
-            "drivers": fleet.list_drivers(),
-            "assignments": fleet.list_assignments(),
-            "maintenance": fleet.list_maintenance(),
+            "dashboard": dashboard,
+            "vehicles": vehicles,
+            "drivers": drivers,
+            "assignments": assignments,
+            "maintenance": maintenance,
             "fuel_logs": fuel_logs,
             "trips": trips,
             "csrf_token": session.get("csrf_token"),

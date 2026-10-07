@@ -192,6 +192,7 @@ const state = {
 const view = document.querySelector("#app-view");
 let idleLogoutTimer;
 let lastActivityPing = 0;
+let searchRenderTimer;
 
 function returnToSignIn(expired = false) {
   window.location.replace(expired ? "/login?expired=1" : "/login");
@@ -269,6 +270,7 @@ async function api(path, options = {}) {
   const response = await fetch(path, {
     ...options,
     headers,
+    cache: "no-store",
   });
   const payload = await response.json().catch(() => ({}));
   if (!response.ok) {
@@ -336,12 +338,12 @@ function tableMarkup(rows, columns, resource, options = {}) {
   const headings = columns.map(([, label]) => `<th scope="col">${escapeHtml(label)}</th>`).join("");
   const actionHeader = resource ? '<th class="action-column" scope="col">Action</th>' : "";
   const body = rows.map((row) => {
-    const cells = columns.map(([key, , formatter]) => {
+    const cells = columns.map(([key, label, formatter]) => {
       const value = formatter ? formatter(row[key]) : escapeHtml(row[key] ?? "—");
-      return `<td>${value}</td>`;
+      return `<td data-label="${escapeHtml(label)}">${value}</td>`;
     }).join("");
     const action = resource
-      ? `<td class="action-column"><button class="icon-button delete-button" type="button" data-action="delete" data-resource="${escapeHtml(resource)}" data-id="${escapeHtml(row.id)}" aria-label="Delete record">×</button></td>`
+      ? `<td class="action-column" data-label="Action"><button class="icon-button delete-button" type="button" data-action="delete" data-resource="${escapeHtml(resource)}" data-id="${escapeHtml(row.id)}" aria-label="Delete record">×</button></td>`
       : "";
     const rowAttributes = options.rowAction
       ? `tabindex="0" role="button" class="clickable-row" data-action="${escapeHtml(options.rowAction)}" data-id="${escapeHtml(row.id)}" aria-label="View trip ${escapeHtml(row.ism_no || row.id)}"`
@@ -1255,11 +1257,16 @@ view.addEventListener("input", (event) => {
   }
   if (event.target.id !== "record-search") return;
   const position = event.target.selectionStart;
+  const restoreFocus = document.activeElement === event.target;
   state.search = event.target.value;
-  render();
-  const nextInput = document.querySelector("#record-search");
-  nextInput?.focus();
-  nextInput?.setSelectionRange(position, position);
+  window.clearTimeout(searchRenderTimer);
+  searchRenderTimer = window.setTimeout(() => {
+    render();
+    if (!restoreFocus) return;
+    const nextInput = document.querySelector("#record-search");
+    nextInput?.focus();
+    nextInput?.setSelectionRange(position, position);
+  }, 140);
 });
 
 view.addEventListener("click", (event) => {
@@ -1341,6 +1348,7 @@ function setSidebarOpen(open) {
   if (mobileNavigation.matches) {
     sidebar.classList.toggle("sidebar-open", open);
     sidebarBackdrop.classList.toggle("sidebar-backdrop-open", open);
+    document.body.classList.toggle("sidebar-navigation-open", open);
     menuToggle.setAttribute("aria-expanded", String(open));
     menuToggle.setAttribute("aria-label", open ? "Close navigation" : "Open navigation");
     if (open) sidebar.querySelector(".nav-link")?.focus();
@@ -1357,6 +1365,7 @@ setSidebarOpen(!mobileNavigation.matches && !appShell.classList.contains("sideba
 document.querySelectorAll(".nav-link").forEach((link) => {
   link.addEventListener("click", () => {
     state.search = "";
+    window.clearTimeout(searchRenderTimer);
     if (mobileNavigation.matches) setSidebarOpen(false);
   });
 });
@@ -1379,6 +1388,7 @@ document.addEventListener("keydown", (event) => {
 mobileNavigation.addEventListener("change", () => {
   sidebar.classList.remove("sidebar-open");
   sidebarBackdrop.classList.remove("sidebar-backdrop-open");
+  document.body.classList.remove("sidebar-navigation-open");
   menuToggle.setAttribute("aria-expanded", String(!appShell.classList.contains("sidebar-collapsed")));
   menuToggle.setAttribute(
     "aria-label",
@@ -1408,6 +1418,7 @@ document.querySelector("#sign-out").addEventListener("click", async (event) => {
 
 window.addEventListener("hashchange", () => {
   state.search = "";
+  window.clearTimeout(searchRenderTimer);
   render();
 });
 

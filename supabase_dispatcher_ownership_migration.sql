@@ -78,6 +78,20 @@ create trigger trips_edit_history
 create index if not exists trips_created_by_idx on public.trips(created_by);
 create index if not exists fuel_logs_created_by_idx on public.fuel_logs(created_by);
 create index if not exists maintenance_created_by_idx on public.maintenance(created_by);
+create index if not exists trips_created_by_shipment_date_idx
+    on public.trips(created_by, shipment_date desc);
+create index if not exists trips_shipment_date_idx
+    on public.trips(shipment_date desc);
+create index if not exists fuel_logs_created_by_logged_on_idx
+    on public.fuel_logs(created_by, logged_on desc);
+create index if not exists fuel_logs_logged_on_idx
+    on public.fuel_logs(logged_on desc);
+create index if not exists maintenance_created_by_performed_on_idx
+    on public.maintenance(created_by, performed_on desc);
+create index if not exists maintenance_performed_on_idx
+    on public.maintenance(performed_on desc);
+create index if not exists assignments_assigned_date_idx
+    on public.assignments(assigned_date desc);
 
 select setval(
     pg_get_serial_sequence('public.trips', 'id'),

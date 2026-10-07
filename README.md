@@ -65,6 +65,14 @@ The edit history is stored by a database trigger; run the current
 `supabase_dispatcher_ownership_migration.sql` in Supabase before deploying this
 feature. Dispatchers can edit only their own trips.
 
+The interface adapts record tables into labeled cards on narrow screens and
+uses device-safe viewport sizing for mobile dialogs and navigation. Fonts use
+local system stacks to avoid blocking initial rendering on an external font
+download. The bootstrap endpoint reuses its loaded records to calculate its
+dashboard summary instead of requesting those tables a second time. The
+dispatcher migration adds indexes for commonly sorted trip, fuel, maintenance,
+and assignment lists.
+
 The web app requires Supabase email/password authentication. Its access and
 refresh tokens are stored in HttpOnly, SameSite browser-session cookies;
 protected pages, data APIs, and report exports reject unauthenticated requests.
