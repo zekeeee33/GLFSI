@@ -9,6 +9,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 import app as web_app
+from PIL import Image
 from fleet_management import FleetManagementError, FleetManager, _supabase_project_url
 from openpyxl import load_workbook
 from payroll import calculate_driver_payroll, period_date, trip_rate
@@ -422,6 +423,24 @@ class FakeSupabaseClient:
         return FakeQuery(self, table_name)
 
 
+class FakeStorage:
+    def __init__(self):
+        self.files = {}
+
+    def from_(self, _bucket):
+        return self
+
+    def upload(self, path, file, _options):
+        self.files[path] = file
+
+    def download(self, path):
+        return self.files[path]
+
+    def remove(self, paths):
+        for path in paths:
+            self.files.pop(path, None)
+
+
 class FakeAuthClient:
     def __init__(self):
         self.auth = self
@@ -562,6 +581,88 @@ class FleetManagerTests(unittest.TestCase):
         self.assertEqual(workbook["Maintenance"]["E5"].data_type, "s")
         self.assertEqual(workbook["Trips"]["G5"].value, "Manila")
 
+    def test_web_trip_history_export_returns_trip_details_as_excel(self):
+        vehicle = self.manager.add_vehicle("TRIP-XLS-1", "Toyota", "Hiace", 2024)
+        driver = self.manager.add_driver("Trip Export Driver", "TRIP-DL-1")
+        self.manager.add_trip(
+            vehicle["id"],
+            driver["id"],
+            "Manila to Cavite",
+            100,
+            150,
+            ism_no="ISM-TRIP-1",
+            shipment_date="2026-10-05",
+            time_in="08:15",
+            time_out="10:30",
+            origin="Manila",
+            destination="Cavite",
+            load_details="12 cartons",
+            trip_fuel="Diesel",
+        )
+        web_app.manager = self.manager
+        web_app.app.config["TESTING"] = True
+        client = web_app.app.test_client()
+        self.sign_in(client)
+
+        response = client.get("/api/export/trips")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(
+            response.mimetype,
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )
+        self.assertIn("trip_history.xlsx", response.headers["Content-Disposition"])
+        workbook = load_workbook(BytesIO(response.data), data_only=True)
+        self.assertEqual(workbook.sheetnames, ["Trip History"])
+        trips = workbook["Trip History"]
+        self.assertEqual(trips["B4"].value, "Ism No")
+        self.assertEqual(trips["B5"].value, "ISM-TRIP-1")
+        self.assertEqual(trips["F5"].value, "Manila")
+        self.assertEqual(trips["H5"].value, "TRIP-XLS-1")
+        self.assertEqual(trips["K5"].value, "Trip Export Driver")
+        self.assertEqual(trips["C5"].number_format, "yyyy-mm-dd")
+        self.assertEqual(trips["D5"].number_format, "hh:mm")
+        self.assertEqual(trips.freeze_panes, "A5")
+        self.assertEqual(trips.auto_filter.ref, "A4:R5")
+
+    def test_web_trip_history_export_uses_selected_group_and_search(self):
+        vehicle = self.manager.add_vehicle("TRIP-XLS-2", "Toyota", "Hiace", 2024)
+        first_driver = self.manager.add_driver("Alpha Driver", "TRIP-DL-2")
+        second_driver = self.manager.add_driver("Beta Driver", "TRIP-DL-3")
+        self.manager.add_trip(
+            vehicle["id"],
+            first_driver["id"],
+            "Manila to Cavite",
+            100,
+            150,
+            ism_no="MATCH-TRIP",
+            origin="Manila",
+            destination="Cavite",
+        )
+        self.manager.add_trip(
+            vehicle["id"],
+            second_driver["id"],
+            "Cavite to Manila",
+            150,
+            200,
+            ism_no="OTHER-TRIP",
+            origin="Cavite",
+            destination="Manila",
+        )
+        web_app.manager = self.manager
+        web_app.app.config["TESTING"] = True
+        client = web_app.app.test_client()
+        self.sign_in(client)
+
+        response = client.get(
+            "/api/export/trips?group_by=driver_name&search=MATCH-TRIP"
+        )
+
+        self.assertEqual(response.status_code, 200)
+        workbook = load_workbook(BytesIO(response.data), data_only=True)
+        self.assertEqual(workbook.sheetnames, ["Alpha Driver"])
+        self.assertEqual(workbook["Alpha Driver"]["B5"].value, "MATCH-TRIP")
+
     def test_cli_export_report_defaults_to_excel_file(self):
         from fleet_management import _build_cli
 
@@ -675,6 +776,134 @@ class FleetManagerTests(unittest.TestCase):
         self.assertEqual(trip["shipment_date"], "2026-10-03")
         self.assertEqual(trip["plate_number"], "WEB-123")
         self.assertEqual(trip["driver_name"], "Web Driver")
+
+    def test_dispatcher_is_limited_to_owned_records_and_allowed_endpoints(self):
+        web_app.manager = self.manager
+        web_app.app.config["TESTING"] = True
+        vehicle = self.manager.add_vehicle("DSP-123", "Toyota", "Hiace", 2022)
+        driver = self.manager.add_driver("Dispatcher Driver", "DSP-DL-1")
+        own_trip = self.manager.add_trip(
+            vehicle["id"], driver["id"], "Origin to Destination", 0, 0,
+            ism_no="DSP-OWN", origin="Origin", destination="Destination",
+            created_by="auth-user-1",
+        )
+        self.manager.add_trip(
+            vehicle["id"], driver["id"], "Other to Route", 0, 0,
+            ism_no="OTHER-TRIP", origin="Other", destination="Route",
+            created_by="another-dispatcher",
+        )
+        auth_client = FakeAuthClient()
+        auth_client.user.user_metadata = {"role": "dispatcher", "full_name": "Dispatch User"}
+        auth_client.user.app_metadata = {"role": "administrator"}
+        client = web_app.app.test_client()
+        self.sign_in(client, auth_client)
+
+        bootstrap = client.get("/api/bootstrap")
+        self.assertEqual(bootstrap.status_code, 200)
+        self.assertEqual(bootstrap.json["user"]["role"], "dispatcher")
+        self.assertEqual([row["id"] for row in bootstrap.json["trips"]], [own_trip["id"]])
+        self.assertEqual(bootstrap.json["dashboard"]["total_trips"], 1)
+        self.assertNotIn("total_vehicles", bootstrap.json["dashboard"])
+        self.assertEqual(
+            bootstrap.json["drivers"],
+            [{"id": driver["id"], "name": "Dispatcher Driver", "status": "active"}],
+        )
+
+        csrf = bootstrap.json["csrf_token"]
+        denied_vehicle_create = client.post(
+            "/api/vehicles",
+            json={"plate_number": "DENIED", "make": "Toyota", "model": "Hiace", "year": 2022},
+            headers={"X-CSRF-Token": csrf},
+        )
+        denied_vehicle_list = client.get("/api/vehicles")
+        denied_driver_list = client.get("/api/drivers")
+        denied_payroll = client.get("/api/payroll?start_date=2026-10-01&end_date=2026-10-31")
+        denied_export = client.get("/api/export")
+        denied_delete = client.delete(
+            f"/api/trips/{own_trip['id']}",
+            headers={"X-CSRF-Token": csrf},
+        )
+        self.assertEqual(denied_vehicle_create.status_code, 403)
+        self.assertEqual(denied_vehicle_list.status_code, 403)
+        self.assertEqual(denied_driver_list.status_code, 403)
+        self.assertEqual(denied_payroll.status_code, 403)
+        self.assertEqual(denied_export.status_code, 403)
+        self.assertEqual(denied_delete.status_code, 403)
+
+        created_trip = client.post(
+            "/api/trips",
+            json={
+                "ism_no": "DSP-NEW",
+                "shipment_date": "2026-10-03",
+                "origin": "Origin",
+                "destination": "Destination",
+                "vehicle_id": vehicle["id"],
+                "driver_id": driver["id"],
+                "created_by": "another-dispatcher",
+            },
+            headers={"X-CSRF-Token": csrf},
+        )
+        self.assertEqual(created_trip.status_code, 400)
+        self.assertEqual(len(self.manager.list_trips(user_id="auth-user-1")), 1)
+
+    def test_dispatcher_can_upload_and_view_owned_trip_manifest_and_fuel_invoice(self):
+        web_app.manager = self.manager
+        web_app.app.config["TESTING"] = True
+        self.manager.client.storage = FakeStorage()
+        vehicle = self.manager.add_vehicle("DOC-123", "Toyota", "Hiace", 2022)
+        driver = self.manager.add_driver("Document Driver", "DOC-DL-1")
+        trip = self.manager.add_trip(
+            vehicle["id"], driver["id"], "Origin to Destination", 0, 0,
+            ism_no="DOC-TRIP", origin="Origin", destination="Destination",
+            created_by="auth-user-1",
+        )
+        other_trip = self.manager.add_trip(
+            vehicle["id"], driver["id"], "Other to Destination", 0, 0,
+            ism_no="OTHER-DOC-TRIP", origin="Other", destination="Destination",
+            created_by="another-dispatcher",
+        )
+        fuel = self.manager.add_fuel(
+            vehicle["id"], "diesel", 20, 1.5, created_by="auth-user-1"
+        )
+
+        auth_client = FakeAuthClient()
+        auth_client.user.user_metadata = {"role": "dispatcher"}
+        client = web_app.app.test_client()
+        self.sign_in(client, auth_client)
+        csrf = self.csrf_token(client)
+
+        image = BytesIO()
+        Image.new("RGB", (2, 2), color="blue").save(image, format="PNG")
+        image_bytes = image.getvalue()
+        manifest_upload = client.post(
+            f"/api/trips/{trip['id']}/manifest",
+            data={"image": (BytesIO(image_bytes), "manifest.png")},
+            headers={"X-CSRF-Token": csrf},
+        )
+        invoice_upload = client.post(
+            f"/api/fuel/{fuel['id']}/invoice",
+            data={"image": (BytesIO(image_bytes), "invoice.png")},
+            headers={"X-CSRF-Token": csrf},
+        )
+        manifest_view = client.get(f"/api/trips/{trip['id']}/manifest")
+        invoice_view = client.get(f"/api/fuel/{fuel['id']}/invoice")
+        other_manifest_view = client.get(f"/api/trips/{other_trip['id']}/manifest")
+
+        self.assertEqual(manifest_upload.status_code, 201)
+        self.assertEqual(invoice_upload.status_code, 201)
+        self.assertEqual(manifest_view.status_code, 200)
+        self.assertEqual(invoice_view.status_code, 200)
+        self.assertEqual(manifest_view.mimetype, "image/png")
+        self.assertEqual(manifest_view.data, image_bytes)
+        self.assertEqual(invoice_view.data, image_bytes)
+        self.assertEqual(other_manifest_view.status_code, 403)
+
+        invalid_image = client.post(
+            f"/api/trips/{trip['id']}/manifest",
+            data={"image": (BytesIO(b"not an image"), "manifest.png")},
+            headers={"X-CSRF-Token": csrf},
+        )
+        self.assertEqual(invalid_image.status_code, 400)
 
     def test_web_reports_missing_supabase_configuration(self):
         web_app.manager = None
@@ -836,6 +1065,23 @@ class FleetManagerTests(unittest.TestCase):
             "glfs_refresh_token=;" in cookie
             for cookie in response.headers.getlist("Set-Cookie")
         ))
+
+    def test_idle_browser_redirect_shows_inactivity_notice(self):
+        web_app.app.config["TESTING"] = True
+        client = web_app.app.test_client()
+        self.sign_in(client)
+        with client.session_transaction() as browser_session:
+            browser_session["last_activity"] = (
+                time.time() - web_app.SESSION_IDLE_TIMEOUT_SECONDS - 1
+            )
+
+        response = client.get("/")
+
+        self.assertEqual(response.status_code, 302)
+        self.assertIn("/login?expired=1", response.headers["Location"])
+        login_page = client.get(response.headers["Location"])
+        self.assertIn(b"You have been logged out due to inactivity.", login_page.data)
+        login_page.close()
 
     def test_expired_browser_redirect_forces_login_page(self):
         web_app.app.config["TESTING"] = True

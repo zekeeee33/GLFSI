@@ -24,6 +24,25 @@ by default, and remembers the selected theme in the browser.
 6. In Supabase **Authentication → Users**, invite or create each authorized
    user's email/password account. Public sign-up is not enabled by this app.
 
+## Dispatcher roles and data isolation
+
+Run [`supabase_dispatcher_ownership_migration.sql`](./supabase_dispatcher_ownership_migration.sql)
+in the Supabase SQL Editor before using dispatcher accounts. It adds immutable
+`created_by` ownership fields to trips, fuel logs, and maintenance records.
+Existing records remain unowned and are visible only to administrators.
+
+Set a dispatcher's role to `dispatcher` in that user's Supabase **User Metadata**
+to enable the compatibility role restriction. Prefer setting `role` in
+**App Metadata** when provisioning accounts server-side; App Metadata is
+administrator-controlled. The application never accepts `administrator` from
+User Metadata as an authorization grant. Users without an explicit dispatcher
+role retain the existing administrator access model.
+
+Dispatchers can access their own trips, fuel logs, and maintenance records and
+the shared vehicle/driver choices needed to submit them. Payroll, system
+exports, fleet-wide pages, and delete requests are denied by the server as well
+as hidden in the dispatcher interface.
+
 The web app requires Supabase email/password authentication. Its access and
 refresh tokens are stored in HttpOnly, SameSite browser-session cookies;
 protected pages, data APIs, and report exports reject unauthenticated requests.

@@ -3,6 +3,11 @@
 const form = document.querySelector("#login-form");
 const submit = document.querySelector("#login-submit");
 const errorMessage = document.querySelector("#login-error");
+const inactivityNotice = document.querySelector("#inactivity-notice");
+
+if (new URLSearchParams(window.location.search).get("expired") === "1") {
+  inactivityNotice.hidden = false;
+}
 
 form.addEventListener("submit", async (event) => {
   event.preventDefault();

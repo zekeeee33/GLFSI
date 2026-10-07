@@ -1,5 +1,7 @@
 @import url("https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&family=Manrope:wght@500;600;700;800&display=swap");
 
+[hidden] { display: none !important; }
+
 :root {
   color-scheme: light;
   --canvas: #f3f6fc;
@@ -145,6 +147,8 @@ button:focus-visible, a:focus-visible, input:focus-visible, select:focus-visible
   transition: background .2s ease, color .2s ease, border-color .2s ease, transform .2s var(--ease-ui);
 }
 
+.nav-link[hidden] { display: none !important; }
+
 .nav-link:hover { background: rgb(255 255 255 / 6%); color: white; transform: translateX(2px); }
 .nav-link.active { border-color: rgb(130 157 255 / 13%); background: linear-gradient(100deg, #2b3f70, #26375f); color: white; box-shadow: inset 3px 0 #91a8ff; }
 .nav-icon { width: 20px; color: #98a9cc; font-size: 17px; text-align: center; }
@@ -269,6 +273,16 @@ h2 { margin-bottom: 0; font-size: 15px; font-weight: 700; letter-spacing: -.3px;
 .trips-report { width: 100%; }
 .trips-report .table-wrap { overflow-x: auto; }
 .trips-report table { min-width: 1120px; }
+.trip-view-tabs { display: flex; flex-wrap: wrap; gap: 7px; margin: 0 0 13px; }
+.trip-view-tab { min-height: 34px; padding: 0 12px; border: 1px solid var(--border); border-radius: 8px; background: var(--surface); color: var(--muted); cursor: pointer; font: inherit; font-size: 11px; font-weight: 600; }
+.trip-view-tab:hover { border-color: var(--blue); color: var(--blue); }
+.trip-view-tab-active { border-color: var(--blue); background: var(--blue); color: #fff; }
+.trip-view-tab-active:hover { color: #fff; }
+.trip-group + .trip-group { margin-top: 17px; padding-top: 16px; border-top: 1px solid var(--border); }
+.trip-group-heading { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin-bottom: 9px; }
+.trip-group-heading h3 { margin: 0; font-size: 14px; }
+.trip-group-heading .record-count { margin: 0; }
+.trip-empty { margin: 0; color: var(--muted); font-size: 12px; }
 .records-heading { align-items: end; margin-bottom: 12px; }
 .search-box { display: flex; width: min(230px, 44%); min-height: 39px; align-items: center; gap: 8px; padding: 0 11px; border: 1px solid var(--border); border-radius: 9px; color: #8c96a8; transition: border-color .18s ease, box-shadow .18s ease; }
 .search-box input { min-height: 32px; padding: 0; border: 0; box-shadow: none !important; }

@@ -114,12 +114,15 @@ class FleetManager:
         table: str,
         select: str,
         order: Optional[tuple[str, str]] = None,
+        filters: Optional[List[tuple[str, Any]]] = None,
     ) -> List[Dict[str, Any]]:
         page_size = 1000
         offset = 0
         result: List[Dict[str, Any]] = []
         while True:
             query = self.client.table(table).select(select)
+            for column, value in filters or []:
+                query = query.eq(column, value)
             if order:
                 column, direction = order
                 query = query.order(column, desc=direction == "desc")
@@ -151,10 +154,15 @@ class FleetManager:
         self._execute(self.client.table(table).delete().eq("id", record_id))
 
     def _related_list(
-        self, table: str, select: str, order: tuple[str, str]
+        self,
+        table: str,
+        select: str,
+        order: tuple[str, str],
+        owner_id: Optional[str] = None,
     ) -> List[Dict[str, Any]]:
         rows = []
-        for row in self._select_all(table, select, order):
+        filters = [("created_by", owner_id)] if owner_id is not None else None
+        for row in self._select_all(table, select, order, filters):
             driver = row.pop("driver", None)
             vehicle = row.pop("vehicle", None)
             if isinstance(driver, dict):
@@ -177,6 +185,30 @@ class FleetManager:
             self.client.table(table).select("id").eq("id", record_id).limit(1)
         )
         return bool(response.data)
+
+    @staticmethod
+    def _normalize_owner(value: Optional[Any]) -> Optional[str]:
+        if value is None:
+            return None
+        text = str(value).strip()
+        return text or None
+
+    @classmethod
+    def _matches_owner(cls, row: Dict[str, Any], user_id: Optional[str]) -> bool:
+        if user_id is None:
+            return True
+        owner_value = cls._normalize_owner(
+            row.get("created_by")
+            or row.get("dispatcher_id")
+            or row.get("user_id")
+        )
+        return owner_value == cls._normalize_owner(user_id)
+
+    @classmethod
+    def _filter_owned_rows(cls, rows: List[Dict[str, Any]], user_id: Optional[str]) -> List[Dict[str, Any]]:
+        if user_id is None:
+            return rows
+        return [row for row in rows if cls._matches_owner(row, user_id)]
 
     def add_vehicle(
         self,
@@ -315,31 +347,38 @@ class FleetManager:
         description: Optional[str],
         cost: float,
         performed_on: Optional[str] = None,
+        created_by: Optional[Any] = None,
     ) -> Dict[str, Any]:
         if not self._exists("vehicles", vehicle_id):
             raise FleetManagementError(f"Vehicle {vehicle_id} not found")
         if not service_type:
             raise FleetManagementError("service_type is required")
-        return self._insert(
-            "maintenance",
-            {
-                "vehicle_id": vehicle_id,
-                "service_type": service_type.strip(),
-                "description": description,
-                "cost": float(cost),
-                "performed_on": performed_on or datetime.now().date().isoformat(),
-            },
-        )
+        owner = self._normalize_owner(created_by)
+        payload = {
+            "vehicle_id": vehicle_id,
+            "service_type": service_type.strip(),
+            "description": description,
+            "cost": float(cost),
+            "performed_on": performed_on or datetime.now().date().isoformat(),
+        }
+        if owner is not None:
+            payload["created_by"] = owner
+        return self._insert("maintenance", payload)
 
-    def get_maintenance(self, maintenance_id: int) -> Dict[str, Any]:
-        return self._get("maintenance", maintenance_id)
+    def get_maintenance(self, maintenance_id: int, user_id: Optional[str] = None) -> Dict[str, Any]:
+        row = self._get("maintenance", maintenance_id)
+        if user_id is not None and not self._matches_owner(row, user_id):
+            raise FleetManagementError(f"You do not have access to maintenance record {maintenance_id}")
+        return row
 
-    def list_maintenance(self) -> List[Dict[str, Any]]:
-        return self._related_list(
+    def list_maintenance(self, user_id: Optional[str] = None) -> List[Dict[str, Any]]:
+        rows = self._related_list(
             "maintenance",
             "*,vehicle:vehicles(plate_number)",
             ("performed_on", "desc"),
+            owner_id=user_id,
         )
+        return rows if user_id is None else self._filter_owned_rows(rows, user_id)
 
     def add_fuel(
         self,
@@ -349,32 +388,54 @@ class FleetManager:
         price_per_liter: float,
         total_cost: Optional[float] = None,
         logged_on: Optional[str] = None,
+        created_by: Optional[Any] = None,
     ) -> Dict[str, Any]:
         if not self._exists("vehicles", vehicle_id):
             raise FleetManagementError(f"Vehicle {vehicle_id} not found")
         if not fuel_type or quantity <= 0 or price_per_liter <= 0:
             raise FleetManagementError("fuel_type is required; quantity and price_per_liter must be positive")
-        return self._insert(
-            "fuel_logs",
-            {
-                "vehicle_id": vehicle_id,
-                "fuel_type": fuel_type.strip(),
-                "quantity": float(quantity),
-                "price_per_liter": float(price_per_liter),
-                "total_cost": float(total_cost) if total_cost is not None else quantity * price_per_liter,
-                "logged_on": logged_on or datetime.now().date().isoformat(),
-            },
+        owner = self._normalize_owner(created_by)
+        payload = {
+            "vehicle_id": vehicle_id,
+            "fuel_type": fuel_type.strip(),
+            "quantity": float(quantity),
+            "price_per_liter": float(price_per_liter),
+            "total_cost": float(total_cost) if total_cost is not None else quantity * price_per_liter,
+            "logged_on": logged_on or datetime.now().date().isoformat(),
+        }
+        if owner is not None:
+            payload["created_by"] = owner
+        return self._insert("fuel_logs", payload)
+
+    def get_fuel(self, fuel_id: int, user_id: Optional[str] = None) -> Dict[str, Any]:
+        row = self._get("fuel_logs", fuel_id)
+        if user_id is not None and not self._matches_owner(row, user_id):
+            raise FleetManagementError(f"You do not have access to fuel log {fuel_id}")
+        return row
+
+    def set_fuel_invoice_path(
+        self, fuel_id: int, object_path: str, user_id: Optional[str] = None
+    ) -> None:
+        self.get_fuel(fuel_id, user_id)
+        query = (
+            self.client.table("fuel_logs")
+            .update({"invoice_object_path": object_path})
+            .eq("id", fuel_id)
         )
+        if user_id is not None:
+            query = query.eq("created_by", user_id)
+        response = self._execute(query.select("id"))
+        if not response.data:
+            raise FleetManagementError(f"Fuel log {fuel_id} was not found or is not accessible")
 
-    def get_fuel(self, fuel_id: int) -> Dict[str, Any]:
-        return self._get("fuel_logs", fuel_id)
-
-    def list_fuel_logs(self) -> List[Dict[str, Any]]:
-        return self._related_list(
+    def list_fuel_logs(self, user_id: Optional[str] = None) -> List[Dict[str, Any]]:
+        rows = self._related_list(
             "fuel_logs",
             "*,vehicle:vehicles(plate_number)",
             ("logged_on", "desc"),
+            owner_id=user_id,
         )
+        return rows if user_id is None else self._filter_owned_rows(rows, user_id)
 
     def add_trip(
         self,
@@ -393,6 +454,7 @@ class FleetManager:
         destination: Optional[str] = None,
         load_details: Optional[str] = None,
         trip_fuel: Optional[str] = None,
+        created_by: Optional[Any] = None,
     ) -> Dict[str, Any]:
         if not self._exists("vehicles", vehicle_id):
             raise FleetManagementError(f"Vehicle {vehicle_id} not found")
@@ -402,6 +464,7 @@ class FleetManager:
             raise FleetManagementError("route is required")
         if start_odometer < 0 or end_odometer < start_odometer:
             raise FleetManagementError("odometer readings must be non-negative and end cannot be lower than start")
+        owner = self._normalize_owner(created_by)
         trip = self._insert(
             "trips",
             {
@@ -420,6 +483,7 @@ class FleetManager:
                 "destination": destination.strip() if destination else None,
                 "load_details": load_details.strip() if load_details else None,
                 "trip_fuel": trip_fuel.strip() if trip_fuel else None,
+                **({"created_by": owner} if owner is not None else {}),
             },
         )
         if end_odometer > 0:
@@ -430,7 +494,7 @@ class FleetManager:
             )
         return trip
 
-    def get_trip(self, trip_id: int) -> Dict[str, Any]:
+    def get_trip(self, trip_id: int, user_id: Optional[str] = None) -> Dict[str, Any]:
         response = self._execute(
             self.client.table("trips")
             .select("*,driver:drivers(name),vehicle:vehicles(plate_number,make,model)")
@@ -440,6 +504,8 @@ class FleetManager:
         if not response.data:
             raise FleetManagementError(f"Trip {trip_id} not found")
         row = dict(response.data[0])
+        if user_id is not None and not self._matches_owner(row, user_id):
+            raise FleetManagementError(f"You do not have access to trip {trip_id}")
         driver = row.pop("driver", None)
         vehicle = row.pop("vehicle", None)
         if isinstance(driver, dict):
@@ -448,12 +514,29 @@ class FleetManager:
             row.update({key: vehicle.get(key) for key in ("plate_number", "make", "model")})
         return row
 
-    def list_trips(self) -> List[Dict[str, Any]]:
-        return self._related_list(
+    def set_trip_manifest_path(
+        self, trip_id: int, object_path: str, user_id: Optional[str] = None
+    ) -> None:
+        self.get_trip(trip_id, user_id)
+        query = (
+            self.client.table("trips")
+            .update({"manifest_object_path": object_path})
+            .eq("id", trip_id)
+        )
+        if user_id is not None:
+            query = query.eq("created_by", user_id)
+        response = self._execute(query.select("id"))
+        if not response.data:
+            raise FleetManagementError(f"Trip {trip_id} was not found or is not accessible")
+
+    def list_trips(self, user_id: Optional[str] = None) -> List[Dict[str, Any]]:
+        rows = self._related_list(
             "trips",
             "*,driver:drivers(name),vehicle:vehicles(plate_number,make,model)",
             ("shipment_date", "desc"),
+            owner_id=user_id,
         )
+        return rows if user_id is None else self._filter_owned_rows(rows, user_id)
 
     def payroll_report(self, start_date: str, end_date: str) -> Dict[str, Any]:
         from payroll import PayrollService
@@ -513,21 +596,33 @@ class FleetManager:
             start_date, end_date, settle_overdraft, actor_id
         )
 
-    def delete_trip(self, trip_id: int) -> None:
+    def delete_trip(self, trip_id: int, user_id: Optional[str] = None) -> None:
+        if user_id is not None:
+            row = self.get_trip(trip_id)
+            if not self._matches_owner(row, user_id):
+                raise FleetManagementError(f"You do not have access to trip {trip_id}")
         self._delete("trips", trip_id)
 
-    def delete_maintenance(self, maintenance_id: int) -> None:
+    def delete_maintenance(self, maintenance_id: int, user_id: Optional[str] = None) -> None:
+        if user_id is not None:
+            row = self.get_maintenance(maintenance_id)
+            if not self._matches_owner(row, user_id):
+                raise FleetManagementError(f"You do not have access to maintenance record {maintenance_id}")
         self._delete("maintenance", maintenance_id)
 
-    def delete_fuel_log(self, fuel_id: int) -> None:
+    def delete_fuel_log(self, fuel_id: int, user_id: Optional[str] = None) -> None:
+        if user_id is not None:
+            row = self.get_fuel(fuel_id)
+            if not self._matches_owner(row, user_id):
+                raise FleetManagementError(f"You do not have access to fuel log {fuel_id}")
         self._delete("fuel_logs", fuel_id)
 
-    def dashboard(self) -> Dict[str, Any]:
+    def dashboard(self, user_id: Optional[str] = None) -> Dict[str, Any]:
         vehicles = self._list("vehicles", select="status")
         drivers = self._list("drivers", select="status")
-        fuel_logs = self._list("fuel_logs", select="total_cost")
-        maintenance = self._list("maintenance", select="cost")
-        trips = self._list("trips", select="id")
+        fuel_logs = self._filter_owned_rows(self._list("fuel_logs", select="total_cost"), user_id)
+        maintenance = self._filter_owned_rows(self._list("maintenance", select="cost"), user_id)
+        trips = self._filter_owned_rows(self._list("trips", select="id"), user_id)
         return {
             "total_vehicles": len(vehicles),
             "active_drivers": sum(driver["status"] == "active" for driver in drivers),

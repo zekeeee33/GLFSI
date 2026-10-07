@@ -112,6 +112,16 @@ h1 { margin: 0; font-family: Manrope, "Segoe UI", sans-serif; font-size: 29px; f
 #login-form input:focus { border-color: #6c86e8; outline: 3px solid rgb(49 89 219 / 12%); }
 
 .login-error { margin: 4px 0; color: #b33c4a; font-size: 12px; line-height: 1.5; }
+.login-notice {
+  margin: 0 0 16px;
+  padding: 11px 13px;
+  border: 1px solid #b8dfc8;
+  border-radius: 9px;
+  background: #effaf3;
+  color: #24613b;
+  font-size: 12px;
+  line-height: 1.5;
+}
 .login-submit {
   display: flex;
   min-height: 46px;
@@ -144,6 +154,11 @@ h1 { margin: 0; font-family: Manrope, "Segoe UI", sans-serif; font-size: 29px; f
 :root[data-theme="dark"] #login-form label { color: #bfcbde; }
 :root[data-theme="dark"] .login-eyebrow { color: #a8baff; }
 :root[data-theme="dark"] .login-error { color: #ffabb2; }
+:root[data-theme="dark"] .login-notice {
+  border-color: #315c43;
+  background: #172b20;
+  color: #a8e0b9;
+}
 
 @media (max-width: 480px) {
   .login-card { padding: 27px 22px; }

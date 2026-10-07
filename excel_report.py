@@ -37,6 +37,13 @@ EXCEL_REPORT_SHEETS = (
     )),
 )
 
+EXCEL_TRIP_FIELDS = (
+    "id", "ism_no", "shipment_date", "time_in", "time_out", "origin",
+    "destination", "plate_number", "make", "model", "driver_name",
+    "load_details", "trip_fuel", "route", "start_odometer", "end_odometer",
+    "trip_date", "notes",
+)
+
 EXCEL_CURRENCY_FIELDS = {"cost", "price_per_liter", "total_cost"}
 EXCEL_DATE_FIELDS = {
     "assigned_date", "created_at", "insurance_expiry", "logged_on",
@@ -168,6 +175,134 @@ def build_excel_report(report: dict[str, Any]) -> BytesIO:
             for record in records
         ]
         format_sheet(workbook.create_sheet(sheet_title), sheet_title, headers, rows)
+
+    output = BytesIO()
+    workbook.save(output)
+    output.seek(0)
+    return output
+
+
+def build_trip_excel_report(
+    trips: list[dict[str, Any]],
+    group_by: str | None = None,
+) -> BytesIO:
+    workbook = Workbook()
+    header_fill = PatternFill("solid", fgColor="1F4E78")
+    alternate_fill = PatternFill("solid", fgColor="EAF1F8")
+    group_labels = {
+        "driver_name": "Driver",
+        "plate_number": "Truck",
+        "origin": "Origin",
+        "destination": "Destination",
+    }
+    groups: dict[str, list[dict[str, Any]]] = {}
+    if group_by:
+        label = group_labels[group_by]
+        for trip in trips:
+            group_name = str(trip.get(group_by) or f"Unassigned {label.lower()}")
+            groups.setdefault(group_name, []).append(trip)
+        report_groups = sorted(
+            groups.items(),
+            key=lambda item: item[0].casefold(),
+        )
+    else:
+        report_groups = [("Trip History", trips)]
+
+    used_sheet_names: set[str] = set()
+    for index, (group_name, group_trips) in enumerate(report_groups):
+        if index == 0:
+            worksheet = workbook.active
+        else:
+            worksheet = workbook.create_sheet()
+
+        if group_by:
+            base_name = group_name
+        else:
+            base_name = "Trip History"
+        safe_name = "".join(
+            "_" if character in "[]:*?/\\\\" else character
+            for character in base_name
+        ).strip("'")[:31] or "Trip History"
+        sheet_name = safe_name
+        suffix = 2
+        while sheet_name.casefold() in used_sheet_names:
+            suffix_text = f" ({suffix})"
+            sheet_name = f"{safe_name[:31 - len(suffix_text)]}{suffix_text}"
+            suffix += 1
+        used_sheet_names.add(sheet_name.casefold())
+        worksheet.title = sheet_name
+        worksheet.sheet_view.showGridLines = False
+        worksheet.merge_cells(
+            start_row=1,
+            start_column=1,
+            end_row=1,
+            end_column=len(EXCEL_TRIP_FIELDS),
+        )
+        report_title = (
+            f"Fleet Management System - Trip History by {group_labels[group_by]}: {group_name}"
+            if group_by
+            else "Fleet Management System - Trip History"
+        )
+        title = worksheet.cell(row=1, column=1, value=report_title)
+        title.font = Font(name="Aptos Display", size=16, bold=True, color="FFFFFF")
+        title.fill = PatternFill("solid", fgColor="17365D")
+        title.alignment = Alignment(vertical="center")
+        worksheet.row_dimensions[1].height = 30
+        worksheet.cell(
+            row=2,
+            column=1,
+            value=f"Generated {datetime.now().astimezone().strftime('%Y-%m-%d %H:%M %Z')}",
+        ).font = Font(italic=True, color="64748B")
+
+        for column_index, field in enumerate(EXCEL_TRIP_FIELDS, start=1):
+            cell = worksheet.cell(
+                row=4,
+                column=column_index,
+                value=field.replace("_", " ").title(),
+            )
+            cell.font = Font(bold=True, color="FFFFFF")
+            cell.fill = header_fill
+            cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+        worksheet.row_dimensions[4].height = 30
+
+        for row_index, trip in enumerate(group_trips, start=5):
+            for column_index, field in enumerate(EXCEL_TRIP_FIELDS, start=1):
+                value = _excel_cell_value(field, trip.get(field))
+                cell = worksheet.cell(row=row_index, column=column_index, value=value)
+                if isinstance(value, str):
+                    cell.data_type = "s"
+                cell.alignment = Alignment(vertical="top", wrap_text=True)
+                if row_index % 2:
+                    cell.fill = alternate_fill
+                if field in EXCEL_DATE_FIELDS and isinstance(value, date):
+                    cell.number_format = "yyyy-mm-dd"
+                elif field in {"time_in", "time_out"} and isinstance(value, time):
+                    cell.number_format = "hh:mm"
+
+        last_column = get_column_letter(len(EXCEL_TRIP_FIELDS))
+        last_row = max(4, 4 + len(group_trips))
+        worksheet.auto_filter.ref = f"A4:{last_column}{last_row}"
+        worksheet.freeze_panes = "A5"
+        worksheet.print_title_rows = "1:4"
+        worksheet.page_setup.orientation = "landscape"
+        worksheet.page_setup.fitToWidth = 1
+        worksheet.page_setup.fitToHeight = 0
+        worksheet.sheet_properties.pageSetUpPr.fitToPage = True
+        for column_index, field in enumerate(EXCEL_TRIP_FIELDS, start=1):
+            values = [field.replace("_", " ").title()]
+            values.extend(
+                str(trip.get(field)) if trip.get(field) is not None else ""
+                for trip in group_trips
+            )
+            worksheet.column_dimensions[get_column_letter(column_index)].width = min(
+                max(max(map(len, values), default=0) + 2, 12),
+                42,
+            )
+
+    if not report_groups:
+        worksheet = workbook.active
+        worksheet.title = "Trip History"
+        worksheet.append(["No trips match the selected view"])
 
     output = BytesIO()
     workbook.save(output)

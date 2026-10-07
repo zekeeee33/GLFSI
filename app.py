@@ -6,14 +6,18 @@ import logging
 import os
 import secrets
 import time
+import uuid
+import warnings
 from datetime import timedelta
+from io import BytesIO
 from typing import Any
 
 from flask import Flask, g, jsonify, redirect, request, send_file, send_from_directory, session, url_for
 from dotenv import dotenv_values
+from PIL import Image, UnidentifiedImageError
 from supabase import Client, create_client
 
-from excel_report import build_excel_report
+from excel_report import build_excel_report, build_trip_excel_report
 from fleet_management import (
     FleetManagementError,
     FleetManager,
@@ -26,6 +30,12 @@ STATIC_DIR = os.path.join(BASE_DIR, "static")
 app = Flask(__name__, static_folder=STATIC_DIR, static_url_path="/static")
 app.config["SECRET_KEY"] = os.environ.get("SECRET_KEY") or secrets.token_hex(32)
 app.config["MAX_CONTENT_LENGTH"] = 16 * 1024 * 1024
+app.config["DOCUMENT_IMAGE_MAX_BYTES"] = int(
+    os.environ.get("DOCUMENT_IMAGE_MAX_BYTES", str(10 * 1024 * 1024))
+)
+app.config["DOCUMENT_IMAGE_BUCKET"] = os.environ.get(
+    "DOCUMENT_IMAGE_BUCKET", "fleet-trip-documents"
+)
 app.config["SESSION_COOKIE_HTTPONLY"] = True
 app.config["SESSION_COOKIE_SAMESITE"] = "Lax"
 app.config["SESSION_COOKIE_SECURE"] = os.environ.get("COOKIE_SECURE", "").strip().lower() in {
@@ -74,6 +84,46 @@ def _json_error(message: str, status: int) -> tuple[Any, int]:
     return jsonify({"error": message}), status
 
 
+def _user_role() -> str:
+    return str((g.current_user or {}).get("role") or "administrator").lower()
+
+
+def _is_dispatcher() -> bool:
+    return _user_role() == "dispatcher"
+
+
+def _role_for_auth_user(user: Any) -> str:
+    app_metadata = getattr(user, "app_metadata", None) or {}
+    user_metadata = getattr(user, "user_metadata", None) or {}
+    trusted_role = str(app_metadata.get("role") or "").strip().lower()
+    # A user-metadata dispatcher designation can only reduce access, never grant it.
+    if str(user_metadata.get("role") or "").strip().lower() == "dispatcher":
+        return "dispatcher"
+    if trusted_role in {"administrator", "dispatcher"}:
+        return trusted_role
+    return "administrator"
+
+
+def _authorize_dispatcher_request() -> Any:
+    if not _is_dispatcher():
+        return None
+    if request.path.startswith("/api/payroll") or request.path == "/api/export":
+        return _json_error("This function is only available to administrators.", 403)
+    if request.path.startswith("/api/") and request.path not in {
+        "/api/auth/me",
+        "/api/bootstrap",
+        "/api/export/trips",
+    }:
+        resource = request.path.split("/")[2] if len(request.path.split("/")) > 2 else ""
+        if resource not in {"trips", "fuel", "maintenance"}:
+            return _json_error("Dispatchers are not authorized to access this function.", 403)
+        if request.method == "DELETE":
+            return _json_error("Dispatchers cannot delete submitted records.", 403)
+        if request.method not in {"GET", "POST"}:
+            return _json_error("Dispatchers cannot modify submitted records this way.", 403)
+    return None
+
+
 def _clear_auth() -> None:
     session.clear()
     g.clear_auth_cookies = True
@@ -116,7 +166,7 @@ def enforce_authentication() -> Any:
         }:
             return _json_error("Your session expired due to inactivity. Please sign in again.", 401)
         if request.path in {"/", "/static/index.html"}:
-            return redirect(url_for("login_page"))
+            return redirect(url_for("login_page", expired="1"))
 
     if request.method in {"POST", "PUT", "PATCH", "DELETE"} and request.path.startswith("/api/"):
         expected = session.get("csrf_token", "")
@@ -134,7 +184,8 @@ def enforce_authentication() -> Any:
         return None
 
     if app.testing and app.config.get("TEST_AUTH_BYPASS"):
-        g.current_user = {"id": "test-user", "email": "test@example.com"}
+        g.current_user = {"id": "test-user", "email": "test@example.com", "role": "administrator"}
+        session.setdefault("user_role", "administrator")
         return None
 
     if not session.get("user_id"):
@@ -153,11 +204,18 @@ def enforce_authentication() -> Any:
             user = getattr(user_response, "user", None)
             if user and str(getattr(user, "id", "")) == str(session.get("user_id")):
                 session["last_activity"] = time.time()
+                role = _role_for_auth_user(user)
+                session["user_role"] = role
                 g.current_user = {
                     "id": str(user.id),
                     "email": getattr(user, "email", None) or session.get("email", ""),
+                    "role": role,
+                    "full_name": (
+                        (getattr(user, "user_metadata", None) or {}).get("full_name")
+                        or (getattr(user, "user_metadata", None) or {}).get("name")
+                    ),
                 }
-                return None
+                return _authorize_dispatcher_request()
         except Exception:
             pass
 
@@ -169,11 +227,18 @@ def enforce_authentication() -> Any:
             if refreshed_session and user and str(getattr(user, "id", "")) == str(session.get("user_id")):
                 g.auth_tokens = refreshed_session
                 session["last_activity"] = time.time()
+                role = _role_for_auth_user(user)
+                session["user_role"] = role
                 g.current_user = {
                     "id": str(user.id),
                     "email": getattr(user, "email", None) or session.get("email", ""),
+                    "role": role,
+                    "full_name": (
+                        (getattr(user, "user_metadata", None) or {}).get("full_name")
+                        or (getattr(user, "user_metadata", None) or {}).get("name")
+                    ),
                 }
-                return None
+                return _authorize_dispatcher_request()
         except Exception as exc:
             status = getattr(exc, "status", None)
             if status not in {400, 401}:
@@ -188,7 +253,9 @@ def enforce_authentication() -> Any:
 
 @app.after_request
 def set_auth_cookies(response: Any) -> Any:
-    if request.path.startswith("/api/"):
+    if request.path.startswith("/api/") or request.path in {
+        "/", "/static/index.html", "/static/app.js", "/static/style.css",
+    }:
         response.headers["Cache-Control"] = "no-store"
     auth_tokens = getattr(g, "auth_tokens", None)
     secure = _secure_cookies()
@@ -290,14 +357,24 @@ def auth_login() -> Any:
         return _json_error("Supabase did not return a valid sign-in session.", 502)
 
     session.clear()
+    role = _role_for_auth_user(user)
     session["user_id"] = str(user.id)
     session["email"] = getattr(user, "email", None) or email
+    session["user_role"] = role
     session["csrf_token"] = secrets.token_urlsafe(32)
     session["last_activity"] = time.time()
     g.auth_tokens = auth_session
     return jsonify(
         {
-            "user": {"id": session["user_id"], "email": session["email"]},
+            "user": {
+                "id": session["user_id"],
+                "email": session["email"],
+                "role": role,
+                "full_name": (
+                    (getattr(user, "user_metadata", None) or {}).get("full_name")
+                    or (getattr(user, "user_metadata", None) or {}).get("name")
+                ),
+            },
             "redirect": url_for("index"),
         }
     )
@@ -322,6 +399,47 @@ def auth_me() -> Any:
 @app.route("/api/bootstrap")
 def bootstrap() -> Any:
     fleet = get_manager()
+    user_id = str((g.current_user or {}).get("id") or session.get("user_id") or "")
+    if _is_dispatcher():
+        if not user_id:
+            return _json_error("Authenticated dispatcher identity is missing.", 403)
+        trips = fleet.list_trips(user_id=user_id)
+        fuel_logs = fleet.list_fuel_logs(user_id=user_id)
+        maintenance = fleet.list_maintenance(user_id=user_id)
+        today = time.strftime("%Y-%m-%d")
+        _add_document_links(trips, "manifest_object_path", "manifest_image_url", "trip_manifest_image")
+        _add_document_links(fuel_logs, "invoice_object_path", "invoice_image_url", "fuel_invoice_image")
+        return jsonify(
+            {
+                "dashboard": {
+                    "total_trips": len(trips),
+                    "today_trips": sum(
+                        str(trip.get("shipment_date") or "")[:10] == today
+                        for trip in trips
+                    ),
+                    "total_fuel_logs": len(fuel_logs),
+                    "total_maintenance": len(maintenance),
+                },
+                "vehicles": [
+                    {key: row.get(key) for key in ("id", "plate_number", "make", "model")}
+                    for row in fleet.list_vehicles()
+                ],
+                "drivers": [
+                    {key: row.get(key) for key in ("id", "name", "status")}
+                    for row in fleet.list_drivers()
+                ],
+                "assignments": [],
+                "maintenance": maintenance,
+                "fuel_logs": fuel_logs,
+                "trips": trips,
+                "csrf_token": session.get("csrf_token"),
+                "user": g.current_user,
+            }
+        )
+    trips = fleet.list_trips()
+    fuel_logs = fleet.list_fuel_logs()
+    _add_document_links(trips, "manifest_object_path", "manifest_image_url", "trip_manifest_image")
+    _add_document_links(fuel_logs, "invoice_object_path", "invoice_image_url", "fuel_invoice_image")
     return jsonify(
         {
             "dashboard": fleet.dashboard(),
@@ -329,12 +447,155 @@ def bootstrap() -> Any:
             "drivers": fleet.list_drivers(),
             "assignments": fleet.list_assignments(),
             "maintenance": fleet.list_maintenance(),
-            "fuel_logs": fleet.list_fuel_logs(),
-            "trips": fleet.list_trips(),
+            "fuel_logs": fuel_logs,
+            "trips": trips,
             "csrf_token": session.get("csrf_token"),
             "user": g.current_user,
         }
     )
+
+
+def _add_document_links(
+    rows: list[dict[str, Any]], path_field: str, url_field: str, endpoint: str
+) -> None:
+    for row in rows:
+        object_path = row.pop(path_field, None)
+        if object_path:
+            row[url_field] = url_for(endpoint, **{
+                "trip_id" if endpoint == "trip_manifest_image" else "fuel_id": row["id"]
+            })
+
+
+def _validated_image(file_storage: Any) -> tuple[bytes, str, str]:
+    filename = str(file_storage.filename or "").strip()
+    if not filename:
+        raise ValueError("Choose an image file.")
+    max_bytes = app.config["DOCUMENT_IMAGE_MAX_BYTES"]
+    image_bytes = file_storage.stream.read(max_bytes + 1)
+    if len(image_bytes) > max_bytes:
+        raise ValueError(f"Image must be no larger than {max_bytes // (1024 * 1024)} MB.")
+    if not image_bytes:
+        raise ValueError("The selected image is empty.")
+
+    formats = {
+        "JPEG": ("image/jpeg", "jpg"),
+        "PNG": ("image/png", "png"),
+        "WEBP": ("image/webp", "webp"),
+    }
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", Image.DecompressionBombWarning)
+            image = Image.open(BytesIO(image_bytes))
+            image_format = image.format
+            if image_format not in formats:
+                raise ValueError("Use a JPG, PNG, or WEBP image.")
+            if image.width < 1 or image.height < 1 or image.width * image.height > 40_000_000:
+                raise ValueError("Image dimensions are invalid or too large.")
+            image.verify()
+    except ValueError:
+        raise
+    except (
+        UnidentifiedImageError,
+        OSError,
+        SyntaxError,
+        Image.DecompressionBombError,
+        Image.DecompressionBombWarning,
+    ) as exc:
+        raise ValueError("The selected file is not a valid image.") from exc
+    mime_type, extension = formats[image_format]
+    return image_bytes, mime_type, extension
+
+
+def _document_user_id() -> str | None:
+    if not _is_dispatcher():
+        return None
+    return str((g.current_user or {}).get("id") or session.get("user_id") or "")
+
+
+def _record_for_document(kind: str, record_id: int) -> dict[str, Any]:
+    fleet = get_manager()
+    user_id = _document_user_id()
+    try:
+        if kind == "trip":
+            return fleet.get_trip(record_id, user_id=user_id)
+        return fleet.get_fuel(record_id, user_id=user_id)
+    except FleetManagementError as exc:
+        status = 403 if _is_dispatcher() else 404
+        return {"_error": str(exc), "_status": status}
+
+
+def _handle_document_image(kind: str, record_id: int) -> Any:
+    record = _record_for_document(kind, record_id)
+    if "_error" in record:
+        return _json_error(record["_error"], record["_status"])
+
+    is_trip = kind == "trip"
+    path_field = "manifest_object_path" if is_trip else "invoice_object_path"
+    if request.method == "POST":
+        image_file = request.files.get("image")
+        if image_file is None:
+            return _json_error("Attach an image using the 'image' field.", 400)
+        try:
+            image_bytes, mime_type, extension = _validated_image(image_file)
+        except ValueError as exc:
+            return _json_error(str(exc), 400)
+        owner_id = str(record.get("created_by") or (g.current_user or {}).get("id") or "admin")
+        object_path = f"{kind}s/{record_id}/{owner_id}/{uuid.uuid4().hex}.{extension}"
+        storage = get_manager().client.storage.from_(app.config["DOCUMENT_IMAGE_BUCKET"])
+        try:
+            storage.upload(object_path, image_bytes, {"content-type": mime_type})
+            if is_trip:
+                get_manager().set_trip_manifest_path(
+                    record_id, object_path, user_id=_document_user_id()
+                )
+            else:
+                get_manager().set_fuel_invoice_path(
+                    record_id, object_path, user_id=_document_user_id()
+                )
+            if record.get(path_field):
+                storage.remove([record[path_field]])
+        except Exception:
+            logger.exception("Could not store a trip document image.")
+            return _json_error("Could not save the image. Please retry.", 503)
+        return jsonify({"message": "Image uploaded successfully."}), 201
+
+    object_path = record.get(path_field)
+    if not object_path:
+        return _json_error("No image has been uploaded for this record.", 404)
+    try:
+        image_bytes = get_manager().client.storage.from_(
+            app.config["DOCUMENT_IMAGE_BUCKET"]
+        ).download(object_path)
+    except Exception:
+        logger.exception("Could not retrieve a trip document image.")
+        return _json_error("Could not retrieve the image. Please retry.", 503)
+
+    mime_type = {
+        ".jpg": "image/jpeg",
+        ".jpeg": "image/jpeg",
+        ".png": "image/png",
+        ".webp": "image/webp",
+    }.get(os.path.splitext(object_path)[1].lower(), "application/octet-stream")
+    response = send_file(
+        BytesIO(image_bytes),
+        mimetype=mime_type,
+        as_attachment=False,
+        download_name=f"{kind}-{record_id}{os.path.splitext(object_path)[1].lower()}",
+        max_age=0,
+    )
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["Content-Security-Policy"] = "default-src 'none'; img-src 'self'; sandbox"
+    return response
+
+
+@app.route("/api/trips/<int:trip_id>/manifest", methods=["GET", "POST"])
+def trip_manifest_image(trip_id: int) -> Any:
+    return _handle_document_image("trip", trip_id)
+
+
+@app.route("/api/fuel/<int:fuel_id>/invoice", methods=["GET", "POST"])
+def fuel_invoice_image(fuel_id: int) -> Any:
+    return _handle_document_image("fuel", fuel_id)
 
 
 def _body() -> dict[str, Any]:
@@ -459,6 +720,8 @@ def payroll_finalize() -> Any:
 
 def _create_record(resource: str, payload: dict[str, Any]) -> dict[str, Any]:
     fleet = get_manager()
+    if any(key in payload for key in ("created_by", "dispatcher_id", "user_id")):
+        raise ValueError("Ownership is assigned automatically by the authenticated user.")
     if resource == "vehicles":
         return fleet.add_vehicle(
             plate_number=_required_text(payload, "plate_number"),
@@ -487,14 +750,17 @@ def _create_record(resource: str, payload: dict[str, Any]) -> dict[str, Any]:
             notes=_optional_text(payload, "notes"),
         )
     if resource == "maintenance":
+        created_by = str(g.current_user["id"]) if _is_dispatcher() else None
         return fleet.add_maintenance(
             vehicle_id=_integer(payload, "vehicle_id"),
             service_type=_required_text(payload, "service_type"),
             description=_optional_text(payload, "description"),
             cost=_number(payload, "cost", 0),
             performed_on=_optional_text(payload, "performed_on"),
+            created_by=created_by,
         )
     if resource == "fuel":
+        created_by = str(g.current_user["id"]) if _is_dispatcher() else None
         return fleet.add_fuel(
             vehicle_id=_integer(payload, "vehicle_id"),
             fuel_type=_required_text(payload, "fuel_type"),
@@ -506,11 +772,13 @@ def _create_record(resource: str, payload: dict[str, Any]) -> dict[str, Any]:
                 else None
             ),
             logged_on=_optional_text(payload, "logged_on"),
+            created_by=created_by,
         )
     if resource == "trips":
         origin = _required_text(payload, "origin")
         destination = _required_text(payload, "destination")
         shipment_date = _optional_text(payload, "shipment_date")
+        created_by = str(g.current_user["id"]) if _is_dispatcher() else None
         return fleet.add_trip(
             vehicle_id=_integer(payload, "vehicle_id"),
             driver_id=_integer(payload, "driver_id"),
@@ -526,6 +794,7 @@ def _create_record(resource: str, payload: dict[str, Any]) -> dict[str, Any]:
             destination=destination,
             load_details=_optional_text(payload, "load_details"),
             trip_fuel=_optional_text(payload, "trip_fuel"),
+            created_by=created_by,
         )
     raise ValueError("Unknown resource")
 
@@ -560,27 +829,76 @@ def delete_record(resource: str, record_id: int) -> Any:
     method_name = method_names.get(resource)
     if method_name is None:
         return jsonify({"error": "Unknown resource"}), 404
-    getattr(get_manager(), method_name)(record_id)
-    return jsonify({"message": "Record deleted"})
+    try:
+        manager = get_manager()
+        if _is_dispatcher():
+            return _json_error("Dispatchers cannot delete this record type.", 403)
+        getattr(manager, method_name)(record_id)
+        return jsonify({"message": "Record deleted"})
+    except FleetManagementError as exc:
+        return _json_error(str(exc), 403 if _is_dispatcher() else 400)
 
 
 @app.route("/api/export")
 def export_report() -> Any:
     fleet = get_manager()
-    report = {
-        "vehicles": fleet.list_vehicles(),
-        "drivers": fleet.list_drivers(),
-        "assignments": fleet.list_assignments(),
-        "trips": fleet.list_trips(),
-        "maintenance": fleet.list_maintenance(),
-        "fuel_logs": fleet.list_fuel_logs(),
-        "dashboard": fleet.dashboard(),
-    }
+    user_id = str((g.current_user or {}).get("id") or session.get("user_id") or "")
+    if _is_dispatcher() and user_id:
+        report = {
+            "vehicles": fleet.list_vehicles(),
+            "drivers": fleet.list_drivers(),
+            "assignments": fleet.list_assignments(),
+            "trips": fleet.list_trips(user_id=user_id),
+            "maintenance": fleet.list_maintenance(user_id=user_id),
+            "fuel_logs": fleet.list_fuel_logs(user_id=user_id),
+            "dashboard": fleet.dashboard(user_id=user_id),
+        }
+    else:
+        report = {
+            "vehicles": fleet.list_vehicles(),
+            "drivers": fleet.list_drivers(),
+            "assignments": fleet.list_assignments(),
+            "trips": fleet.list_trips(),
+            "maintenance": fleet.list_maintenance(),
+            "fuel_logs": fleet.list_fuel_logs(),
+            "dashboard": fleet.dashboard(),
+        }
     return send_file(
         build_excel_report(report),
         mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         as_attachment=True,
         download_name="fleet_system_report.xlsx",
+    )
+
+
+@app.route("/api/export/trips")
+def export_trip_history() -> Any:
+    group_by = request.args.get("group_by", "")
+    valid_group_fields = {"", "driver_name", "plate_number", "origin", "destination"}
+    if group_by not in valid_group_fields:
+        return _json_error("Choose a valid trip grouping.", 400)
+
+    user_id = str((g.current_user or {}).get("id") or session.get("user_id") or "")
+    trips = get_manager().list_trips(user_id=user_id if _is_dispatcher() and user_id else None)
+    search_term = request.args.get("search", "").strip().casefold()
+    if search_term:
+        searchable_fields = (
+            "ism_no", "shipment_date", "time_in", "time_out", "origin",
+            "destination", "plate_number", "load_details", "driver_name", "trip_fuel",
+        )
+        trips = [
+            trip for trip in trips
+            if any(
+                search_term in str(trip.get(field) or "").casefold()
+                for field in searchable_fields
+            )
+        ]
+
+    return send_file(
+        build_trip_excel_report(trips, group_by or None),
+        mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        as_attachment=True,
+        download_name="trip_history.xlsx",
     )
 
 

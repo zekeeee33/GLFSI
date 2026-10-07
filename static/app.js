@@ -113,6 +113,7 @@ const RESOURCE_CONFIG = {
       { name: "price_per_liter", label: "Price per liter", type: "number", min: 0.01, step: "0.01", required: true },
       { name: "total_cost", label: "Total cost (optional)", type: "number", min: 0, step: "0.01" },
       { name: "logged_on", label: "Date", type: "date" },
+      { name: "invoice_image", label: "Fuel invoice image", type: "file", accept: "image/jpeg,image/png,image/webp" },
     ],
     columns: [
       ["plate_number", "Vehicle"],
@@ -120,6 +121,7 @@ const RESOURCE_CONFIG = {
       ["quantity", "Quantity", (value) => `${formatNumber(value)} L`],
       ["logged_on", "Date"],
       ["total_cost", "Total cost", formatCurrency],
+      ["invoice_image_url", "Invoice", formatImageLink],
     ],
   },
   trips: {
@@ -137,6 +139,7 @@ const RESOURCE_CONFIG = {
       { name: "driver_id", label: "Driver", type: "driver", required: true },
       { name: "load_details", label: "Load" },
       { name: "trip_fuel", label: "Trip/Fuel" },
+      { name: "manifest_image", label: "Load manifest image", type: "file", accept: "image/jpeg,image/png,image/webp" },
     ],
     columns: [
       ["ism_no", "ISM NO"],
@@ -149,6 +152,7 @@ const RESOURCE_CONFIG = {
       ["load_details", "LOAD"],
       ["driver_name", "DRIVER"],
       ["trip_fuel", "TRIP/FUEL"],
+      ["manifest_image_url", "MANIFEST", formatImageLink],
     ],
   },
 };
@@ -158,6 +162,12 @@ function isoDate(date) {
   const month = String(date.getMonth() + 1).padStart(2, "0");
   const day = String(date.getDate()).padStart(2, "0");
   return `${year}-${month}-${day}`;
+}
+
+function formatImageLink(url) {
+  return url
+    ? `<a href="${escapeHtml(url)}" target="_blank" rel="noopener">View image</a>`
+    : "—";
 }
 
 const today = new Date();
@@ -171,6 +181,7 @@ const state = {
   payroll: null,
   payrollKey: "",
   payrollRequestedKey: "",
+  tripsGroupBy: "",
   payrollPeriod: {
     start_date: isoDate(new Date(today.getFullYear(), today.getMonth(), 1)),
     end_date: isoDate(new Date(today.getFullYear(), today.getMonth() + 1, 0)),
@@ -181,20 +192,23 @@ const view = document.querySelector("#app-view");
 let idleLogoutTimer;
 let lastActivityPing = 0;
 
-function returnToSignIn() {
-  window.location.replace("/login?expired=1");
+function returnToSignIn(expired = false) {
+  window.location.replace(expired ? "/login?expired=1" : "/login");
 }
 
 function registerSessionActivity() {
   window.clearTimeout(idleLogoutTimer);
-  idleLogoutTimer = window.setTimeout(returnToSignIn, SESSION_IDLE_TIMEOUT_MS);
+  idleLogoutTimer = window.setTimeout(() => returnToSignIn(true), SESSION_IDLE_TIMEOUT_MS);
 
   const now = Date.now();
   if (now - lastActivityPing < SESSION_ACTIVITY_PING_INTERVAL_MS) return;
   lastActivityPing = now;
   fetch("/api/auth/me", { cache: "no-store" })
-    .then((response) => {
-      if (response.status === 401) returnToSignIn();
+    .then(async (response) => {
+      if (response.status === 401) {
+        const payload = await response.json().catch(() => ({}));
+        returnToSignIn(payload.error?.toLowerCase().includes("inactivity"));
+      }
     })
     .catch(() => showToast("Could not verify the session. Check your connection.", "error"));
 }
@@ -245,7 +259,7 @@ function showToast(message, kind = "success") {
 
 async function api(path, options = {}) {
   const headers = {
-    ...(options.body ? { "Content-Type": "application/json" } : {}),
+    ...(options.body && !(options.body instanceof FormData) ? { "Content-Type": "application/json" } : {}),
     ...options.headers,
   };
   if (["POST", "PUT", "PATCH", "DELETE"].includes(options.method?.toUpperCase())) {
@@ -258,7 +272,7 @@ async function api(path, options = {}) {
   const payload = await response.json().catch(() => ({}));
   if (!response.ok) {
     if (response.status === 401) {
-      window.location.replace("/login");
+      returnToSignIn(payload.error?.toLowerCase().includes("inactivity"));
     }
     throw new Error(payload.error || `Request failed (${response.status})`);
   }
@@ -270,7 +284,9 @@ async function loadData() {
   try {
     state.data = await api("/api/bootstrap");
     state.csrfToken = state.data.csrf_token || "";
-    document.querySelector("#signed-in-user").textContent = state.data.user?.email || "";
+    const user = state.data.user || {};
+    document.querySelector("#signed-in-user").textContent =
+      `${user.email || ""}${user.role ? ` · ${user.role}` : ""}`;
     registerSessionActivity();
     render();
   } catch (error) {
@@ -345,6 +361,26 @@ function panel(title, content, link = "") {
 function renderDashboard() {
   const data = state.data;
   const summary = data.dashboard;
+  if (data.user?.role === "dispatcher") {
+    return `
+      ${header("DISPATCHER DASHBOARD", `Welcome, ${data.user.full_name || data.user.email || "Dispatcher"}`, "Your fleet activity and records.")}
+      <div class="stats-grid">
+        ${statCard("My trips", formatNumber(summary.total_trips), "teal", "⌁")}
+        ${statCard("Today's trips", formatNumber(summary.today_trips), "blue", "▦")}
+        ${statCard("My fuel logs", formatNumber(summary.total_fuel_logs), "orange", "◉")}
+        ${statCard("My maintenance records", formatNumber(summary.total_maintenance), "red", "⚙")}
+      </div>
+      <div class="dashboard-grid">
+        ${panel("My recent trips", tableMarkup(data.trips.slice(0, 5), [
+          ["ism_no", "ISM no"],
+          ["origin", "Origin"],
+          ["destination", "Destination"],
+          ["shipment_date", "Shipment date"],
+        ], null, { empty: "No trips recorded" }), "trips")}
+        ${panel("My fuel logs", tableMarkup(data.fuel_logs.slice(0, 5), RESOURCE_CONFIG.fuel.columns, null, { empty: "No fuel logs recorded" }), "fuel")}
+        ${panel("My maintenance", tableMarkup(data.maintenance.slice(0, 5), RESOURCE_CONFIG.maintenance.columns, null, { empty: "No maintenance records" }), "maintenance")}
+      </div>`;
+  }
   return `
     ${header("OPERATIONS", "Fleet overview", "Monitor vehicles, drivers, and daily fleet activity.")}
     <div class="stats-grid">
@@ -386,6 +422,8 @@ function fieldMarkup(field) {
   let control;
   if (field.type === "select") {
     control = `<select id="field-${field.name}" name="${field.name}" ${required}>${field.options.map(([key, label]) => `<option value="${escapeHtml(key)}">${escapeHtml(label)}</option>`).join("")}</select>`;
+  } else if (field.type === "file") {
+    control = `<input id="field-${field.name}" name="${field.name}" type="file" accept="${escapeHtml(field.accept)}" />`;
   } else if (field.type === "vehicle" || field.type === "driver") {
     const records = field.type === "vehicle" ? state.data.vehicles : state.data.drivers;
     control = `<select id="field-${field.name}" name="${field.name}" ${required} ${records.length ? "" : "disabled"}>${optionMarkup(field.type)}</select>${records.length ? "" : `<small class="field-hint">Add a ${field.type} first.</small>`}`;
@@ -403,6 +441,39 @@ function filterRows(rows, columns) {
   return rows.filter((row) => columns.some(([key]) => String(row[key] ?? "").toLocaleLowerCase().includes(term)));
 }
 
+function groupedTripMarkup(rows, config) {
+  const groupOptions = [
+    ["driver_name", "Driver"],
+    ["plate_number", "Truck"],
+    ["origin", "Origin"],
+    ["destination", "Destination"],
+  ];
+  const selectedGroup = groupOptions.find(([key]) => key === state.tripsGroupBy);
+  if (!selectedGroup) {
+    return tableMarkup(rows, config.columns, null, { empty: "No trip records" });
+  }
+
+  const [groupKey, groupLabel] = selectedGroup;
+  const groups = new Map();
+  for (const trip of rows) {
+    const value = String(trip[groupKey] || `Unassigned ${groupLabel.toLowerCase()}`);
+    if (!groups.has(value)) groups.set(value, []);
+    groups.get(value).push(trip);
+  }
+
+  return [...groups.entries()]
+    .sort(([left], [right]) => left.localeCompare(right, undefined, { sensitivity: "base" }))
+    .map(([groupName, trips]) => `
+      <section class="trip-group" aria-label="${escapeHtml(groupLabel)}: ${escapeHtml(groupName)}">
+        <div class="trip-group-heading">
+          <h3>${escapeHtml(groupName)}</h3>
+          <span class="record-count">${formatNumber(trips.length)} ${trips.length === 1 ? "trip" : "trips"}</span>
+        </div>
+        ${tableMarkup(trips, config.columns, null, { empty: "No trip records" })}
+      </section>`)
+    .join("") || `<p class="trip-empty">No trip records</p>`;
+}
+
 function renderResource(page) {
   const config = RESOURCE_CONFIG[page];
   const listKey = page === "fuel" ? "fuel_logs" : page;
@@ -418,16 +489,25 @@ function renderResource(page) {
       ${header(
         "FLEET DATA",
         config.title,
-        "Review the complete shipment report. Use the table’s horizontal scrollbar on narrow screens.",
-        '<button class="button button-primary" data-action="new-record" type="button"><span aria-hidden="true">＋</span> New record</button>',
+        "Review trip details or view them independently by driver, truck, origin, or destination.",
+        '<button class="button button-secondary" data-action="trip-export" type="button">Export Excel</button><button class="button button-primary" data-action="new-record" type="button"><span aria-hidden="true">＋</span> New record</button>',
       )}
       <section class="panel records-panel trips-report">
         <div class="panel-heading records-heading">
           <div><p class="eyebrow">SHIPMENT MANIFEST</p><h2>${escapeHtml(config.title)}</h2></div>
           <label class="search-box"><span class="sr-only">Search trips</span><span aria-hidden="true">⌕</span><input type="search" id="record-search" placeholder="Search trips" value="${escapeHtml(state.search)}" /></label>
         </div>
+        <nav class="trip-view-tabs" aria-label="Trip views">
+          <button class="trip-view-tab ${state.tripsGroupBy ? "" : "trip-view-tab-active"}" type="button" data-action="trip-group" data-group-by="" aria-pressed="${!state.tripsGroupBy}">All trips</button>
+          <button class="trip-view-tab ${state.tripsGroupBy === "driver_name" ? "trip-view-tab-active" : ""}" type="button" data-action="trip-group" data-group-by="driver_name" aria-pressed="${state.tripsGroupBy === "driver_name"}">By driver</button>
+          <button class="trip-view-tab ${state.tripsGroupBy === "plate_number" ? "trip-view-tab-active" : ""}" type="button" data-action="trip-group" data-group-by="plate_number" aria-pressed="${state.tripsGroupBy === "plate_number"}">By truck</button>
+          <button class="trip-view-tab ${state.tripsGroupBy === "origin" ? "trip-view-tab-active" : ""}" type="button" data-action="trip-group" data-group-by="origin" aria-pressed="${state.tripsGroupBy === "origin"}">By origin</button>
+          <button class="trip-view-tab ${state.tripsGroupBy === "destination" ? "trip-view-tab-active" : ""}" type="button" data-action="trip-group" data-group-by="destination" aria-pressed="${state.tripsGroupBy === "destination"}">By destination</button>
+        </nav>
         <p class="record-count">${formatNumber(rows.length)} ${rows.length === 1 ? "record" : "records"}</p>
-        ${tableMarkup(rows, config.columns, null, { empty: "No trip records" })}
+        <div class="trip-view-content">
+          ${groupedTripMarkup(rows, config)}
+        </div>
       </section>
       <dialog class="record-dialog" aria-labelledby="trip-dialog-title">
         <div class="dialog-header">
@@ -462,7 +542,7 @@ function renderResource(page) {
           <label class="search-box"><span class="sr-only">Search ${escapeHtml(config.title.toLowerCase())}</span><span aria-hidden="true">⌕</span><input type="search" id="record-search" placeholder="Search records" value="${escapeHtml(state.search)}" /></label>
         </div>
         <p class="record-count">${formatNumber(rows.length)} ${rows.length === 1 ? "record" : "records"}</p>
-        ${tableMarkup(rows, config.columns, page === "trips" ? null : config.api, { empty: `No ${config.singular} records` })}
+        ${tableMarkup(rows, config.columns, state.data.user?.role === "dispatcher" || page === "trips" ? null : config.api, { empty: `No ${config.singular} records` })}
       </section>
     </div>`;
 }
@@ -671,6 +751,16 @@ function renderPayroll() {
 function render() {
   if (!state.data) return;
   state.page = location.hash.slice(1) in TITLES ? location.hash.slice(1) : "dashboard";
+  const dispatcherPages = new Set(["dashboard", "trips", "fuel", "maintenance"]);
+  const isDispatcher = state.data.user?.role === "dispatcher";
+  if (isDispatcher && !dispatcherPages.has(state.page)) {
+    location.hash = "dashboard";
+    state.page = "dashboard";
+  }
+  document.querySelectorAll(".nav-link").forEach((link) => {
+    link.hidden = isDispatcher && !dispatcherPages.has(link.dataset.page);
+  });
+  document.querySelector(".topbar > .button[href='/api/export']")?.toggleAttribute("hidden", isDispatcher);
   document.title = `${TITLES[state.page]} · Good Luck Forwarding Systems Inc.`;
   document.querySelectorAll(".nav-link").forEach((link) => {
     const active = link.dataset.page === state.page;
@@ -686,7 +776,12 @@ function render() {
 async function submitForm(form) {
   const page = form.dataset.form;
   const config = RESOURCE_CONFIG[page];
-  const payload = Object.fromEntries(new FormData(form).entries());
+  const formData = new FormData(form);
+  const manifestImage = formData.get("manifest_image");
+  const invoiceImage = formData.get("invoice_image");
+  const payload = Object.fromEntries(formData.entries());
+  delete payload.manifest_image;
+  delete payload.invoice_image;
   for (const field of config.fields) {
     if (field.type === "number" && payload[field.name] !== "") {
       payload[field.name] = Number(payload[field.name]);
@@ -699,7 +794,23 @@ async function submitForm(form) {
   const submit = form.querySelector('button[type="submit"]');
   submit.disabled = true;
   try {
-    await api(`/api/${config.api}`, { method: "POST", body: JSON.stringify(payload) });
+    const result = await api(`/api/${config.api}`, { method: "POST", body: JSON.stringify(payload) });
+    const image = page === "trips" ? manifestImage : page === "fuel" ? invoiceImage : null;
+    if (image instanceof File && image.size > 0) {
+      const uploadBody = new FormData();
+      uploadBody.append("image", image);
+      const imageEndpoint = page === "trips"
+        ? `/api/trips/${encodeURIComponent(result.data.id)}/manifest`
+        : `/api/fuel/${encodeURIComponent(result.data.id)}/invoice`;
+      try {
+        await api(imageEndpoint, { method: "POST", body: uploadBody });
+      } catch (error) {
+        showToast(`${capitalize(config.singular)} saved, but its image was not uploaded: ${error.message}`, "error");
+        state.search = "";
+        await loadData();
+        return;
+      }
+    }
     showToast(`${capitalize(config.singular)} saved successfully.`);
     state.search = "";
     const dialog = form.closest("dialog");
@@ -850,6 +961,36 @@ function exportPayrollCsv() {
   URL.revokeObjectURL(url);
 }
 
+async function exportTripHistory() {
+  const button = view.querySelector('[data-action="trip-export"]');
+  button.disabled = true;
+  try {
+    const params = new URLSearchParams();
+    if (state.tripsGroupBy) params.set("group_by", state.tripsGroupBy);
+    if (state.search.trim()) params.set("search", state.search.trim());
+    const query = params.toString();
+    const response = await fetch(`/api/export/trips${query ? `?${query}` : ""}`, { cache: "no-store" });
+    if (!response.ok) {
+      const payload = await response.json().catch(() => ({}));
+      if (response.status === 401) {
+        returnToSignIn(payload.error?.toLowerCase().includes("inactivity"));
+      }
+      throw new Error(payload.error || `Trip export failed (${response.status}).`);
+    }
+    const blob = await response.blob();
+    const url = URL.createObjectURL(blob);
+    const anchor = document.createElement("a");
+    anchor.href = url;
+    anchor.download = `trip_history${state.tripsGroupBy ? `-by-${state.tripsGroupBy.replace("_name", "")}` : ""}.xlsx`;
+    anchor.click();
+    URL.revokeObjectURL(url);
+  } catch (error) {
+    showToast(error.message || "Could not export trip history.", "error");
+  } finally {
+    if (button.isConnected) button.disabled = false;
+  }
+}
+
 view.addEventListener("submit", (event) => {
   const payrollForm = event.target.closest("#payroll-period-form, #cash-advance-form, #overdraft-form");
   if (payrollForm) {
@@ -895,6 +1036,11 @@ view.addEventListener("click", (event) => {
   }
   if (button.dataset.action === "payroll-print") window.print();
   if (button.dataset.action === "payroll-export") exportPayrollCsv();
+  if (button.dataset.action === "trip-export") exportTripHistory();
+  if (button.dataset.action === "trip-group") {
+    state.tripsGroupBy = button.dataset.groupBy || "";
+    render();
+  }
   if (button.dataset.action === "new-record") {
     const dialog = view.querySelector(".record-dialog");
     if (dialog && !dialog.open) {
