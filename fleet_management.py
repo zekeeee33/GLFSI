@@ -90,6 +90,23 @@ class FleetManager:
                     "supabase_trips_migration.sql in the Supabase SQL Editor, "
                     "then refresh the app."
                 ) from exc
+            missing_edit_history = (
+                "column trips.last_edited_by does not exist" in combined_error
+                or "column trips.last_edited_by_email does not exist" in combined_error
+                or (
+                    "trip_edit_history" in combined_error
+                    and (
+                        "does not exist" in combined_error
+                        or "schema cache" in combined_error
+                    )
+                )
+            )
+            if missing_edit_history:
+                raise FleetManagementError(
+                    "Trip edit history is not installed. Run "
+                    "supabase_dispatcher_ownership_migration.sql in the Supabase "
+                    "SQL Editor, then refresh the app."
+                ) from exc
             if "payroll_periods" in combined_error and (
                 "does not exist" in combined_error or "schema cache" in combined_error
             ):
@@ -514,13 +531,93 @@ class FleetManager:
             row.update({key: vehicle.get(key) for key in ("plate_number", "make", "model")})
         return row
 
-    def set_trip_manifest_path(
-        self, trip_id: int, object_path: str, user_id: Optional[str] = None
-    ) -> None:
+    def update_trip(
+        self,
+        trip_id: int,
+        values: Dict[str, Any],
+        edited_by: str,
+        editor_email: Optional[str],
+        user_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        editable_fields = {
+            "ism_no",
+            "shipment_date",
+            "time_in",
+            "time_out",
+            "origin",
+            "destination",
+            "vehicle_id",
+            "driver_id",
+            "load_details",
+            "trip_fuel",
+            "notes",
+            "route",
+        }
+        required_fields = {
+            "shipment_date",
+            "origin",
+            "destination",
+            "vehicle_id",
+            "driver_id",
+            "route",
+        }
+        if (
+            not required_fields.issubset(values)
+            or set(values) - editable_fields
+        ):
+            raise FleetManagementError("The trip contains unsupported fields.")
         self.get_trip(trip_id, user_id)
+        if values["vehicle_id"] is not None and not self._exists("vehicles", values["vehicle_id"]):
+            raise FleetManagementError(f"Vehicle {values['vehicle_id']} not found")
+        if values["driver_id"] is not None and not self._exists("drivers", values["driver_id"]):
+            raise FleetManagementError(f"Driver {values['driver_id']} not found")
+
+        update_values = {
+            **values,
+            "trip_date": values["shipment_date"],
+            "last_edited_by": edited_by,
+            "last_edited_by_email": editor_email,
+        }
         query = (
             self.client.table("trips")
-            .update({"manifest_object_path": object_path})
+            .update(update_values)
+            .eq("id", trip_id)
+        )
+        if user_id is not None:
+            query = query.eq("created_by", user_id)
+        response = self._execute(query.select("*"))
+        if not response.data:
+            raise FleetManagementError(f"Trip {trip_id} was not found or is not accessible")
+        return dict(response.data[0])
+
+    def list_trip_edit_history(
+        self, trip_id: int, user_id: Optional[str] = None
+    ) -> List[Dict[str, Any]]:
+        self.get_trip(trip_id, user_id)
+        response = self._execute(
+            self.client.table("trip_edit_history")
+            .select("id,trip_id,edited_by,edited_by_email,edited_at,old_values,new_values")
+            .eq("trip_id", trip_id)
+            .order("edited_at", desc=True)
+        )
+        return [dict(row) for row in (response.data or [])]
+
+    def set_trip_manifest_path(
+        self,
+        trip_id: int,
+        object_path: str,
+        user_id: Optional[str] = None,
+        edited_by: Optional[str] = None,
+        editor_email: Optional[str] = None,
+    ) -> None:
+        self.get_trip(trip_id, user_id)
+        update_values = {"manifest_object_path": object_path}
+        if edited_by is not None:
+            update_values["last_edited_by"] = edited_by
+            update_values["last_edited_by_email"] = editor_email
+        query = (
+            self.client.table("trips")
+            .update(update_values)
             .eq("id", trip_id)
         )
         if user_id is not None:

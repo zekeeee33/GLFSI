@@ -120,7 +120,12 @@ def _authorize_dispatcher_request() -> Any:
             return _json_error("Dispatchers are not authorized to access this function.", 403)
         if request.method == "DELETE":
             return _json_error("Dispatchers cannot delete submitted records.", 403)
-        if request.method not in {"GET", "POST"}:
+        is_trip_update = (
+            request.method == "PATCH"
+            and request.path.startswith("/api/trips/")
+            and request.path.removeprefix("/api/trips/").isdigit()
+        )
+        if request.method not in {"GET", "POST"} and not is_trip_update:
             return _json_error("Dispatchers cannot modify submitted records this way.", 403)
     return None
 
@@ -554,7 +559,11 @@ def _handle_document_image(kind: str, record_id: int) -> Any:
             uploaded = True
             if is_trip:
                 get_manager().set_trip_manifest_path(
-                    record_id, object_path, user_id=_document_user_id()
+                    record_id,
+                    object_path,
+                    user_id=_document_user_id(),
+                    edited_by=str((g.current_user or {}).get("id") or session.get("user_id") or ""),
+                    editor_email=(g.current_user or {}).get("email") or session.get("email"),
                 )
             else:
                 get_manager().set_fuel_invoice_path(
@@ -607,6 +616,69 @@ def _handle_document_image(kind: str, record_id: int) -> Any:
 @app.route("/api/trips/<int:trip_id>/manifest", methods=["GET", "POST"])
 def trip_manifest_image(trip_id: int) -> Any:
     return _handle_document_image("trip", trip_id)
+
+
+@app.route("/api/trips/<int:trip_id>/history")
+def trip_edit_history(trip_id: int) -> Any:
+    user_id = _document_user_id()
+    try:
+        history = get_manager().list_trip_edit_history(trip_id, user_id=user_id)
+    except FleetManagementError as exc:
+        message = str(exc)
+        if "not found" in message.lower():
+            return _json_error(message, 403 if _is_dispatcher() else 404)
+        if "do not have access" in message.lower():
+            return _json_error(message, 403)
+        raise
+    return jsonify({"history": history})
+
+
+@app.route("/api/trips/<int:trip_id>", methods=["PATCH"])
+def update_trip(trip_id: int) -> Any:
+    try:
+        payload = _body()
+        origin = _required_text(payload, "origin")
+        destination = _required_text(payload, "destination")
+        actor = g.current_user or {}
+        editor_id = str(actor.get("id") or session.get("user_id") or "")
+        record = get_manager().update_trip(
+            trip_id,
+            {
+                "ism_no": _optional_text(payload, "ism_no"),
+                "shipment_date": _required_text(payload, "shipment_date"),
+                "time_in": _optional_text(payload, "time_in"),
+                "time_out": _optional_text(payload, "time_out"),
+                "origin": origin,
+                "destination": destination,
+                "vehicle_id": (
+                    _integer(payload, "vehicle_id")
+                    if payload.get("vehicle_id") not in (None, "")
+                    else None
+                ),
+                "driver_id": (
+                    _integer(payload, "driver_id")
+                    if payload.get("driver_id") not in (None, "")
+                    else None
+                ),
+                "load_details": _optional_text(payload, "load_details"),
+                "trip_fuel": _optional_text(payload, "trip_fuel"),
+                "notes": _optional_text(payload, "notes"),
+                "route": f"{origin} to {destination}",
+            },
+            edited_by=editor_id,
+            editor_email=actor.get("email") or session.get("email"),
+            user_id=editor_id if _is_dispatcher() else None,
+        )
+    except ValueError as exc:
+        return _json_error(str(exc), 400)
+    except FleetManagementError as exc:
+        message = str(exc)
+        if "not found" in message.lower():
+            return _json_error(message, 403 if _is_dispatcher() else 404)
+        if "do not have access" in message.lower():
+            return _json_error(message, 403)
+        raise
+    return jsonify({"data": record})
 
 
 @app.route("/api/fuel/<int:fuel_id>/invoice", methods=["GET", "POST"])
@@ -810,6 +882,7 @@ def _create_record(resource: str, payload: dict[str, Any]) -> dict[str, Any]:
             destination=destination,
             load_details=_optional_text(payload, "load_details"),
             trip_fuel=_optional_text(payload, "trip_fuel"),
+            notes=_optional_text(payload, "notes"),
             created_by=created_by,
         )
     raise ValueError("Unknown resource")

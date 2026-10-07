@@ -918,6 +918,91 @@ class FleetManagerTests(unittest.TestCase):
         )
         self.assertEqual(invalid_image.status_code, 400)
 
+    def test_dispatcher_can_edit_owned_trip_and_view_its_edit_history(self):
+        web_app.manager = self.manager
+        web_app.app.config["TESTING"] = True
+        vehicle = self.manager.add_vehicle("EDIT-123", "Toyota", "Hiace", 2022)
+        driver = self.manager.add_driver("Edit Driver", "EDIT-DL-1")
+        own_trip = self.manager.add_trip(
+            vehicle["id"],
+            driver["id"],
+            "Old Origin to Old Destination",
+            0,
+            0,
+            ism_no="EDIT-TRIP",
+            shipment_date="2026-10-01",
+            origin="Old Origin",
+            destination="Old Destination",
+            created_by="auth-user-1",
+        )
+        other_trip = self.manager.add_trip(
+            vehicle["id"],
+            driver["id"],
+            "Other Origin to Other Destination",
+            0,
+            0,
+            ism_no="OTHER-EDIT-TRIP",
+            created_by="another-dispatcher",
+        )
+        auth_client = FakeAuthClient()
+        auth_client.user.user_metadata = {"role": "dispatcher"}
+        client = web_app.app.test_client()
+        self.sign_in(client, auth_client)
+        csrf = self.csrf_token(client)
+
+        response = client.patch(
+            f"/api/trips/{own_trip['id']}",
+            json={
+                "ism_no": "EDIT-TRIP-UPDATED",
+                "shipment_date": "2026-10-02",
+                "time_in": "08:00",
+                "time_out": "10:00",
+                "origin": "New Origin",
+                "destination": "New Destination",
+                "vehicle_id": vehicle["id"],
+                "driver_id": driver["id"],
+                "load_details": "Updated load",
+                "trip_fuel": "Diesel",
+            },
+            headers={"X-CSRF-Token": csrf},
+        )
+        denied = client.patch(
+            f"/api/trips/{other_trip['id']}",
+            json={
+                "ism_no": "NO-ACCESS",
+                "shipment_date": "2026-10-02",
+                "origin": "No",
+                "destination": "Access",
+                "vehicle_id": vehicle["id"],
+                "driver_id": driver["id"],
+            },
+            headers={"X-CSRF-Token": csrf},
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json["data"]["ism_no"], "EDIT-TRIP-UPDATED")
+        self.assertEqual(response.json["data"]["route"], "New Origin to New Destination")
+        self.assertEqual(response.json["data"]["last_edited_by"], "auth-user-1")
+        self.assertEqual(denied.status_code, 403)
+        self.assertEqual(
+            self.manager.get_trip(own_trip["id"])["destination"],
+            "New Destination",
+        )
+        self.manager.client.tables["trip_edit_history"] = [{
+            "id": 1,
+            "trip_id": own_trip["id"],
+            "edited_by": "auth-user-1",
+            "edited_by_email": "dispatcher@example.com",
+            "edited_at": "2026-10-02T08:00:00+00:00",
+            "old_values": {"destination": "Old Destination"},
+            "new_values": {"destination": "New Destination"},
+        }]
+        history = client.get(f"/api/trips/{own_trip['id']}/history")
+        denied_history = client.get(f"/api/trips/{other_trip['id']}/history")
+        self.assertEqual(history.status_code, 200)
+        self.assertEqual(history.json["history"][0]["edited_by_email"], "dispatcher@example.com")
+        self.assertEqual(denied_history.status_code, 403)
+
     def test_web_reports_missing_supabase_configuration(self):
         web_app.manager = None
         web_app.app.config["TESTING"] = True

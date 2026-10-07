@@ -59,6 +59,12 @@ details popup with its route, vehicle, driver, shipment information, and
 uploaded load manifest when available. The popup also lets authorized users
 upload a missing manifest later or replace the current image.
 
+Open a trip to edit its shipment details and review its edit history. Each
+change records the authenticated editor, timestamp, and before/after values.
+The edit history is stored by a database trigger; run the current
+`supabase_dispatcher_ownership_migration.sql` in Supabase before deploying this
+feature. Dispatchers can edit only their own trips.
+
 The web app requires Supabase email/password authentication. Its access and
 refresh tokens are stored in HttpOnly, SameSite browser-session cookies;
 protected pages, data APIs, and report exports reject unauthenticated requests.
