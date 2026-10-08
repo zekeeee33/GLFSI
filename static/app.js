@@ -1338,62 +1338,11 @@ view.addEventListener("change", (event) => {
   render();
 });
 
-const appShell = document.querySelector(".app-shell");
-const sidebar = document.querySelector("#sidebar");
-const menuToggle = document.querySelector("#menu-toggle");
-const sidebarBackdrop = document.querySelector("#sidebar-backdrop");
-const mobileNavigation = window.matchMedia("(max-width: 760px)");
-
-function setSidebarOpen(open) {
-  if (mobileNavigation.matches) {
-    sidebar.classList.toggle("sidebar-open", open);
-    sidebarBackdrop.classList.toggle("sidebar-backdrop-open", open);
-    document.body.classList.toggle("sidebar-navigation-open", open);
-    menuToggle.setAttribute("aria-expanded", String(open));
-    menuToggle.setAttribute("aria-label", open ? "Close navigation" : "Open navigation");
-    if (open) sidebar.querySelector(".nav-link")?.focus();
-    return;
-  }
-
-  appShell.classList.toggle("sidebar-collapsed", !open);
-  menuToggle.setAttribute("aria-expanded", String(open));
-  menuToggle.setAttribute("aria-label", open ? "Collapse navigation" : "Expand navigation");
-}
-
-setSidebarOpen(!mobileNavigation.matches && !appShell.classList.contains("sidebar-collapsed"));
-
 document.querySelectorAll(".nav-link").forEach((link) => {
   link.addEventListener("click", () => {
     state.search = "";
     window.clearTimeout(searchRenderTimer);
-    if (mobileNavigation.matches) setSidebarOpen(false);
   });
-});
-
-menuToggle.addEventListener("click", () => {
-  if (mobileNavigation.matches) {
-    setSidebarOpen(!sidebar.classList.contains("sidebar-open"));
-  } else {
-    setSidebarOpen(appShell.classList.contains("sidebar-collapsed"));
-  }
-});
-
-sidebarBackdrop.addEventListener("click", () => setSidebarOpen(false));
-document.addEventListener("keydown", (event) => {
-  if (event.key === "Escape" && sidebar.classList.contains("sidebar-open")) {
-    setSidebarOpen(false);
-    menuToggle.focus();
-  }
-});
-mobileNavigation.addEventListener("change", () => {
-  sidebar.classList.remove("sidebar-open");
-  sidebarBackdrop.classList.remove("sidebar-backdrop-open");
-  document.body.classList.remove("sidebar-navigation-open");
-  menuToggle.setAttribute("aria-expanded", String(!appShell.classList.contains("sidebar-collapsed")));
-  menuToggle.setAttribute(
-    "aria-label",
-    appShell.classList.contains("sidebar-collapsed") ? "Expand navigation" : "Collapse navigation",
-  );
 });
 
 document.querySelector("#sign-out").addEventListener("click", async (event) => {
