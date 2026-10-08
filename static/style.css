@@ -128,17 +128,12 @@ button:focus-visible, a:focus-visible, input:focus-visible, select:focus-visible
 }
 
 .brand-mark {
-  display: grid;
-  width: 39px;
-  height: 39px;
+  display: block;
+  width: 48px;
+  height: 48px;
   flex: 0 0 auto;
-  place-items: center;
-  border: 1px solid rgb(255 255 255 / 12%);
-  border-radius: 13px;
-  background: linear-gradient(135deg, var(--pink), var(--teal));
-  box-shadow: 0 8px 18px rgb(12 141 143 / 18%);
-  font-family: Manrope, sans-serif;
-  font-weight: 800;
+  border-radius: 50%;
+  object-fit: contain;
 }
 
 .brand-copy { display: grid; max-width: 190px; gap: 3px; overflow: hidden; opacity: 1; white-space: nowrap; transition: max-width .28s var(--ease-ui), opacity .16s ease, visibility .16s linear; }
@@ -399,7 +394,6 @@ tbody tr:hover { background: var(--table-hover); }
     radial-gradient(ellipse at 85% 0%, rgb(66 91 157 / 14%), transparent 34rem),
     var(--canvas);
 }
-:root[data-theme="dark"] .brand-mark { border-color: rgb(255 255 255 / 13%); }
 :root[data-theme="dark"] .nav-link.active { border-color: transparent; background: var(--teal-soft); color: var(--teal-strong); }
 :root[data-theme="dark"] .avatar { border-color: var(--border-strong); background: linear-gradient(145deg, #25334b, #1a273c); color: #c3d0ff; }
 :root[data-theme="dark"] .footer,
@@ -463,7 +457,7 @@ tbody tr:hover { background: var(--table-hover); }
 @media (max-width: 760px) {
   :root { --navigation-height: 108px; }
   .sidebar { flex-wrap: wrap; gap: 7px 14px; padding: 9px max(14px, env(safe-area-inset-left)) 7px; }
-  .brand { min-height: 39px; }
+  .brand { min-height: 48px; }
   .nav { order: 1; width: 100%; flex-basis: 100%; justify-content: flex-start; margin-inline: -4px; overflow-x: auto; scrollbar-width: thin; }
   .nav-link { min-height: 38px; }
   .topbar { height: 52px; gap: 8px; padding-inline: max(14px, env(safe-area-inset-left)) max(14px, env(safe-area-inset-right)); }
