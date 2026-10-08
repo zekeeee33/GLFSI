@@ -179,6 +179,9 @@ const state = {
   page: "dashboard",
   search: "",
   csrfToken: "",
+  notifications: [],
+  unreadNotifications: 0,
+  notificationTarget: null,
   payroll: null,
   payrollKey: "",
   payrollRequestedKey: "",
@@ -193,6 +196,8 @@ const view = document.querySelector("#app-view");
 let idleLogoutTimer;
 let lastActivityPing = 0;
 let searchRenderTimer;
+let notificationPollTimer;
+let notificationFetchInProgress = false;
 
 function returnToSignIn(expired = false) {
   window.location.replace(expired ? "/login?expired=1" : "/login");
@@ -282,6 +287,83 @@ async function api(path, options = {}) {
   return payload;
 }
 
+function renderNotificationItems() {
+  const list = document.querySelector("#notification-list");
+  if (!list) return;
+  const dispatcherFilter = document.querySelector("#notification-dispatcher-filter").value.trim().toLocaleLowerCase();
+  const typeFilter = document.querySelector("#notification-type-filter").value;
+  const dateFilter = document.querySelector("#notification-date-filter").value;
+  const statusFilter = document.querySelector("#notification-status-filter").value;
+  const filtered = state.notifications.filter((notification) =>
+    (!dispatcherFilter || `${notification.actor_name} ${notification.actor_email}`.toLocaleLowerCase().includes(dispatcherFilter))
+    && (!typeFilter || notification.notification_type === typeFilter)
+    && (!dateFilter || String(notification.created_at || "").slice(0, 10) === dateFilter)
+    && (!statusFilter || (notification.is_read ? "read" : "unread") === statusFilter),
+  );
+  if (!filtered.length) {
+    list.innerHTML = `<p class="notification-empty">${state.notifications.length ? "No notifications match these filters." : "You’re all caught up."}</p>`;
+    return;
+  }
+  list.innerHTML = filtered.map((notification) => {
+    const createdAt = new Date(notification.created_at);
+    const readableDate = Number.isNaN(createdAt.getTime())
+      ? ""
+      : new Intl.DateTimeFormat(undefined, { dateStyle: "medium", timeStyle: "short" }).format(createdAt);
+    return `
+      <button class="notification-item ${notification.is_read ? "" : "unread"}" type="button" data-notification-id="${escapeHtml(notification.id)}">
+        <span class="notification-item-title">${escapeHtml(notification.title)}</span>
+        <span class="notification-item-message">${escapeHtml(notification.message)}</span>
+        <span class="notification-item-meta"><span>Record #${escapeHtml(notification.record_id)}</span><time datetime="${escapeHtml(notification.created_at)}">${escapeHtml(readableDate)}</time></span>
+      </button>`;
+  }).join("");
+}
+
+function setUnreadNotificationCount(count) {
+  state.unreadNotifications = Number.isFinite(Number(count)) ? Number(count) : 0;
+  const badge = document.querySelector("#notification-count");
+  const button = document.querySelector("#notification-toggle");
+  badge.textContent = state.unreadNotifications > 99 ? "99+" : String(state.unreadNotifications);
+  badge.hidden = state.unreadNotifications === 0;
+  button.setAttribute(
+    "aria-label",
+    `Notifications${state.unreadNotifications ? `, ${state.unreadNotifications} unread` : ""}`,
+  );
+}
+
+async function refreshNotifications(loadList = false) {
+  if (notificationFetchInProgress || state.data?.user?.role !== "administrator") return;
+  notificationFetchInProgress = true;
+  try {
+    const result = await api("/api/notifications/unread-count");
+    setUnreadNotificationCount(result.unread_count);
+    const center = document.querySelector("#notification-center");
+    if (loadList || !center.hidden) {
+      const listing = await api("/api/notifications");
+      state.notifications = listing.notifications || [];
+      renderNotificationItems();
+    }
+    document.querySelector("#notification-error").hidden = true;
+  } catch (error) {
+    const errorMessage = document.querySelector("#notification-error");
+    errorMessage.textContent = error.message || "Could not load notifications.";
+    errorMessage.hidden = false;
+  } finally {
+    notificationFetchInProgress = false;
+  }
+}
+
+function initializeNotificationPolling() {
+  const adminCenter = document.querySelector("#notification-menu-wrap");
+  const isAdmin = state.data?.user?.role === "administrator";
+  adminCenter.hidden = !isAdmin;
+  window.clearInterval(notificationPollTimer);
+  if (!isAdmin) return;
+  refreshNotifications();
+  notificationPollTimer = window.setInterval(() => {
+    if (!document.hidden) refreshNotifications();
+  }, 12000);
+}
+
 async function loadData() {
   view.setAttribute("aria-busy", "true");
   try {
@@ -292,6 +374,7 @@ async function loadData() {
       `${user.email || ""}${user.role ? ` · ${user.role}` : ""}`;
     registerSessionActivity();
     render();
+    initializeNotificationPolling();
   } catch (error) {
     view.innerHTML = `
       <section class="error-card">
@@ -346,8 +429,8 @@ function tableMarkup(rows, columns, resource, options = {}) {
       ? `<td class="action-column" data-label="Action"><button class="icon-button delete-button" type="button" data-action="delete" data-resource="${escapeHtml(resource)}" data-id="${escapeHtml(row.id)}" aria-label="Delete record">×</button></td>`
       : "";
     const rowAttributes = options.rowAction
-      ? `tabindex="0" role="button" class="clickable-row" data-action="${escapeHtml(options.rowAction)}" data-id="${escapeHtml(row.id)}" aria-label="View trip ${escapeHtml(row.ism_no || row.id)}"`
-      : "";
+        ? `tabindex="0" role="button" class="clickable-row" data-action="${escapeHtml(options.rowAction)}" data-id="${escapeHtml(row.id)}" data-record-id="${escapeHtml(row.id)}" aria-label="View trip ${escapeHtml(row.ism_no || row.id)}"`
+        : (resource ? `data-record-id="${escapeHtml(row.id)}"` : "");
     return `<tr ${rowAttributes}>${cells}${action}</tr>`;
   }).join("");
   return `<div class="table-wrap"><table><thead><tr>${headings}${actionHeader}</tr></thead><tbody>${body}</tbody></table></div>`;
@@ -862,6 +945,17 @@ function render() {
   view.innerHTML = state.page === "dashboard"
     ? renderDashboard()
     : state.page === "payroll" ? renderPayroll() : renderResource(state.page);
+  if (state.notificationTarget?.module === state.page) {
+    const recordRow = [...view.querySelectorAll("[data-record-id]")].find(
+      (row) => row.dataset.recordId === String(state.notificationTarget.recordId),
+    );
+    state.notificationTarget = null;
+    if (recordRow) {
+      recordRow.classList.add("notification-highlight");
+      recordRow.scrollIntoView({ behavior: "smooth", block: "center" });
+      window.setTimeout(() => recordRow.classList.remove("notification-highlight"), 4000);
+    }
+  }
 }
 
 function openTripDetails(tripId) {
@@ -1343,6 +1437,100 @@ document.querySelectorAll(".nav-link").forEach((link) => {
     state.search = "";
     window.clearTimeout(searchRenderTimer);
   });
+});
+
+const notificationMenu = document.querySelector("#notification-center");
+const notificationMenuWrap = document.querySelector("#notification-menu-wrap");
+const notificationToggle = document.querySelector("#notification-toggle");
+
+notificationToggle.addEventListener("click", async () => {
+  notificationMenu.hidden = !notificationMenu.hidden;
+  notificationToggle.setAttribute("aria-expanded", String(!notificationMenu.hidden));
+  if (!notificationMenu.hidden) await refreshNotifications(true);
+});
+
+document.querySelector("#notification-dispatcher-filter").addEventListener("input", renderNotificationItems);
+for (const filterId of [
+  "notification-type-filter",
+  "notification-date-filter",
+  "notification-status-filter",
+]) {
+  document.querySelector(`#${filterId}`).addEventListener("change", renderNotificationItems);
+}
+
+document.querySelector("#notifications-read-all").addEventListener("click", async (event) => {
+  const button = event.currentTarget;
+  button.disabled = true;
+  try {
+    await api("/api/notifications/read-all", { method: "PATCH" });
+    await refreshNotifications(true);
+  } catch (error) {
+    const errorMessage = document.querySelector("#notification-error");
+    errorMessage.textContent = error.message;
+    errorMessage.hidden = false;
+  } finally {
+    button.disabled = false;
+  }
+});
+
+document.querySelector("#notification-list").addEventListener("click", async (event) => {
+  const button = event.target.closest("[data-notification-id]");
+  if (!button) return;
+  const notification = state.notifications.find(
+    (item) => String(item.id) === button.dataset.notificationId,
+  );
+  if (!notification) return;
+  button.disabled = true;
+  try {
+    await api(`/api/notifications/${encodeURIComponent(notification.id)}/read`, {
+      method: "PATCH",
+    });
+    await refreshNotifications(true);
+    notificationMenu.hidden = true;
+    notificationToggle.setAttribute("aria-expanded", "false");
+    const destination = notification.module;
+    if (!["trips", "fuel", "maintenance"].includes(destination)) {
+      throw new Error("This notification does not have a supported destination.");
+    }
+    state.search = "";
+    const nextHash = `#${destination}`;
+    if (window.location.hash !== nextHash) {
+      const hashChanged = new Promise((resolve) => {
+        window.addEventListener("hashchange", resolve, { once: true });
+      });
+      window.location.hash = destination;
+      await hashChanged;
+    }
+    state.notificationTarget = {
+      module: destination,
+      recordId: notification.record_id,
+    };
+    await loadData();
+    if (destination === "trips") openTripDetails(notification.record_id);
+  } catch (error) {
+    const errorMessage = document.querySelector("#notification-error");
+    errorMessage.textContent = error.message;
+    errorMessage.hidden = false;
+  }
+});
+
+document.addEventListener("click", (event) => {
+  if (!notificationMenuWrap.contains(event.target)) {
+    notificationMenu.hidden = true;
+    notificationToggle.setAttribute("aria-expanded", "false");
+  }
+});
+
+document.addEventListener("keydown", (event) => {
+  if (event.key === "Escape" && !notificationMenu.hidden) {
+    notificationMenu.hidden = true;
+    notificationToggle.setAttribute("aria-expanded", "false");
+    notificationToggle.focus();
+  }
+});
+
+document.addEventListener("visibilitychange", () => {
+  if (!document.hidden) refreshNotifications();
 });
 
 document.querySelector("#sign-out").addEventListener("click", async (event) => {

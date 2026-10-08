@@ -878,11 +878,12 @@ class FleetManagerTests(unittest.TestCase):
         image = BytesIO()
         Image.new("RGB", (2, 2), color="blue").save(image, format="PNG")
         image_bytes = image.getvalue()
-        manifest_upload = client.post(
-            f"/api/trips/{trip['id']}/manifest",
-            data={"image": (BytesIO(image_bytes), "manifest.png")},
-            headers={"X-CSRF-Token": csrf},
-        )
+        with patch.object(web_app, "_admin_recipient_ids", return_value=["admin-user"]):
+            manifest_upload = client.post(
+                f"/api/trips/{trip['id']}/manifest",
+                data={"image": (BytesIO(image_bytes), "manifest.png")},
+                headers={"X-CSRF-Token": csrf},
+            )
         invoice_upload = client.post(
             f"/api/fuel/{fuel['id']}/invoice",
             data={"image": (BytesIO(image_bytes), "invoice.png")},
@@ -894,6 +895,10 @@ class FleetManagerTests(unittest.TestCase):
         other_manifest_view = client.get(f"/api/trips/{other_trip['id']}/manifest")
 
         self.assertEqual(manifest_upload.status_code, 201)
+        self.assertEqual(
+            self.client.tables["notifications"][0]["notification_type"],
+            "NEW_LOAD_MANIFEST",
+        )
         self.assertEqual(invoice_upload.status_code, 201)
         self.assertEqual(
             bootstrap.json["trips"][0]["manifest_image_url"],
@@ -1005,6 +1010,243 @@ class FleetManagerTests(unittest.TestCase):
         self.assertEqual(history.status_code, 200)
         self.assertEqual(history.json["history"][0]["edited_by_email"], "dispatcher@example.com")
         self.assertEqual(denied_history.status_code, 403)
+
+    def test_dispatcher_creates_notification_for_each_supported_record_type(self):
+        vehicle = self.manager.add_vehicle("NOTIFY-1", "Toyota", "Hiace", 2024)
+        driver = self.manager.add_driver("Notify Driver", "NOTIFY-DL-1")
+        web_app.manager = self.manager
+        web_app.app.config["TESTING"] = True
+        auth_client = FakeAuthClient()
+        auth_client.user.user_metadata = {
+            "role": "dispatcher",
+            "full_name": "Juan Dela Cruz",
+        }
+        auth_client.user.app_metadata = {"role": "administrator"}
+        client = web_app.app.test_client()
+        self.sign_in(client, auth_client)
+        csrf = self.csrf_token(client)
+
+        requests = [
+            (
+                "trips",
+                {
+                    "ism_no": "31946326",
+                    "shipment_date": "2026-10-08",
+                    "origin": "GENSAN",
+                    "destination": "DAV2",
+                    "vehicle_id": vehicle["id"],
+                    "driver_id": driver["id"],
+                },
+                "NEW_TRIP",
+            ),
+            (
+                "fuel",
+                {
+                    "vehicle_id": vehicle["id"],
+                    "fuel_type": "Diesel",
+                    "quantity": 50,
+                    "price_per_liter": 70,
+                    "total_cost": 3500,
+                },
+                "NEW_FUEL_LOG",
+            ),
+            (
+                "maintenance",
+                {
+                    "vehicle_id": vehicle["id"],
+                    "service_type": "Oil change",
+                    "description": "Scheduled service",
+                    "cost": 1200,
+                },
+                "NEW_MAINTENANCE_LOG",
+            ),
+        ]
+        with patch.object(web_app, "_admin_recipient_ids", return_value=["admin-user"]):
+            created_records = []
+            for resource, payload, expected_type in requests:
+                response = client.post(
+                    f"/api/{resource}",
+                    json=payload,
+                    headers={"X-CSRF-Token": csrf},
+                )
+                self.assertEqual(response.status_code, 201)
+                created_records.append((response.json["data"], expected_type))
+
+        notifications = self.client.tables["notifications"]
+        self.assertEqual(len(notifications), 3)
+        for record, expected_type in created_records:
+            matching = [
+                item for item in notifications
+                if item["record_id"] == str(record["id"])
+                and item["notification_type"] == expected_type
+            ]
+            self.assertEqual(len(matching), 1)
+            self.assertEqual(matching[0]["notification_type"], expected_type)
+            self.assertEqual(matching[0]["recipient_user_id"], "admin-user")
+            self.assertEqual(matching[0]["actor_user_id"], "auth-user-1")
+            self.assertEqual(matching[0]["actor_name"], "Juan Dela Cruz")
+            self.assertFalse(matching[0]["is_read"])
+        self.assertIn("GENSAN → DAV2", notifications[0]["message"])
+        self.assertIn("31946326", notifications[0]["message"])
+
+    def test_dispatcher_notification_creation_is_idempotent_per_record(self):
+        web_app.manager = self.manager
+        with patch.object(web_app, "_admin_recipient_ids", return_value=["admin-user"]):
+            record = {
+                "id": 51,
+                "origin": "GENSAN",
+                "destination": "DAV2",
+                "ism_no": "ISM-51",
+            }
+            actor = {
+                "id": "dispatcher-id",
+                "full_name": "Dispatcher",
+                "email": "dispatcher@example.com",
+            }
+            web_app._create_dispatcher_notifications("trips", record, actor)
+            web_app._create_dispatcher_notifications("trips", record, actor)
+
+        self.assertEqual(len(self.client.tables["notifications"]), 1)
+
+    def test_admin_notification_api_scopes_records_and_marks_them_read(self):
+        web_app.manager = self.manager
+        web_app.app.config["TESTING"] = True
+        self.client.tables["notifications"] = [
+            {
+                "id": 1,
+                "recipient_user_id": "admin-user",
+                "actor_user_id": "dispatcher-id",
+                "actor_name": "Maria Santos",
+                "actor_email": "maria@example.com",
+                "notification_type": "NEW_FUEL_LOG",
+                "module": "fuel",
+                "record_id": "10",
+                "title": "New Fuel Log Added",
+                "message": "Vehicle: MUB289",
+                "is_read": False,
+                "created_at": "2026-10-08T01:10:00+00:00",
+                "read_at": None,
+            },
+            {
+                "id": 2,
+                "recipient_user_id": "another-admin",
+                "actor_user_id": "dispatcher-id",
+                "actor_name": "Another Dispatcher",
+                "actor_email": "other@example.com",
+                "notification_type": "NEW_TRIP",
+                "module": "trips",
+                "record_id": "11",
+                "title": "New Trip Added",
+                "message": "GENSAN → DAV2",
+                "is_read": False,
+                "created_at": "2026-10-08T01:11:00+00:00",
+                "read_at": None,
+            },
+        ]
+        auth_client = FakeAuthClient()
+        auth_client.user.id = "admin-user"
+        client = web_app.app.test_client()
+        self.sign_in(client, auth_client)
+
+        listing = client.get(
+            "/api/notifications?dispatcher=maria&type=new_fuel_log&date=2026-10-08&status=unread"
+        )
+        self.assertEqual(listing.status_code, 200)
+        self.assertEqual([row["id"] for row in listing.json["notifications"]], [1])
+        self.assertEqual(client.get("/api/notifications/unread-count").json["unread_count"], 1)
+
+        read = client.patch(
+            "/api/notifications/1/read",
+            headers={"X-CSRF-Token": self.csrf_token(client)},
+        )
+        self.assertEqual(read.status_code, 200)
+        self.assertTrue(read.json["notification"]["is_read"])
+        self.assertTrue(read.json["notification"]["read_at"])
+        self.assertEqual(client.get("/api/notifications/unread-count").json["unread_count"], 0)
+        self.assertEqual(
+            self.client.tables["notifications"][0]["message"],
+            "Vehicle: MUB289",
+        )
+        self.client.tables["notifications"].append({
+            "id": 3,
+            "recipient_user_id": "admin-user",
+            "actor_user_id": "dispatcher-id",
+            "actor_name": "Maria Santos",
+            "actor_email": "maria@example.com",
+            "notification_type": "NEW_TRIP",
+            "module": "trips",
+            "record_id": "12",
+            "title": "New Trip Added",
+            "message": "GENSAN → DAV2",
+            "is_read": False,
+            "created_at": "2026-10-08T01:12:00+00:00",
+            "read_at": None,
+        })
+        read_all = client.patch(
+            "/api/notifications/read-all",
+            headers={"X-CSRF-Token": self.csrf_token(client)},
+        )
+        self.assertEqual(read_all.status_code, 200)
+        self.assertEqual(read_all.json["updated"], 1)
+        self.assertTrue(self.client.tables["notifications"][2]["is_read"])
+        self.assertFalse(self.client.tables["notifications"][1]["is_read"])
+
+    def test_dispatcher_cannot_access_admin_notifications(self):
+        web_app.manager = self.manager
+        web_app.app.config["TESTING"] = True
+        auth_client = FakeAuthClient()
+        auth_client.user.user_metadata = {"role": "dispatcher"}
+        auth_client.user.app_metadata = {"role": "administrator"}
+        client = web_app.app.test_client()
+        self.sign_in(client, auth_client)
+
+        self.assertEqual(client.get("/api/notifications").status_code, 403)
+        self.assertEqual(client.get("/api/notifications/unread-count").status_code, 403)
+
+    def test_notification_failure_does_not_fail_successful_dispatcher_record(self):
+        vehicle = self.manager.add_vehicle("NOTIFY-FAIL", "Toyota", "Hiace", 2024)
+        driver = self.manager.add_driver("Notify Fail Driver", "NOTIFY-DL-FAIL")
+        web_app.manager = self.manager
+        web_app.app.config["TESTING"] = True
+        auth_client = FakeAuthClient()
+        auth_client.user.user_metadata = {"role": "dispatcher"}
+        client = web_app.app.test_client()
+        self.sign_in(client, auth_client)
+        csrf = self.csrf_token(client)
+
+        payload = {
+            "shipment_date": "2026-10-08",
+            "origin": "GENSAN",
+            "destination": "DAV2",
+            "vehicle_id": vehicle["id"],
+            "driver_id": driver["id"],
+        }
+        with patch.object(
+            self.manager,
+            "add_trip",
+            side_effect=FleetManagementError("Trip insert failed"),
+        ):
+            failed_insert = client.post(
+                "/api/trips",
+                json=payload,
+                headers={"X-CSRF-Token": csrf},
+            )
+        self.assertEqual(failed_insert.status_code, 503)
+        self.assertFalse(self.client.tables.get("notifications"))
+
+        with patch.object(
+            web_app, "_admin_recipient_ids", side_effect=RuntimeError("Auth lookup failed")
+        ):
+            with self.assertLogs(web_app.logger, level="ERROR"):
+                response = client.post(
+                    "/api/trips",
+                    json=payload,
+                    headers={"X-CSRF-Token": csrf},
+                )
+
+        self.assertEqual(response.status_code, 201)
+        self.assertEqual(len(self.client.tables["trips"]), 1)
+        self.assertFalse(self.client.tables.get("notifications"))
 
     def test_web_reports_missing_supabase_configuration(self):
         web_app.manager = None

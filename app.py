@@ -7,7 +7,7 @@ import secrets
 import time
 import uuid
 import warnings
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
 from io import BytesIO
 from typing import Any
 
@@ -583,6 +583,10 @@ def _handle_document_image(kind: str, record_id: int) -> Any:
                 get_manager().set_fuel_invoice_path(
                     record_id, object_path, user_id=_document_user_id()
                 )
+            if is_trip and _is_dispatcher() and not record.get(path_field):
+                _create_dispatcher_notifications(
+                    "load_manifest", record, g.current_user or {}
+                )
             if record.get(path_field):
                 try:
                     storage.remove([record[path_field]])
@@ -902,6 +906,274 @@ def _create_record(resource: str, payload: dict[str, Any]) -> dict[str, Any]:
     raise ValueError("Unknown resource")
 
 
+def _admin_recipient_ids() -> list[str]:
+    admin_api = get_manager().client.auth.admin
+    recipient_ids: list[str] = []
+    page = 1
+    per_page = 1000
+    while True:
+        response = admin_api.list_users(page=page, per_page=per_page)
+        users = getattr(response, "users", response)
+        if not isinstance(users, list):
+            raise FleetManagementError("Supabase Auth returned an invalid user list.")
+        recipient_ids.extend(
+            str(user.id)
+            for user in users
+            if getattr(user, "id", None) and _role_for_auth_user(user) == "administrator"
+        )
+        if len(users) < per_page:
+            return recipient_ids
+        page += 1
+
+
+def _notification_message(resource: str, record: dict[str, Any]) -> tuple[str, str]:
+    if resource in {"trips", "load_manifest"}:
+        title = "New Load Manifest Added" if resource == "load_manifest" else "New Trip Added"
+        route = " → ".join(
+            str(record.get(field) or "").strip()
+            for field in ("origin", "destination")
+            if record.get(field)
+        )
+        details = [route] if route else []
+        if record.get("ism_no"):
+            details.append(f"ISM Number: {record['ism_no']}")
+        if resource == "load_manifest":
+            details.insert(0, "Load manifest uploaded")
+        return title, " · ".join(details) or f"Trip record #{record['id']}"
+    if resource == "fuel":
+        title = "New Fuel Log Added"
+        details = []
+        if record.get("plate_number"):
+            details.append(f"Vehicle: {record['plate_number']}")
+        if record.get("total_cost") is not None:
+            details.append(f"Fuel amount: ₱{record['total_cost']}")
+        elif record.get("quantity") is not None:
+            details.append(f"Fuel quantity: {record['quantity']} L")
+        return title, " · ".join(details) or f"Fuel log record #{record['id']}"
+    if resource == "maintenance":
+        title = "New Maintenance Log Added"
+        details = [
+            str(record.get("service_type") or "").strip(),
+            str(record.get("description") or "").strip(),
+        ]
+        if record.get("plate_number"):
+            details.insert(0, f"Vehicle: {record['plate_number']}")
+        return title, " · ".join(detail for detail in details if detail) or f"Maintenance record #{record['id']}"
+    raise ValueError(f"Notifications are not configured for {resource}.")
+
+
+def _create_dispatcher_notifications(
+    resource: str, record: dict[str, Any], actor: dict[str, Any]
+) -> None:
+    module_details = {
+        "trips": ("NEW_TRIP", "trips"),
+        "fuel": ("NEW_FUEL_LOG", "fuel"),
+        "maintenance": ("NEW_MAINTENANCE_LOG", "maintenance"),
+        "load_manifest": ("NEW_LOAD_MANIFEST", "trips"),
+    }
+    notification_type, module = module_details[resource]
+    actor_id = str(actor["id"])
+    actor_name = str(actor.get("full_name") or actor.get("email") or "Dispatcher")
+    actor_email = str(actor.get("email") or "")
+    try:
+        notification_record = dict(record)
+        if resource in {"fuel", "maintenance"} and record.get("vehicle_id"):
+            try:
+                vehicle = get_manager().get_vehicle(int(record["vehicle_id"]))
+                notification_record["plate_number"] = vehicle.get("plate_number")
+            except Exception:
+                logger.warning(
+                    "Could not load vehicle details for %s notification record %s.",
+                    resource,
+                    record.get("id"),
+                    exc_info=True,
+                )
+        title, details = _notification_message(resource, notification_record)
+        message = f"Dispatcher: {actor_name}"
+        if actor_email:
+            message += f" ({actor_email})"
+        message += f" · {details}"
+        recipients = _admin_recipient_ids()
+        if not recipients:
+            logger.warning("No Admin recipients found for dispatcher notification.")
+            return
+
+        notifications = get_manager().client.table("notifications")
+        for recipient_id in recipients:
+            try:
+                existing = (
+                    notifications.select("id")
+                    .eq("recipient_user_id", recipient_id)
+                    .eq("notification_type", notification_type)
+                    .eq("module", module)
+                    .eq("record_id", str(record["id"]))
+                    .limit(1)
+                    .execute()
+                )
+                if existing.data:
+                    continue
+                notifications.insert({
+                    "recipient_user_id": recipient_id,
+                    "actor_user_id": actor_id,
+                    "actor_name": actor_name,
+                    "actor_email": actor_email,
+                    "notification_type": notification_type,
+                    "module": module,
+                    "record_id": str(record["id"]),
+                    "title": title,
+                    "message": message,
+                    "is_read": False,
+                }).execute()
+            except Exception:
+                logger.exception(
+                    "Could not persist notification for Admin %s (%s record %s).",
+                    recipient_id,
+                    resource,
+                    record.get("id"),
+                )
+    except Exception:
+        logger.exception(
+            "Could not create notification for dispatcher %s %s record %s.",
+            resource,
+            actor_id,
+            record.get("id"),
+        )
+
+
+def _admin_notification_request() -> tuple[str | None, Any | None]:
+    if _is_dispatcher() or _user_role() != "administrator":
+        return None, _json_error("Notifications are only available to administrators.", 403)
+    recipient_id = str((g.current_user or {}).get("id") or "")
+    if not recipient_id:
+        return None, _json_error("Authenticated Admin identity is missing.", 403)
+    return recipient_id, None
+
+
+@app.route("/api/notifications")
+def list_notifications() -> Any:
+    recipient_id, error = _admin_notification_request()
+    if error:
+        return error
+    try:
+        notifications = get_manager()._select_all(
+            "notifications",
+            "*",
+            order=("created_at", "desc"),
+            filters=[("recipient_user_id", recipient_id)],
+        )
+    except FleetManagementError as exc:
+        logger.warning("Could not load Admin notifications: %s", exc)
+        return _json_error(str(exc), 503)
+    except Exception:
+        logger.exception("Could not load Admin notifications.")
+        return _json_error("Could not load notifications. Please retry.", 503)
+
+    dispatcher = request.args.get("dispatcher", "").strip().lower()
+    data_type = request.args.get("type", "").strip().lower()
+    created_date = request.args.get("date", "").strip()
+    status = request.args.get("status", "").strip().lower()
+    if created_date:
+        try:
+            datetime.strptime(created_date, "%Y-%m-%d")
+        except ValueError:
+            return _json_error("Date filter must use YYYY-MM-DD.", 400)
+    if status and status not in {"read", "unread"}:
+        return _json_error("Status filter must be read or unread.", 400)
+    notifications = [
+        row for row in notifications
+        if (not dispatcher or dispatcher in (
+            f"{row.get('actor_name', '')} {row.get('actor_email', '')}".lower()
+        ))
+        and (not data_type or row.get("notification_type", "").lower() == data_type)
+        and (not created_date or str(row.get("created_at", ""))[:10] == created_date)
+        and (not status or bool(row.get("is_read")) == (status == "read"))
+    ]
+    return jsonify({"notifications": notifications})
+
+
+@app.route("/api/notifications/unread-count")
+def unread_notification_count() -> Any:
+    recipient_id, error = _admin_notification_request()
+    if error:
+        return error
+    try:
+        unread = get_manager()._select_all(
+            "notifications",
+            "id",
+            filters=[("recipient_user_id", recipient_id), ("is_read", False)],
+        )
+    except FleetManagementError as exc:
+        logger.warning("Could not load the Admin unread notification count: %s", exc)
+        return _json_error(str(exc), 503)
+    except Exception:
+        logger.exception("Could not load the Admin unread notification count.")
+        return _json_error("Could not load unread notifications. Please retry.", 503)
+    return jsonify({"unread_count": len(unread)})
+
+
+@app.route("/api/notifications/<int:notification_id>/read", methods=["PATCH"])
+def mark_notification_read(notification_id: int) -> Any:
+    recipient_id, error = _admin_notification_request()
+    if error:
+        return error
+    notifications = get_manager().client.table("notifications")
+    try:
+        result = (
+            notifications.update({
+                "is_read": True,
+                "read_at": datetime.now(timezone.utc).isoformat(),
+            })
+            .eq("id", notification_id)
+            .eq("recipient_user_id", recipient_id)
+            .eq("is_read", False)
+            .execute()
+        )
+        rows = result.data or []
+        if not rows:
+            existing = (
+                notifications.select("*")
+                .eq("id", notification_id)
+                .eq("recipient_user_id", recipient_id)
+                .limit(1)
+                .execute()
+            )
+            rows = existing.data or []
+        if not rows:
+            return _json_error("Notification not found.", 404)
+    except FleetManagementError as exc:
+        logger.warning("Could not mark Admin notification %s as read: %s", notification_id, exc)
+        return _json_error(str(exc), 503)
+    except Exception:
+        logger.exception("Could not mark Admin notification %s as read.", notification_id)
+        return _json_error("Could not update the notification. Please retry.", 503)
+    return jsonify({"notification": rows[0]})
+
+
+@app.route("/api/notifications/read-all", methods=["PATCH"])
+def mark_all_notifications_read() -> Any:
+    recipient_id, error = _admin_notification_request()
+    if error:
+        return error
+    try:
+        result = (
+            get_manager().client.table("notifications")
+            .update({
+                "is_read": True,
+                "read_at": datetime.now(timezone.utc).isoformat(),
+            })
+            .eq("recipient_user_id", recipient_id)
+            .eq("is_read", False)
+            .execute()
+        )
+    except FleetManagementError as exc:
+        logger.warning("Could not mark all Admin notifications as read: %s", exc)
+        return _json_error(str(exc), 503)
+    except Exception:
+        logger.exception("Could not mark all Admin notifications as read.")
+        return _json_error("Could not update notifications. Please retry.", 503)
+    return jsonify({"updated": len(result.data or [])})
+
+
 @app.route(
     "/api/<any(vehicles,drivers,assignments,maintenance,fuel,trips):resource>",
     methods=["POST"],
@@ -913,6 +1185,8 @@ def create_record(resource: str) -> Any:
         record = _create_record(resource, _body())
     except ValueError as exc:
         return jsonify({"error": str(exc)}), 400
+    if _is_dispatcher() and resource in {"trips", "fuel", "maintenance"}:
+        _create_dispatcher_notifications(resource, record, g.current_user or {})
     return jsonify({"data": record}), 201
 
 

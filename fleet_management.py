@@ -115,6 +115,14 @@ class FleetManager:
                     "supabase_payroll_migration.sql in the Supabase SQL Editor, "
                     "then refresh the app."
                 ) from exc
+            if "notifications" in combined_error and (
+                "does not exist" in combined_error or "schema cache" in combined_error
+            ):
+                raise FleetManagementError(
+                    "Admin notifications are not installed. Run "
+                    "supabase_notifications_migration.sql in the Supabase SQL "
+                    "Editor, then refresh the app."
+                ) from exc
             raise FleetManagementError(f"Supabase request failed: {exc}") from exc
 
     def _insert(self, table: str, values: Dict[str, Any]) -> Dict[str, Any]:

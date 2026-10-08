@@ -36,6 +36,13 @@ and maintenance ID counters past existing records, which prevents duplicate
 IDs after CSV imports. Existing records remain unowned and are visible only to
 administrators.
 
+Run [`supabase_notifications_migration.sql`](./supabase_notifications_migration.sql)
+in the Supabase SQL Editor to enable Admin notifications. Each successful
+dispatcher-created trip, fuel log, maintenance log, or first load-manifest upload
+is recorded for each administrator. Admins can filter, open, and mark their
+notifications as read. The notification center refreshes unread counts every
+12 seconds while the app is open.
+
 Set a dispatcher's role to `dispatcher` in that user's Supabase **User Metadata**
 to enable the compatibility role restriction. Prefer setting `role` in
 **App Metadata** when provisioning accounts server-side; App Metadata is

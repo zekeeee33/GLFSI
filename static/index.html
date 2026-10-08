@@ -10,8 +10,8 @@
     <title>Good Luck Forwarding Systems Inc. Fleet Management System</title>
     <link rel="icon" type="image/png" href="/static/glfs-logo.png" />
     <script src="/static/theme.js"></script>
-    <link rel="stylesheet" href="/static/style.css?v=top-navigation-logo-2" />
-    <script src="/static/app.js?v=top-navigation-1" defer></script>
+    <link rel="stylesheet" href="/static/style.css?v=dispatcher-notifications-1" />
+    <script src="/static/app.js?v=dispatcher-notifications-1" defer></script>
   </head>
   <body>
     <div class="app-shell">
@@ -56,6 +56,39 @@
       <div class="main-column">
         <header class="topbar">
           <div class="topbar-spacer"></div>
+          <div class="notification-menu-wrap" id="notification-menu-wrap" hidden>
+            <button class="button button-secondary button-small notification-toggle" id="notification-toggle" type="button" aria-expanded="false" aria-controls="notification-center" aria-label="Notifications">
+              <svg aria-hidden="true" viewBox="0 0 24 24"><path d="M18 9a6 6 0 0 0-12 0c0 7-3 7-3 9h18c0-2-3-2-3-9M10 21h4"/></svg>
+              <span>Notifications</span>
+              <span class="notification-count" id="notification-count" hidden>0</span>
+            </button>
+            <section class="notification-center" id="notification-center" aria-label="Notifications" hidden>
+              <div class="notification-center-heading">
+                <h2>Notifications</h2>
+                <button class="text-button" id="notifications-read-all" type="button">Mark all as read</button>
+              </div>
+              <div class="notification-filters">
+                <input id="notification-dispatcher-filter" type="search" placeholder="Filter dispatcher" aria-label="Filter by dispatcher" />
+                <select id="notification-type-filter" aria-label="Filter by data type">
+                  <option value="">All data types</option>
+                  <option value="NEW_TRIP">Trips</option>
+                  <option value="NEW_LOAD_MANIFEST">Load manifests</option>
+                  <option value="NEW_FUEL_LOG">Fuel logs</option>
+                  <option value="NEW_MAINTENANCE_LOG">Maintenance</option>
+                </select>
+                <input id="notification-date-filter" type="date" aria-label="Filter by date" />
+                <select id="notification-status-filter" aria-label="Filter by read status">
+                  <option value="">All status</option>
+                  <option value="unread">Unread</option>
+                  <option value="read">Read</option>
+                </select>
+              </div>
+              <p class="notification-error" id="notification-error" role="status" hidden></p>
+              <div class="notification-list" id="notification-list" aria-live="polite">
+                <p class="notification-empty">Loading notifications…</p>
+              </div>
+            </section>
+          </div>
           <a class="button button-secondary button-small" href="/api/export" aria-label="Export Excel report" title="Export Excel report">
             <span aria-hidden="true">↓</span> Export Excel report
           </a>
