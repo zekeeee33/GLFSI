@@ -90,6 +90,12 @@ class FleetManager:
                     "supabase_trips_migration.sql in the Supabase SQL Editor, "
                     "then refresh the app."
                 ) from exc
+            if "function hashtextext(text) does not exist" in combined_error:
+                raise FleetManagementError(
+                    "The Supabase payroll finalization function is outdated. Run "
+                    "the updated supabase_payroll_migration.sql in the Supabase "
+                    "SQL Editor, then retry payroll finalization."
+                ) from exc
             missing_edit_history = (
                 "column trips.last_edited_by does not exist" in combined_error
                 or "column trips.last_edited_by_email does not exist" in combined_error

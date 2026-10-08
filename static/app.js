@@ -727,10 +727,6 @@ function payrollOptionMarkup(records, selected, key, entityLabel, displayField) 
   ).join("")}`;
 }
 
-function payrollCsvCell(value) {
-  return `"${String(value ?? "").replaceAll('"', '""')}"`;
-}
-
 function payrollRows() {
   const report = state.payroll || { trips: [], drivers: [] };
   const filters = state.payrollFilters;
@@ -823,18 +819,33 @@ function renderPayroll() {
           <span class="button button-secondary button-small">View Details</span>
         </summary>
         <div class="payroll-driver-body">
-          ${tableMarkup(driverTrips, tripColumns, null, { empty: "No trips for this driver in the selected filters" })}
-          <div class="payroll-financial-grid">
-            <span>Gross pay <strong>${formatCurrency(driver.gross_pay)}</strong></span>
-            <span>Cash advances <strong>${formatCurrency(driver.cash_advances)}</strong></span>
-            <span>Claims <strong>Coming Soon</strong></span>
-            <span>Opening overdraft <strong>${formatCurrency(driver.opening_overdraft)}</strong></span>
-            <span>New overdraft <strong>${formatCurrency(driver.new_overdraft)}</strong></span>
-            <span>Overdraft deduction <strong>${formatCurrency(driver.overdraft_deduction)}</strong></span>
-            <span>Net before overdraft <strong>${formatCurrency(driver.net_before_overdraft)}</strong></span>
-            <span>Final net pay <strong>${formatCurrency(driver.final_net_pay ?? Math.max(Number(driver.net_before_overdraft || 0), 0))}</strong></span>
-            <span>Remaining amount due <strong>${formatCurrency(driver.remaining_amount_due)}</strong></span>
-            <span>Outstanding overdraft <strong>${formatCurrency(driver.remaining_overdraft ?? driver.overdraft_balance)}</strong></span>
+          <section class="payroll-breakdown payroll-earnings">
+            <div class="payroll-breakdown-heading"><p class="eyebrow">EARNINGS BREAKDOWN</p><span>${formatNumber(driverTrips.length)} trip line items</span></div>
+            ${tableMarkup(driverTrips, tripColumns, null, { empty: "No trips for this driver in the selected filters" })}
+          </section>
+          <div class="payroll-breakdown-columns">
+            <section class="payroll-breakdown payroll-deductions">
+              <div class="payroll-breakdown-heading"><p class="eyebrow">DEDUCTIONS &amp; ADJUSTMENTS</p></div>
+              <div class="table-wrap payroll-deductions-wrap">
+                <table class="payroll-deductions-table">
+                  <tbody>
+                    <tr><th scope="row">Cash advances</th><td>${formatCurrency(driver.cash_advances)}</td></tr>
+                    <tr><th scope="row">Claims</th><td>Coming Soon</td></tr>
+                    <tr><th scope="row">Opening overdraft</th><td>${formatCurrency(driver.opening_overdraft)}</td></tr>
+                    <tr><th scope="row">New overdraft</th><td>${formatCurrency(driver.new_overdraft)}</td></tr>
+                    <tr><th scope="row">Overdraft deduction</th><td>${formatCurrency(driver.overdraft_deduction)}</td></tr>
+                    <tr><th scope="row">Outstanding overdraft</th><td>${formatCurrency(driver.remaining_overdraft ?? driver.overdraft_balance)}</td></tr>
+                  </tbody>
+                </table>
+              </div>
+            </section>
+            <section class="payroll-net-summary">
+              <p class="eyebrow">NET PAY SUMMARY</p>
+              <div><span>Gross earnings</span><strong>${formatCurrency(driver.gross_pay)}</strong></div>
+              <div><span>Net before overdraft</span><strong>${formatCurrency(driver.net_before_overdraft)}</strong></div>
+              <div class="payroll-net-pay"><span>Final net pay</span><strong>${formatCurrency(driver.final_net_pay ?? Math.max(Number(driver.net_before_overdraft || 0), 0))}</strong></div>
+              <div><span>Remaining amount due</span><strong>${formatCurrency(driver.remaining_amount_due)}</strong></div>
+            </section>
           </div>
           ${driver.overdraft_transactions?.length ? `<div><p class="eyebrow">OVERDRAFT TRANSACTION HISTORY</p>${tableMarkup(driver.overdraft_transactions, [
             ["effective_date", "Date"],
@@ -847,20 +858,21 @@ function renderPayroll() {
       </details>`;
   }).join("");
   return `
-    ${header("FINANCE", "Payroll", "Review route-based earnings, advances, overdrafts, and driver payroll.", '<button class="button button-secondary" data-action="payroll-print" type="button">Print Payroll</button><button class="button button-secondary" data-action="payroll-export" type="button">Export CSV</button>')}
-    <div class="payroll-period-bar">
+    <div class="payroll-page">
+    ${header("FINANCE", "Payroll", "Review route-based earnings, advances, overdrafts, and driver payroll.", '<button class="button button-secondary" data-action="payroll-export" type="button">Export Excel</button>')}
+    <section class="panel payroll-period-bar payroll-section payroll-period-details">
+      <div class="panel-heading"><div><p class="eyebrow">PAY PERIOD</p><h2>Employee &amp; pay period details</h2></div><span class="badge badge-${escapeHtml(status)}">${escapeHtml(status)}</span></div>
       <form id="payroll-period-form" class="payroll-toolbar">
         <label class="form-field"><span>Period start</span><input name="start_date" type="date" value="${escapeHtml(startDate)}" required /></label>
         <label class="form-field"><span>Period end</span><input name="end_date" type="date" value="${escapeHtml(endDate)}" required /></label>
         <button class="button button-primary" type="submit">Generate Report</button>
-        <span class="badge badge-${escapeHtml(status)}">${escapeHtml(status)}</span>
       </form>
       <div class="payroll-filter-grid">
         <label class="form-field"><span>Driver</span><select id="payroll-driver-filter">${payrollOptionMarkup(state.data.drivers, selectedDriver, "id", "driver", "name")}</select></label>
         <label class="form-field"><span>Search ISM number</span><input id="payroll-ism-filter" type="search" placeholder="Search ISM" value="${escapeHtml(state.payrollFilters.ism_no)}" /></label>
         <label class="form-field"><span>Origin</span><select id="payroll-origin-filter"><option value="">All origins</option>${origins.map((origin) => `<option ${origin === state.payrollFilters.origin ? "selected" : ""} value="${escapeHtml(origin)}">${escapeHtml(origin)}</option>`).join("")}</select></label>
         <label class="form-field"><span>Destination</span><select id="payroll-destination-filter"><option value="">All destinations</option>${destinations.map((destination) => `<option ${destination === state.payrollFilters.destination ? "selected" : ""} value="${escapeHtml(destination)}">${escapeHtml(destination)}</option>`).join("")}</select></label>
-      </div>
+      </section>
     </div>
     <div class="stats-grid payroll-stats">
       ${statCard("Total Drivers", formatNumber(driverSummaries.length), "blue", "♙")}
@@ -1253,35 +1265,42 @@ async function payrollWorkflowAction(action) {
   }
 }
 
-function exportPayrollCsv() {
-  const rows = payrollRows();
-  const headers = ["Date", "Driver Name", "ISM Number", "Origin", "Destination", "Trip Rate", "Review"];
-  const fields = ["payroll_date", "driver_name", "ism_no", "origin", "destination", "rate", "issue"];
-  const lines = [
-    headers.map(payrollCsvCell).join(","),
-    ...rows.map((trip) => fields.map((field) =>
-      payrollCsvCell(field === "rate" && trip.rate != null ? Number(trip.rate).toFixed(2) : trip[field]),
-    ).join(",")),
-    "",
-    ["Driver", "Trips", "Gross Pay", "Cash Advances", "Net Before Overdraft", "Overdraft Deduction", "Final Net Pay", "Remaining Due"].map(payrollCsvCell).join(","),
-    ...(state.payroll?.drivers || []).map((driver) => [
-      driver.driver_name,
-      driver.total_trips,
-      driver.gross_pay,
-      driver.cash_advances,
-      driver.net_before_overdraft,
-      driver.overdraft_deduction,
-      driver.final_net_pay ?? Math.max(Number(driver.net_before_overdraft || 0), 0),
-      driver.remaining_amount_due,
-    ].map(payrollCsvCell).join(",")),
-  ];
-  const blob = new Blob(["\uFEFF", lines.join("\r\n")], { type: "text/csv;charset=utf-8" });
-  const url = URL.createObjectURL(blob);
-  const anchor = document.createElement("a");
-  anchor.href = url;
-  anchor.download = `payroll-${state.payrollPeriod.start_date}-to-${state.payrollPeriod.end_date}.csv`;
-  anchor.click();
-  URL.revokeObjectURL(url);
+async function exportPayrollReport() {
+  const button = view.querySelector('[data-action="payroll-export"]');
+  if (button) button.disabled = true;
+  try {
+    const params = new URLSearchParams({
+      start_date: state.payrollPeriod.start_date,
+      end_date: state.payrollPeriod.end_date,
+    });
+    for (const [key, value] of Object.entries(state.payrollFilters)) {
+      if (value.trim()) params.set(key, value.trim());
+    }
+    const response = await fetch(`/api/payroll/export?${params}`, { cache: "no-store" });
+    if (!response.ok) {
+      const payload = await response.json().catch(() => ({}));
+      if (response.status === 401) {
+        returnToSignIn(payload.error?.toLowerCase().includes("inactivity"));
+      }
+      if (response.status === 404) {
+        throw new Error(
+          "The payroll Excel export endpoint is unavailable. Restart the Flask server or redeploy the latest app, then refresh this page.",
+        );
+      }
+      throw new Error(payload.error || `Payroll export failed (${response.status}).`);
+    }
+    const blob = await response.blob();
+    const url = URL.createObjectURL(blob);
+    const anchor = document.createElement("a");
+    anchor.href = url;
+    anchor.download = `payroll-${state.payrollPeriod.start_date}-to-${state.payrollPeriod.end_date}.xlsx`;
+    anchor.click();
+    window.setTimeout(() => URL.revokeObjectURL(url), 1000);
+  } catch (error) {
+    showToast(error.message || "Could not export the payroll report.", "error");
+  } finally {
+    if (button?.isConnected) button.disabled = false;
+  }
 }
 
 async function exportTripHistory() {
@@ -1379,8 +1398,7 @@ view.addEventListener("click", (event) => {
   if (button.dataset.action === "payroll-review" || button.dataset.action === "payroll-finalize") {
     payrollWorkflowAction(button.dataset.action);
   }
-  if (button.dataset.action === "payroll-print") window.print();
-  if (button.dataset.action === "payroll-export") exportPayrollCsv();
+  if (button.dataset.action === "payroll-export") exportPayrollReport();
   if (button.dataset.action === "trip-export") exportTripHistory();
   if (button.dataset.action === "trip-group") {
     state.tripsGroupBy = button.dataset.groupBy || "";

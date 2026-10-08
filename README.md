@@ -123,6 +123,8 @@ snapshots, driver summaries, cash advances, overdraft transactions, and audit
 history. Payroll uses the existing trip and driver IDs and does not copy or
 modify trip records. The migration's database function finalizes payroll
 atomically and prevents a trip from being finalized in more than one period.
+If the payroll migration was already run before an update, rerun the updated SQL
+in the Supabase SQL Editor so the finalization function is replaced.
 
 Payroll is available to signed-in users, matching the existing app-wide access
 model (the current app does not define separate user roles). Payroll eligibility
@@ -142,7 +144,9 @@ values if trips or route rules later change. Cash advances must be recorded befo
 review; overdrafts are recorded as explicit opening/new ledger entries and are
 never inferred from negative pay. Overdraft settlement is separately confirmed
 at finalization. Claims are shown as Coming Soon and do not affect pay.
-Payroll reports can be printed or exported as CSV.
+Payroll reports can be exported as a formatted Excel workbook. Restart the Flask
+server or redeploy the application after updating the backend so the payroll
+export endpoint is registered.
 
 ## Run the app
 

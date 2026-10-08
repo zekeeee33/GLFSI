@@ -17,6 +17,16 @@ from werkzeug.exceptions import MethodNotAllowed
 
 
 class PayrollCalculationTests(unittest.TestCase):
+    def test_payroll_migration_locks_trips_without_hash_functions(self):
+        migration_path = os.path.join(
+            os.path.dirname(__file__), "..", "supabase_payroll_migration.sql"
+        )
+        with open(migration_path, encoding="utf-8") as migration_file:
+            migration = migration_file.read()
+
+        self.assertIn("pg_advisory_xact_lock(item_row.trip_id)", migration)
+        self.assertNotIn("hashtextext", migration)
+
     def test_payroll_get_route_is_not_claimed_by_generic_resource_routes(self):
         adapter = web_app.app.url_map.bind("127.0.0.1")
 
@@ -283,6 +293,102 @@ class PayrollCalculationTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json["trips"][0]["ism_no"], "ISM-API")
         self.assertEqual(response.json["trips"][0]["rate"], "200.00")
+
+    def test_payroll_excel_export_matches_selected_report_filters(self):
+        client = FakeSupabaseClient()
+        manager = FleetManager(client=client)
+        vehicle = manager.add_vehicle("PAY-XLS-1", "Toyota", "Hiace", 2022)
+        first_driver = manager.add_driver("Excel Payroll Driver", "PAY-XLS-DL-1")
+        second_driver = manager.add_driver("Other Payroll Driver", "PAY-XLS-DL-2")
+        manager.add_trip(
+            vehicle["id"], first_driver["id"], "DAV1 to DAV2", 0, 0,
+            ism_no="ISM-XLS-MATCH", shipment_date="2026-10-05",
+            origin="DAV1", destination="DAV2",
+        )
+        manager.add_trip(
+            vehicle["id"], first_driver["id"], "DAV1 to DAV2", 0, 0,
+            ism_no="ISM-XLS-OTHER", shipment_date="2026-10-06",
+            origin="DAV1", destination="DAV2",
+        )
+        manager.add_trip(
+            vehicle["id"], second_driver["id"], "GENSAN to DAV2", 0, 0,
+            ism_no="ISM-XLS-MATCH-OTHER", shipment_date="2026-10-07",
+            origin="GENSAN", destination="DAV2",
+        )
+        with patch.object(web_app, "manager", manager), patch.dict(
+            web_app.app.config, {"TESTING": True, "TEST_AUTH_BYPASS": True}
+        ):
+            response = web_app.app.test_client().get(
+                "/api/payroll/export?start_date=2026-10-01&end_date=2026-10-15"
+                f"&driver_id={first_driver['id']}&ism_no=MATCH&origin=DAV1&destination=DAV2"
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(
+            response.mimetype,
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )
+        self.assertIn("payroll-2026-10-01-to-2026-10-15.xlsx", response.headers["Content-Disposition"])
+        workbook = load_workbook(BytesIO(response.data), data_only=True)
+        self.assertEqual(
+            workbook.sheetnames,
+            [
+                "Payroll Summary", "Trip Details", "Cash Advances",
+                "Overdraft Ledger", "Review Items", "Audit History",
+                "Payslip Excel Payroll Driver",
+            ],
+        )
+        summary = workbook["Payroll Summary"]
+        self.assertEqual(summary["B6"].value, 1)
+        self.assertEqual(summary["B7"].value, 1)
+        self.assertEqual(summary["A16"].value, "Excel Payroll Driver")
+        self.assertEqual(summary["B16"].value, 1)
+        trips = workbook["Trip Details"]
+        self.assertEqual(trips["B6"].value, "Excel Payroll Driver")
+        self.assertEqual(trips["C6"].value, "ISM-XLS-MATCH")
+        self.assertEqual(trips["F6"].value, 200)
+        payslip = workbook["Payslip Excel Payroll Driver"]
+        self.assertEqual(payslip["A1"].value, "EMPLOYEE PAYSLIP")
+        self.assertEqual(payslip["B7"].value, "Excel Payroll Driver")
+        self.assertEqual(payslip["B12"].value, "ISM-XLS-MATCH")
+        self.assertEqual(payslip["E12"].value, 200)
+        self.assertEqual(payslip["F17"].value, 400)
+        self.assertEqual(payslip.page_setup.fitToWidth, 1)
+        self.assertEqual(payslip.page_setup.fitToHeight, 1)
+        self.assertEqual(payslip.print_area, "'Payslip Excel Payroll Driver'!$A$1:$F$28")
+
+    def test_payroll_excel_export_creates_one_payslip_sheet_per_driver(self):
+        client = FakeSupabaseClient()
+        manager = FleetManager(client=client)
+        vehicle = manager.add_vehicle("PAY-XLS-2", "Toyota", "Hiace", 2022)
+        drivers = [
+            manager.add_driver("First Payslip Driver", "PAY-XLS-DL-3"),
+            manager.add_driver("Second Payslip Driver", "PAY-XLS-DL-4"),
+        ]
+        for index, driver in enumerate(drivers, start=1):
+            manager.add_trip(
+                vehicle["id"], driver["id"], "DAV1 to DAV2", 0, 0,
+                ism_no=f"ISM-PAYSLIP-{index}", shipment_date=f"2026-10-0{index}",
+                origin="DAV1", destination="DAV2",
+            )
+        with patch.object(web_app, "manager", manager), patch.dict(
+            web_app.app.config, {"TESTING": True, "TEST_AUTH_BYPASS": True}
+        ):
+            response = web_app.app.test_client().get(
+                "/api/payroll/export?start_date=2026-10-01&end_date=2026-10-15"
+            )
+
+        self.assertEqual(response.status_code, 200)
+        workbook = load_workbook(BytesIO(response.data), data_only=True)
+        self.assertIn("Payslip First Payslip Driver", workbook.sheetnames)
+        self.assertIn("Payslip Second Payslip Driver", workbook.sheetnames)
+        self.assertEqual(
+            [
+                name for name in workbook.sheetnames
+                if name.startswith("Payslip ")
+            ],
+            ["Payslip First Payslip Driver", "Payslip Second Payslip Driver"],
+        )
 
 
 class FakeAuthApiError(Exception):
@@ -719,6 +825,20 @@ class FleetManagerTests(unittest.TestCase):
             FleetManagementError, "supabase_trips_migration.sql"
         ):
             self.manager._execute(UnmigratedTripsQuery())
+
+    def test_outdated_payroll_finalization_function_has_actionable_error(self):
+        class OutdatedPayrollFunctionQuery:
+            def execute(self):
+                raise RuntimeError(
+                    "{'message': 'function hashtextext(text) does not exist', "
+                    "'code': '42883'}"
+                )
+
+        with self.assertRaisesRegex(
+            FleetManagementError,
+            "updated supabase_payroll_migration.sql",
+        ):
+            self.manager._execute(OutdatedPayrollFunctionQuery())
 
     def test_web_dashboard_and_vehicle_form_use_supabase_manager(self):
         web_app.manager = self.manager

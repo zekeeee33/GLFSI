@@ -142,7 +142,7 @@ begin
         select trip_id from public.payroll_items
         where payroll_period_id = p_period_id order by trip_id
     loop
-        perform pg_advisory_xact_lock(hashtextext(item_row.trip_id::text));
+        perform pg_advisory_xact_lock(item_row.trip_id);
     end loop;
 
     if exists (

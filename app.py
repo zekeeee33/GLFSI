@@ -16,7 +16,11 @@ from dotenv import dotenv_values
 from PIL import Image, UnidentifiedImageError
 from supabase import Client, create_client
 
-from excel_report import build_excel_report, build_trip_excel_report
+from excel_report import (
+    build_excel_report,
+    build_payroll_excel_report,
+    build_trip_excel_report,
+)
 from fleet_management import (
     FleetManagementError,
     FleetManager,
@@ -753,6 +757,50 @@ def payroll_report() -> Any:
         return jsonify(get_manager().payroll_report(start_date, end_date))
     except ValueError as exc:
         return _json_error(str(exc), 400)
+
+
+@app.route("/api/payroll/export")
+def export_payroll_report() -> Any:
+    start_date = request.args.get("start_date", "")
+    end_date = request.args.get("end_date", "")
+    try:
+        report = get_manager().payroll_report(start_date, end_date)
+    except ValueError as exc:
+        return _json_error(str(exc), 400)
+
+    filters = {
+        "driver_id": request.args.get("driver_id", "").strip(),
+        "ism_no": request.args.get("ism_no", "").strip(),
+        "origin": request.args.get("origin", "").strip(),
+        "destination": request.args.get("destination", "").strip(),
+    }
+    search = filters["ism_no"].casefold()
+    trips = [
+        trip for trip in report.get("trips", [])
+        if (not filters["driver_id"] or str(trip.get("driver_id")) == filters["driver_id"])
+        and (not search or search in str(trip.get("ism_no") or "").casefold())
+        and (not filters["origin"] or trip.get("origin") == filters["origin"])
+        and (not filters["destination"] or trip.get("destination") == filters["destination"])
+    ]
+    drivers = [
+        driver for driver in report.get("drivers", [])
+        if not filters["driver_id"] or str(driver.get("driver_id")) == filters["driver_id"]
+    ]
+    selected_driver = next(
+        (driver.get("driver_name") for driver in drivers
+         if str(driver.get("driver_id")) == filters["driver_id"]),
+        None,
+    )
+    if selected_driver:
+        filters["driver_id"] = selected_driver
+    return send_file(
+        build_payroll_excel_report(
+            report, trips, drivers, start_date, end_date, filters
+        ),
+        mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        as_attachment=True,
+        download_name=f"payroll-{start_date}-to-{end_date}.xlsx",
+    )
 
 
 @app.route("/api/payroll/review", methods=["POST"])
