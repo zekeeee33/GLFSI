@@ -132,11 +132,15 @@ class PayrollService:
 
         period = self._get_period(start_date, end_date)
         drivers = self.manager.list_drivers()
-        trip_rows = self.manager.list_trips()
         if period and period.get("status") in {"reviewed", "finalized"}:
             saved_items = self._rows("payroll_items", {"payroll_period_id": period["id"]})
             trips = saved_items
         else:
+            trip_rows = self.manager.list_trips(
+                include_fuel=False,
+                start_date=start_date,
+                end_date=end_date,
+            )
             trips = []
             for trip in trip_rows:
                 trip_date = self._trip_date(trip)
@@ -365,6 +369,7 @@ class PayrollService:
                 "origin": trip["origin"],
                 "destination": trip["destination"],
                 "rate": trip["rate"],
+                "truck_route_rate": trip.get("truck_route_rate"),
             }
             for trip in current["trips"]
             if trip.get("eligible")

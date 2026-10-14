@@ -13,21 +13,30 @@ by default, and remembers the selected theme in the browser.
 
 1. Create a Supabase project.
 2. In the Supabase SQL Editor, run [`supabase_schema.sql`](./supabase_schema.sql).
-3. Copy `.env.example` to `.env`.
-4. Fill in `SUPABASE_URL`, `SUPABASE_ANON_KEY`, and
+3. Run [`supabase_dispatcher_ownership_migration.sql`](./supabase_dispatcher_ownership_migration.sql)
+   to add record ownership fields.
+4. Run [`supabase_fuel_allocation_migration.sql`](./supabase_fuel_allocation_migration.sql)
+   to add the `fuel_logs.trip_id` relationship and fuel allocation fields. This
+   step is required even if `fuel_logs` already exists: `CREATE TABLE IF NOT EXISTS`
+   does not add missing columns to an existing table. If the app reports that
+   `fuel_logs.trip_id` does not exist, run this migration in the SQL Editor and
+   refresh the app.
+5. Copy `.env.example` to `.env`.
+6. Fill in `SUPABASE_URL`, `SUPABASE_ANON_KEY`, and
    `SUPABASE_SERVICE_ROLE_KEY` from the project's API settings. The anon or
    publishable key is used for password authentication; the service-role/secret
    key is used only by the server for fleet data access. Never put the
    service-role key in browser code or commit either secret to source control.
-5. Replace `SECRET_KEY` with a long random value (for example, generate one with
+7. Replace `SECRET_KEY` with a long random value (for example, generate one with
    `python -c "import secrets; print(secrets.token_hex(32))"`).
-6. In Supabase **Authentication → Users**, invite or create each authorized
+8. In Supabase **Authentication → Users**, invite or create each authorized
    user's email/password account. Public sign-up is not enabled by this app.
 
 ## Dispatcher roles and data isolation
 
 Run [`supabase_dispatcher_ownership_migration.sql`](./supabase_dispatcher_ownership_migration.sql)
-in the Supabase SQL Editor before using dispatcher accounts. It adds immutable
+in the Supabase SQL Editor before using dispatcher accounts if you have not
+already run it during initial setup. It adds immutable
 `created_by` ownership fields to trips, fuel logs, and maintenance records.
 It also adds private image storage for trip load manifests and fuel invoices.
 If you ran an earlier version of this migration, run the updated file again;
@@ -36,12 +45,77 @@ and maintenance ID counters past existing records, which prevents duplicate
 IDs after CSV imports. Existing records remain unowned and are visible only to
 administrators.
 
+Run [`supabase_fuel_allocation_migration.sql`](./supabase_fuel_allocation_migration.sql)
+after the base trips/routes schema and dispatcher ownership migration. It adds
+the `fuel_logs.trip_id` foreign key and allocation fields; rerun it for existing
+projects because an earlier `CREATE TABLE IF NOT EXISTS` does not update a
+pre-existing `fuel_logs` table.
+
 Run [`supabase_notifications_migration.sql`](./supabase_notifications_migration.sql)
 in the Supabase SQL Editor to enable Admin notifications. Each successful
 dispatcher-created trip, fuel log, maintenance log, or first load-manifest upload
 is recorded for each administrator. Admins can filter, open, and mark their
 notifications as read. The notification center refreshes unread counts every
 12 seconds while the app is open.
+
+## Directional truck route rates
+
+After the base schema, trips, existing truck-rate, and payroll migrations are installed,
+run [`supabase_route_trip_rate_migration.sql`](./supabase_route_trip_rate_migration.sql)
+in the Supabase SQL Editor. It adds the 12 directional route records and their
+capacity-specific rates, including `NULL` for the two unsupplied 36-pallet
+DAV1/DAV2 rates. Reapplying it updates the master records rather than inserting
+duplicates. It stores an immutable hauling-rate snapshot on each trip and flags
+historical trips for review instead of assigning rates from today's configuration.
+
+Then run [`supabase_truck_trailer_migration.sql`](./supabase_truck_trailer_migration.sql).
+The existing `vehicles` table remains the truck registry so its IDs and existing
+references are preserved. Trailers are stored separately and carry pallet
+capacity. The migration backfills each historical trip's truck ID from its
+existing vehicle ID, but cannot determine which trailer hauled a historical
+trip; those trailer assignments remain NULL and flagged for manual review.
+Any former capacity values on trucks are copied to
+`legacy_vehicle_capacity_review` for review, never automatically assigned to
+trailers. Earlier hauling-rate snapshots that may have used truck capacity are
+preserved in `legacy_trip_rate_review`, cleared from the active trip-rate fields,
+and marked unresolved until reviewed against an actual trailer.
+
+## Revenue dashboard setup
+
+After the route/rate and truck/trailer migrations above, run
+[`supabase_revenue_dashboard_migration.sql`](./supabase_revenue_dashboard_migration.sql)
+in the Supabase SQL Editor. The Revenue dashboard is administrator-only and
+uses this migration's RPC and audit tables. Restart the Flask app after applying
+database migrations so it reloads the current application code.
+
+When updating an existing installation, rerun the current Revenue migration so
+the dashboard RPC includes the latest report fields and rate calculation.
+Hauling rate revenue sums each trip's verified saved rate snapshot and audited
+adjustments, including trips whose management revenue status is still `pending`;
+cancelled trips and snapshots still requiring rate or trailer review are
+excluded. The separate status remains available for management review and is
+required before adding audited revenue adjustments. The schema has no separate
+trip completion status. Expense totals use recorded fuel costs
+(`actual_expense`, falling back to `total_cost`), reviewed/finalized payroll
+items, and maintenance costs. There is no general operating-expense ledger,
+and unreviewed payroll or fuel logs without a recorded cost are not estimated.
+Net operating revenue is therefore explicitly provisional, and is unavailable
+when route, driver, trailer, capacity, or text-search filters would make its
+cost scope misleading.
+
+Create trucks and trailers separately in Fleet Management. Select an eligible
+truck and an active trailer when dispatching a trip; the trailer's configured
+capacity determines the exact directional route rate. Trips cannot be saved
+when the route, trailer capacity, or applicable rate is missing. Editing only
+the truck or unrelated trip details does not change a saved hauling-rate
+snapshot. Driver payroll's separate trip allowance remains unchanged.
+
+The trailer migration also imports the 17 unique plate numbers from the
+provided trailer register and preserves its supplied year/model and vehicle
+identifiers. The source does not list pallet capacity, so each imported trailer
+has an unknown capacity and is marked for review; set its verified capacity in
+the Trailers section before it can be assigned to a rate-based trip. The
+duplicate `MUA941` source row is represented by one trailer record.
 
 Set a dispatcher's role to `dispatcher` in that user's Supabase **User Metadata**
 to enable the compatibility role restriction. Prefer setting `role` in
@@ -66,19 +140,30 @@ details popup with its route, vehicle, driver, shipment information, and
 uploaded load manifest when available. The popup also lets authorized users
 upload a missing manifest later or replace the current image.
 
+New trips are entered through a five-step wizard covering trip details,
+assignments, load information, fuel details, and final review. Configured
+route/trailer rate rules and route fuel allocations are reused. Load-manifest
+and fuel-invoice images are uploaded to private storage after the trip is
+created; if an upload fails, the wizard retains the saved trip ID and retries
+only the unfinished upload instead of creating another trip. The Full/Empty
+load type is included in the existing `load_details` text because the current
+schema has no separate load-type column. Persistent draft saving is not offered
+because the current schema has no draft-trip workflow.
+
 Open a trip to edit its shipment details and review its edit history. Each
 change records the authenticated editor, timestamp, and before/after values.
 The edit history is stored by a database trigger; run the current
 `supabase_dispatcher_ownership_migration.sql` in Supabase before deploying this
 feature. Dispatchers can edit only their own trips.
 
-The interface adapts record tables into labeled cards on narrow screens and
-uses device-safe viewport sizing for mobile dialogs and navigation. Fonts use
-local system stacks to avoid blocking initial rendering on an external font
-download. The bootstrap endpoint reuses its loaded records to calculate its
-dashboard summary instead of requesting those tables a second time. The
-dispatcher migration adds indexes for commonly sorted trip, fuel, maintenance,
-and assignment lists.
+The interface uses grouped, collapsible desktop navigation and a compact
+scrollable navigation bar on mobile. Record tables adapt into labeled cards on
+narrow screens and dialogs use device-safe viewport sizing. Fonts use local
+system stacks to avoid blocking initial rendering on an external font download.
+The bootstrap endpoint reuses its loaded records to calculate its dashboard
+summary instead of requesting those tables a second time. The dispatcher
+migration adds indexes for commonly sorted trip, fuel, maintenance, and
+assignment lists.
 
 The web app requires Supabase email/password authentication. Its access and
 refresh tokens are stored in HttpOnly, SameSite browser-session cookies;
@@ -111,7 +196,7 @@ then returns `401`, the Supabase connection is working, but the account
 credentials were rejected.
 
 The **Export Excel report** action downloads a pre-formatted `.xlsx` workbook
-with a dashboard summary and separate worksheets for vehicles, drivers,
+with a dashboard summary and separate worksheets for trucks, trailers, drivers,
 assignments, maintenance, fuel logs, and trips.
 
 ## Payroll setup and workflow
@@ -148,6 +233,15 @@ Payroll reports can be exported as a formatted Excel workbook. Restart the Flask
 server or redeploy the application after updating the backend so the payroll
 export endpoint is registered.
 
+## Data retrieval performance
+
+Trip and fuel list enrichment reads only fuel records linked to the loaded trip
+IDs and only trips linked to the loaded fuel IDs. The bootstrap reuses its fuel
+result rather than issuing another enrichment query. Draft payroll reports
+filter trips by shipment date in Supabase; reviewed or finalized reports load
+their saved payroll items without first loading trip history. Existing ownership
+filters and date/foreign-key indexes remain in place.
+
 ## Run the app
 
 ```powershell
@@ -166,7 +260,7 @@ The same Supabase project is used by the command-line interface:
 
 ```powershell
 python fleet_management.py dashboard
-python fleet_management.py add-vehicle --plate-number ABC-123 --make Toyota --model Hiace --year 2022
+python fleet_management.py add-vehicle --plate-number ABC-123 --make Toyota --model Hiace --year 2022 --pallet-capacity 36
 python fleet_management.py export-report
 ```
 

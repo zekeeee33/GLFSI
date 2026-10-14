@@ -11,12 +11,88 @@ from unittest.mock import patch
 import app as web_app
 from PIL import Image
 from fleet_management import FleetManagementError, FleetManager, _supabase_project_url
+from manifest_ocr import canonical_warehouse_code, extract_manifest_fields, truck_route_rate
 from openpyxl import load_workbook
 from payroll import calculate_driver_payroll, period_date, trip_rate
 from werkzeug.exceptions import MethodNotAllowed
 
 
 class PayrollCalculationTests(unittest.TestCase):
+    def test_manifest_fields_are_extracted_from_reference_layout(self):
+        text = """
+        Shipment No. : GLL-4471
+        Issuing Plant : GENSAN Distribution Center
+        Rec. Plant : Davao Bottling Plant 2
+        Fwd Agent : Good Luck Forwarding
+        Vehicle Lic. No. : ABC 123
+        Vehicle Type : 6-Wheeler
+        Manifest Date : 2026-10-02
+        Delivery Date : 2026-10-03
+        Time In : 08:30
+        Time Out : 16:10
+        """
+        fields = extract_manifest_fields(text)
+        self.assertEqual(fields["manifest_number"], "GLL-4471")
+        self.assertEqual(fields["origin"], "GENSAN")
+        self.assertEqual(fields["destination"], "DAV2")
+        self.assertEqual(fields["vehicle_plate"], "ABC 123")
+        self.assertEqual(fields["manifest_date"], "2026-10-02")
+        self.assertEqual(fields["time_in"], "08:30")
+        self.assertEqual(fields["time_out"], "16:10")
+
+    def test_manifest_warehouse_aliases_normalize_to_canonical_codes(self):
+        self.assertEqual(canonical_warehouse_code("GENSAN Distribution Center"), "GENSAN")
+        self.assertEqual(canonical_warehouse_code("Davao Bottling Plant 2"), "DAV2")
+        self.assertEqual(canonical_warehouse_code("Davao Bottling Plant 1"), "DAV1")
+        self.assertEqual(canonical_warehouse_code("PLAS Astorga"), "PLAS")
+        self.assertIsNone(canonical_warehouse_code("UNKNOWN PLANT"))
+
+    def test_truck_route_rates_match_directional_capacity_and_flag_missing_config(self):
+        self.assertEqual(str(truck_route_rate("GENSAN", "DAV2", 36)), "11000.00")
+        self.assertEqual(str(truck_route_rate("GENSAN", "DAV2", 46)), "14000.00")
+        self.assertIsNone(truck_route_rate("DAV1", "DAV2", 36))
+        self.assertEqual(str(truck_route_rate("PLAS", "DAV1", 46)), "2300.00")
+
+    def test_route_trip_migration_seeds_all_routes_and_null_rate_exceptions(self):
+        migration_path = os.path.join(
+            os.path.dirname(__file__), "..", "supabase_route_trip_rate_migration.sql"
+        )
+        with open(migration_path, encoding="utf-8") as migration_file:
+            migration = migration_file.read()
+
+        self.assertTrue(all(f"({number}, '" in migration for number in range(1, 13)))
+        self.assertEqual(migration.count("null::numeric"), 2)
+        self.assertIn("on conflict (origin_code, destination_code)", migration)
+        self.assertIn("on conflict (origin_code, destination_code, pallet_capacity)", migration)
+        self.assertIn("hauling_rate drop not null", migration)
+        self.assertIn("truck_route_rate numeric(12, 2)", migration)
+        self.assertIn("trip_rate_review_required boolean not null default true", migration)
+
+    def test_truck_trailer_migration_preserves_trucks_and_flags_unknown_trailers(self):
+        migration_path = os.path.join(
+            os.path.dirname(__file__), "..", "supabase_truck_trailer_migration.sql"
+        )
+        with open(migration_path, encoding="utf-8") as migration_file:
+            migration = migration_file.read()
+
+        self.assertIn("create table if not exists public.trailers", migration)
+        self.assertIn("references public.vehicles(id) on delete set null", migration)
+        self.assertIn("set truck_id = vehicle_id", migration)
+        self.assertIn("set trailer_review_required = true", migration)
+        self.assertIn("legacy_vehicle_capacity_review", migration)
+        self.assertIn("legacy_trip_rate_review", migration)
+        self.assertIn("alter table public.vehicles drop column pallet_capacity", migration)
+        self.assertIn("truck_route_rate = null", migration)
+        self.assertIn("trip_rate_review_required = true", migration)
+        self.assertIn("pallet_capacity integer check (pallet_capacity is null or pallet_capacity > 0)", migration)
+        self.assertIn("on conflict (plate_number) do update", migration)
+        for plate in (
+            "MUB289", "MUA508", "MUA518", "MUA528", "MUA548", "MUA941",
+            "MUB106", "MUB109", "MUB482", "MUA538", "MUA551", "MUA973",
+            "MUB116", "MUB263", "MUB282", "MUB285", "TEMP120108",
+        ):
+            self.assertIn(f"('{plate}',", migration)
+
     def test_payroll_migration_locks_trips_without_hash_functions(self):
         migration_path = os.path.join(
             os.path.dirname(__file__), "..", "supabase_payroll_migration.sql"
@@ -34,6 +110,52 @@ class PayrollCalculationTests(unittest.TestCase):
         with self.assertRaises(MethodNotAllowed):
             adapter.match("/api/payroll", method="POST")
         self.assertEqual(adapter.match("/api/trips", method="POST")[0], "create_record")
+
+    def test_revenue_api_rejects_unsupported_trend_buckets(self):
+        with patch.dict(
+            web_app.app.config, {"TESTING": True, "TEST_AUTH_BYPASS": True}
+        ), patch.object(web_app, "get_manager") as get_manager:
+            response = web_app.app.test_client().get(
+                "/api/revenue?start_date=2026-10-01&end_date=2026-10-14&bucket=quarter"
+            )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("day, week, or month", response.json["error"])
+        get_manager.assert_not_called()
+
+    def test_revenue_api_passes_selected_trend_bucket_to_dashboard_rpc(self):
+        manager = SimpleNamespace(
+            revenue_dashboard=lambda filters: {"received_bucket": filters["p_bucket"]}
+        )
+        with patch.dict(
+            web_app.app.config, {"TESTING": True, "TEST_AUTH_BYPASS": True}
+        ), patch.object(web_app, "get_manager", return_value=manager):
+            response = web_app.app.test_client().get(
+                "/api/revenue?start_date=2026-10-01&end_date=2026-10-14&bucket=week"
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json["received_bucket"], "week")
+
+    def test_revenue_dashboard_uses_saved_eligibility_and_recorded_expense_sources(self):
+        migration_path = os.path.join(
+            os.path.dirname(__file__), "..", "supabase_revenue_dashboard_migration.sql"
+        )
+        with open(migration_path, encoding="utf-8") as migration_file:
+            migration = migration_file.read()
+
+        self.assertIn("trip.revenue_status <> 'cancelled'", migration)
+        self.assertIn("trip.truck_route_rate", migration)
+        self.assertIn("and not coalesce(trip.trip_rate_review_required, true)", migration)
+        self.assertIn("and not coalesce(trip.trailer_review_required, true)", migration)
+        self.assertIn("public.fuel_logs", migration)
+        self.assertIn("coalesce(actual_expense, total_cost)", migration)
+        self.assertIn("public.payroll_items", migration)
+        self.assertIn("period.status in ('reviewed', 'finalized')", migration)
+        self.assertIn("coalesce(sum(rate) filter (where item_rank = 1), 0)", migration)
+        self.assertIn("public.maintenance", migration)
+        self.assertIn("'other_operating_expenses_available', false", migration)
+        self.assertIn("'net_operating_revenue_available'", migration)
 
     def test_known_route_rates_are_bidirectional_and_case_insensitive(self):
         routes = [
@@ -262,6 +384,7 @@ class PayrollCalculationTests(unittest.TestCase):
             time_in="08:00", time_out="16:00",
             origin="GENSAN", destination="DAV2",
         )
+        client.tables["trips"][0]["truck_route_rate"] = "11000.00"
 
         report = manager.review_payroll(
             "2026-10-01", "2026-10-15", "00000000-0000-0000-0000-000000000001"
@@ -269,8 +392,11 @@ class PayrollCalculationTests(unittest.TestCase):
 
         self.assertEqual(report["status"], "reviewed")
         self.assertEqual(report["trips"][0]["rate"], "900.00")
+        self.assertEqual(report["trips"][0]["truck_route_rate"], "11000.00")
         self.assertEqual(report["drivers"][0]["gross_pay"], "900.00")
         self.assertEqual(client.tables["payroll_items"][0]["trip_id"], 1)
+        self.assertEqual(client.tables["payroll_items"][0]["rate"], "900.00")
+        self.assertEqual(client.tables["payroll_items"][0]["truck_route_rate"], "11000.00")
 
     def test_payroll_report_api_returns_existing_trip_line_items(self):
         client = FakeSupabaseClient()
@@ -432,6 +558,18 @@ class FakeQuery:
         self.filters.append((column, value))
         return self
 
+    def in_(self, column, values):
+        self.filters.append(("in", column, list(values)))
+        return self
+
+    def gte(self, column, value):
+        self.filters.append(("gte", column, value))
+        return self
+
+    def lte(self, column, value):
+        self.filters.append(("lte", column, value))
+        return self
+
     def order(self, column, desc=False):
         self.sort = (column, desc)
         return self
@@ -445,9 +583,33 @@ class FakeQuery:
         return self
 
     def _matches(self, row):
-        return all(row.get(key) == value for key, value in self.filters)
+        for filter_value in self.filters:
+            if filter_value[0] == "in":
+                _, column, values = filter_value
+                if row.get(column) not in values:
+                    return False
+            elif filter_value[0] in {"gte", "lte"}:
+                operator, column, value = filter_value
+                row_value = row.get(column)
+                if row_value is None:
+                    return False
+                if operator == "gte" and row_value < value:
+                    return False
+                if operator == "lte" and row_value > value:
+                    return False
+            else:
+                column, value = filter_value
+                if row.get(column) != value:
+                    return False
+        return True
 
     def execute(self):
+        self.client.query_log.append({
+            "table": self.table_name,
+            "action": self.action,
+            "columns": self.columns,
+            "filters": list(self.filters),
+        })
         rows = self.client.tables.setdefault(self.table_name, [])
         if self.action == "insert":
             inserted = []
@@ -487,6 +649,7 @@ class FakeQuery:
             self.columns not in ("*",)
             and "driver:" not in self.columns
             and "vehicle:" not in self.columns
+            and "truck:" not in self.columns
         ):
             selected = [column.strip() for column in self.columns.split(",")]
             result = [{key: row.get(key) for key in selected} for row in result]
@@ -501,22 +664,39 @@ class FakeQuery:
                     None,
                 )
                 row["driver"] = {"name": driver["name"]} if driver else None
-            if "vehicle:vehicles(" in self.columns:
+            if "truck:vehicles!" in self.columns or "vehicle:vehicles(" in self.columns:
+                relation_name = "truck" if "truck:vehicles!" in self.columns else "vehicle"
                 vehicle = next(
                     (
                         item
                         for item in self.client.tables.get("vehicles", [])
-                        if item["id"] == row["vehicle_id"]
+                        if item["id"] == row.get("truck_id", row.get("vehicle_id"))
                     ),
                     None,
                 )
                 if vehicle:
-                    row["vehicle"] = {
+                    row[relation_name] = {
                         key: vehicle.get(key)
                         for key in ("plate_number", "make", "model")
                     }
                 else:
-                    row["vehicle"] = None
+                    row[relation_name] = None
+            if "trailer:trailers(" in self.columns:
+                trailer = next(
+                    (
+                        item
+                        for item in self.client.tables.get("trailers", [])
+                        if item["id"] == row.get("trailer_id")
+                    ),
+                    None,
+                )
+                row["trailer"] = (
+                    {
+                        key: trailer.get(key)
+                        for key in ("plate_number", "pallet_capacity", "trailer_type", "status")
+                    }
+                    if trailer else None
+                )
         return SimpleNamespace(data=result)
 
 
@@ -524,6 +704,7 @@ class FakeSupabaseClient:
     def __init__(self):
         self.tables = {}
         self.next_ids = {}
+        self.query_log = []
 
     def table(self, table_name):
         return FakeQuery(self, table_name)
@@ -576,6 +757,320 @@ class FleetManagerTests(unittest.TestCase):
     def setUp(self):
         self.client = FakeSupabaseClient()
         self.manager = FleetManager(client=self.client)
+
+    def test_trailer_without_capacity_is_reviewed_and_cannot_resolve_trip_rate(self):
+        self.configure_davao_plas_routes()
+        truck = self.manager.add_vehicle("NO-CAP-TRUCK", "Hino", "300", 2024)
+        trailer = self.manager.add_trailer(
+            "NO-CAP-TRAILER",
+            year_model=2007,
+            make_model="0",
+            mv_file_no="1244-00000043278",
+            engine_no="NA",
+            chassis_no="LTOX111010-048C",
+        )
+        driver = self.manager.add_driver("No Capacity Driver", "NO-CAP-DL")
+
+        self.assertIsNone(trailer["pallet_capacity"])
+        self.assertTrue(trailer["capacity_review_required"])
+        with self.assertRaisesRegex(FleetManagementError, "valid pallet capacity"):
+            self.manager.add_trip(
+                truck["id"], driver["id"], "DAV1 to PLAS", 0, 0,
+                origin="DAV1", destination="PLAS",
+                require_truck_rate=True, trailer_id=trailer["id"],
+            )
+
+    def configure_route(self, route_number, origin, destination, route_pair, rates):
+        route_id = route_number
+        self.client.tables.setdefault("truck_routes", []).append({
+            "id": route_id,
+            "route_number": route_number,
+            "origin_code": origin,
+            "destination_code": destination,
+            "origin_name": origin,
+            "destination_name": destination,
+            "route_pair": route_pair,
+            "active": True,
+        })
+        route_rates = self.client.tables.setdefault("truck_route_rates", [])
+        for capacity, amount in rates.items():
+            route_rates.append({
+                "id": len(route_rates) + 1,
+                "route_id": route_id,
+                "origin_code": origin,
+                "destination_code": destination,
+                "pallet_capacity": capacity,
+                "hauling_rate": amount,
+                "active": True,
+            })
+
+    def configure_davao_plas_routes(self):
+        self.configure_route(3, "DAV1", "PLAS", "DAV1 ↔ PLAS", {36: "1847.00", 46: "2300.00"})
+        self.configure_route(2, "DAV1", "DAV2", "DAV2 ↔ DAV1", {36: None, 46: "2300.00"})
+        self.configure_route(11, "PLAS", "DAV2", "DAV2 ↔ PLAS", {36: "1847.00", 46: "2200.00"})
+        self.configure_route(7, "GENSAN", "DAV2", "GENSAN ↔ DAV2", {36: "11000.00", 46: "14000.00"})
+
+    def configure_all_routes(self):
+        route_records = [
+            (1, "DAV1", "GENSAN", "GENSAN ↔ DAV1", "12284.85", "15500.00"),
+            (2, "DAV1", "DAV2", "DAV2 ↔ DAV1", None, "2300.00"),
+            (3, "DAV1", "PLAS", "DAV1 ↔ PLAS", "1847.00", "2300.00"),
+            (4, "DAV2", "GENSAN", "GENSAN ↔ DAV2", "11000.00", "14000.00"),
+            (5, "DAV2", "DAV1", "DAV2 ↔ DAV1", None, "2300.00"),
+            (6, "DAV2", "PLAS", "DAV2 ↔ PLAS", "1847.00", "2200.00"),
+            (7, "GENSAN", "DAV2", "GENSAN ↔ DAV2", "11000.00", "14000.00"),
+            (8, "GENSAN", "DAV1", "GENSAN ↔ DAV1", "12284.85", "15500.00"),
+            (9, "GENSAN", "PLAS", "GENSAN ↔ PLAS", "11000.00", "14000.00"),
+            (10, "PLAS", "GENSAN", "GENSAN ↔ PLAS", "11000.00", "14000.00"),
+            (11, "PLAS", "DAV2", "DAV2 ↔ PLAS", "1847.00", "2200.00"),
+            (12, "PLAS", "DAV1", "DAV1 ↔ PLAS", "1847.00", "2300.00"),
+        ]
+        for number, origin, destination, pair, rate36, rate46 in route_records:
+            self.configure_route(
+                number,
+                origin,
+                destination,
+                pair,
+                {36: rate36, 46: rate46},
+            )
+
+    def test_all_directional_routes_resolve_capacity_specific_rates(self):
+        self.configure_all_routes()
+        self.assertEqual(len(self.manager.list_truck_routes()), 12)
+        self.assertEqual(len(self.manager.list_truck_route_rates()), 24)
+        expected = {
+            ("DAV1", "GENSAN", 36): "12284.85",
+            ("DAV1", "GENSAN", 46): "15500.00",
+            ("DAV1", "DAV2", 36): None,
+            ("DAV1", "DAV2", 46): "2300.00",
+            ("DAV1", "PLAS", 36): "1847.00",
+            ("DAV1", "PLAS", 46): "2300.00",
+            ("DAV2", "GENSAN", 36): "11000.00",
+            ("DAV2", "GENSAN", 46): "14000.00",
+            ("DAV2", "DAV1", 36): None,
+            ("DAV2", "DAV1", 46): "2300.00",
+            ("DAV2", "PLAS", 36): "1847.00",
+            ("DAV2", "PLAS", 46): "2200.00",
+            ("GENSAN", "DAV2", 36): "11000.00",
+            ("GENSAN", "DAV2", 46): "14000.00",
+            ("GENSAN", "DAV1", 36): "12284.85",
+            ("GENSAN", "DAV1", 46): "15500.00",
+            ("GENSAN", "PLAS", 36): "11000.00",
+            ("GENSAN", "PLAS", 46): "14000.00",
+            ("PLAS", "GENSAN", 36): "11000.00",
+            ("PLAS", "GENSAN", 46): "14000.00",
+            ("PLAS", "DAV2", 36): "1847.00",
+            ("PLAS", "DAV2", 46): "2200.00",
+            ("PLAS", "DAV1", 36): "1847.00",
+            ("PLAS", "DAV1", 46): "2300.00",
+        }
+        for key, expected_rate in expected.items():
+            with self.subTest(route=key):
+                result = self.manager.resolve_truck_route_rate(*key[:2], key[2])
+                self.assertEqual(
+                    str(result) if result is not None else None,
+                    expected_rate,
+                )
+
+    def test_new_trip_requires_a_configured_rate_and_snapshots_it(self):
+        self.configure_all_routes()
+        truck = self.manager.add_vehicle("RATE-TRUCK", "Toyota", "Hiace", 2024)
+        second_truck = self.manager.add_vehicle("RATE-TRUCK-2", "Hino", "300", 2023)
+        trailer = self.manager.add_trailer("RATE-TRAILER-36", 36)
+        driver = self.manager.add_driver("Rate Driver", "RATE-DL")
+        with self.assertRaisesRegex(FleetManagementError, "Rate not configured"):
+            self.manager.add_trip(
+                truck["id"], driver["id"], "DAV1 to DAV2", 0, 0,
+                origin="DAV1", destination="DAV2", require_truck_rate=True,
+                trailer_id=trailer["id"],
+            )
+        self.assertEqual(self.client.tables.get("trips", []), [])
+
+        self.manager.update_trailer(
+            trailer["id"],
+            {
+                "plate_number": "RATE-TRAILER-36",
+                "pallet_capacity": 46,
+                "trailer_type": None,
+                "status": "active",
+                "remarks": None,
+            },
+        )
+        trip = self.manager.add_trip(
+            truck["id"], driver["id"], "DAV1 to DAV2", 0, 0,
+            origin="DAV1", destination="DAV2", require_truck_rate=True,
+            trailer_id=trailer["id"],
+        )
+        self.assertEqual(trip["route_number"], 2)
+        self.assertEqual(trip["route_pair"], "DAV2 ↔ DAV1")
+        self.assertEqual(trip["pallet_capacity"], 46)
+        self.assertEqual(trip["truck_route_rate"], "2300.00")
+        self.assertFalse(trip["trip_rate_review_required"])
+        trip_details = self.manager.get_trip(trip["id"])
+        self.assertEqual(trip_details["truck_plate_number"], "RATE-TRUCK")
+
+        rate_row = next(
+            row for row in self.client.tables["truck_route_rates"]
+            if row["origin_code"] == "DAV1"
+            and row["destination_code"] == "DAV2"
+            and row["pallet_capacity"] == 46
+        )
+        rate_row["hauling_rate"] = "2700.00"
+        updated = self.manager.update_trip(
+            trip["id"],
+            {
+                "ism_no": None,
+                "shipment_date": "2026-10-09",
+                "time_in": None,
+                "time_out": None,
+                "origin": "DAV1",
+                "destination": "DAV2",
+                "vehicle_id": second_truck["id"],
+                "truck_id": second_truck["id"],
+                "trailer_id": trailer["id"],
+                "driver_id": driver["id"],
+                "load_details": None,
+                "trip_fuel": None,
+                "notes": "Date-only change",
+                "route": "DAV1 to DAV2",
+            },
+            edited_by="admin",
+            editor_email=None,
+        )
+        self.assertEqual(updated["truck_route_rate"], "2300.00")
+        self.assertEqual(updated["pallet_capacity"], 46)
+        self.assertEqual(updated["truck_id"], second_truck["id"])
+        next(
+            row for row in self.client.tables["vehicles"]
+            if row["id"] == second_truck["id"]
+        )["status"] = "maintenance"
+        unchanged_assignment = self.manager.update_trip(
+            trip["id"],
+            {
+                "ism_no": None,
+                "shipment_date": "2026-10-10",
+                "time_in": None,
+                "time_out": None,
+                "origin": "DAV1",
+                "destination": "DAV2",
+                "vehicle_id": second_truck["id"],
+                "truck_id": second_truck["id"],
+                "trailer_id": trailer["id"],
+                "driver_id": driver["id"],
+                "load_details": None,
+                "trip_fuel": None,
+                "notes": "Inactive truck history only",
+                "route": "DAV1 to DAV2",
+            },
+            edited_by="admin",
+            editor_email=None,
+        )
+        self.assertEqual(unchanged_assignment["truck_route_rate"], "2300.00")
+        self.manager.update_trailer(
+            trailer["id"],
+            {
+                "plate_number": "RATE-TRAILER-36",
+                "pallet_capacity": 36,
+                "trailer_type": None,
+                "status": "active",
+                "remarks": None,
+            },
+        )
+        self.assertEqual(self.manager.list_trips()[0]["pallet_capacity"], 46)
+        self.manager.update_trailer(
+            trailer["id"],
+            {
+                "plate_number": "RATE-TRAILER-36",
+                "pallet_capacity": 46,
+                "trailer_type": None,
+                "status": "active",
+                "remarks": None,
+            },
+        )
+
+        rerouted = self.manager.update_trip(
+            trip["id"],
+            {
+                "ism_no": None,
+                "shipment_date": "2026-10-09",
+                "time_in": None,
+                "time_out": None,
+                "origin": "DAV2",
+                "destination": "PLAS",
+                "vehicle_id": truck["id"],
+                "truck_id": truck["id"],
+                "trailer_id": trailer["id"],
+                "driver_id": driver["id"],
+                "load_details": None,
+                "trip_fuel": None,
+                "notes": None,
+                "route": "DAV2 to PLAS",
+            },
+            edited_by="admin",
+            editor_email=None,
+        )
+        self.assertEqual(rerouted["route_number"], 6)
+        self.assertEqual(rerouted["truck_route_rate"], "2200.00")
+
+        trailer_36 = self.manager.add_trailer("RATE-TRAILER-ALT", 36)
+        reassigned = self.manager.update_trip(
+            trip["id"],
+            {
+                "ism_no": None,
+                "shipment_date": "2026-10-09",
+                "time_in": None,
+                "time_out": None,
+                "origin": "DAV2",
+                "destination": "PLAS",
+                "vehicle_id": truck["id"],
+                "truck_id": truck["id"],
+                "trailer_id": trailer_36["id"],
+                "driver_id": driver["id"],
+                "load_details": None,
+                "trip_fuel": None,
+                "notes": None,
+                "route": "DAV2 to PLAS",
+            },
+            edited_by="admin",
+            editor_email=None,
+        )
+        self.assertEqual(reassigned["pallet_capacity"], 36)
+        self.assertEqual(reassigned["truck_route_rate"], "1847.00")
+
+    def test_trips_reject_missing_or_inactive_truck_and_trailer(self):
+        self.configure_davao_plas_routes()
+        truck = self.manager.add_vehicle("VALIDATION-TRUCK", "Hino", "300", 2024)
+        inactive_trailer = self.manager.add_trailer(
+            "VALIDATION-INACTIVE-TRAILER", 36, status="maintenance"
+        )
+        driver = self.manager.add_driver("Validation Driver", "VALIDATION-DL")
+        with self.assertRaisesRegex(FleetManagementError, "trailer is inactive"):
+            self.manager.add_trip(
+                truck["id"], driver["id"], "DAV1 to PLAS", 0, 0,
+                origin="DAV1", destination="PLAS",
+                require_truck_rate=True, trailer_id=inactive_trailer["id"],
+            )
+        with self.assertRaisesRegex(FleetManagementError, "existing active trailer"):
+            self.manager.add_trip(
+                truck["id"], driver["id"], "DAV1 to PLAS", 0, 0,
+                origin="DAV1", destination="PLAS",
+                require_truck_rate=True, trailer_id=9999,
+            )
+
+        next(
+            row for row in self.client.tables["trailers"]
+            if row["id"] == inactive_trailer["id"]
+        )["status"] = "active"
+        next(
+            row for row in self.client.tables["vehicles"]
+            if row["id"] == truck["id"]
+        )["status"] = "maintenance"
+        with self.assertRaisesRegex(FleetManagementError, "truck is inactive"):
+            self.manager.add_trip(
+                truck["id"], driver["id"], "DAV1 to PLAS", 0, 0,
+                origin="DAV1", destination="PLAS",
+                require_truck_rate=True, trailer_id=inactive_trailer["id"],
+            )
 
     def test_add_vehicle_driver_and_assignment(self):
         vehicle = self.manager.add_vehicle("ABC-123", "Toyota", "Hiace", 2022, "White")
@@ -636,6 +1131,88 @@ class FleetManagerTests(unittest.TestCase):
         self.assertEqual(trip["plate_number"], "MUB289")
         self.assertEqual(trip["driver_name"], "SALCEDA")
 
+    def test_trip_and_fuel_enrichment_reads_only_linked_records(self):
+        self.client.tables["trips"] = [
+            {
+                "id": 1,
+                "created_by": "dispatcher-1",
+                "ism_no": "OWN-TRIP",
+                "origin": "DAV1",
+                "destination": "PLAS",
+                "route_number": 3,
+            },
+            {
+                "id": 2,
+                "created_by": "dispatcher-2",
+                "ism_no": "OTHER-TRIP",
+                "origin": "DAV2",
+                "destination": "PLAS",
+                "route_number": 6,
+            },
+        ]
+        self.client.tables["fuel_logs"] = [
+            {
+                "id": 11,
+                "trip_id": 1,
+                "created_by": "dispatcher-1",
+                "fuel_allocation": 350,
+                "actual_expense": 200,
+                "remarks": "Own fuel",
+            },
+            {
+                "id": 12,
+                "trip_id": 2,
+                "created_by": "dispatcher-2",
+                "fuel_allocation": 500,
+                "actual_expense": 450,
+            },
+        ]
+
+        trip = self.manager.list_trips(user_id="dispatcher-1")[0]
+        fuel_queries = [
+            query for query in self.client.query_log
+            if query["table"] == "fuel_logs" and query["action"] == "select"
+        ]
+        self.assertEqual(trip["fuel_id"], 11)
+        self.assertEqual(trip["fuel_allocation"], 350)
+        self.assertEqual(len(fuel_queries), 1)
+        self.assertIn(("in", "trip_id", [1]), fuel_queries[0]["filters"])
+        self.assertEqual(
+            fuel_queries[0]["columns"],
+            "id,trip_id,fuel_allocation,actual_expense,remarks,invoice_object_path",
+        )
+
+        self.client.query_log.clear()
+        fuel = self.manager.list_fuel_logs(user_id="dispatcher-1")[0]
+        linked_trip_queries = [
+            query for query in self.client.query_log
+            if query["table"] == "trips" and query["action"] == "select"
+        ]
+        self.assertEqual(fuel["trip_ism_no"], "OWN-TRIP")
+        self.assertEqual(len(linked_trip_queries), 1)
+        self.assertIn(("in", "id", [1]), linked_trip_queries[0]["filters"])
+        self.assertIn(("created_by", "dispatcher-1"), linked_trip_queries[0]["filters"])
+
+    def test_trip_date_range_is_filtered_in_the_database_query(self):
+        self.client.tables["trips"] = [
+            {"id": 1, "shipment_date": "2026-10-01", "ism_no": "IN-RANGE"},
+            {"id": 2, "shipment_date": "2026-11-01", "ism_no": "OUT-OF-RANGE"},
+        ]
+
+        trips = self.manager.list_trips(
+            include_fuel=False,
+            start_date="2026-10-01",
+            end_date="2026-10-31",
+        )
+
+        self.assertEqual([trip["ism_no"] for trip in trips], ["IN-RANGE"])
+        trips_query = next(
+            query for query in self.client.query_log
+            if query["table"] == "trips" and query["action"] == "select"
+        )
+        self.assertIn(("gte", "shipment_date", "2026-10-01"), trips_query["filters"])
+        self.assertIn(("lte", "shipment_date", "2026-10-31"), trips_query["filters"])
+
     def test_export_report(self):
         self.manager.add_vehicle("ZZZ-001", "Ford", "Transit", 2023)
         self.manager.add_driver("Esther Kofi", "DL-4411")
@@ -675,7 +1252,7 @@ class FleetManagerTests(unittest.TestCase):
         workbook = load_workbook(BytesIO(response.data), data_only=True)
         self.assertEqual(
             workbook.sheetnames,
-            ["Dashboard", "Vehicles", "Drivers", "Assignments", "Maintenance", "Fuel Logs", "Trips"],
+            ["Dashboard", "Vehicles", "Trailers", "Drivers", "Assignments", "Maintenance", "Fuel Logs", "Trips"],
         )
         vehicles = workbook["Vehicles"]
         self.assertEqual(vehicles["B4"].value, "Plate Number")
@@ -705,6 +1282,13 @@ class FleetManagerTests(unittest.TestCase):
             load_details="12 cartons",
             trip_fuel="Diesel",
         )
+        self.client.tables["trips"][0].update({
+            "route_number": 3,
+            "route_pair": "DAV1 ↔ PLAS",
+            "pallet_capacity": 36,
+            "truck_route_rate": "1847.00",
+            "trip_rate_review_required": False,
+        })
         web_app.manager = self.manager
         web_app.app.config["TESTING"] = True
         client = web_app.app.test_client()
@@ -729,7 +1313,9 @@ class FleetManagerTests(unittest.TestCase):
         self.assertEqual(trips["C5"].number_format, "yyyy-mm-dd")
         self.assertEqual(trips["D5"].number_format, "hh:mm")
         self.assertEqual(trips.freeze_panes, "A5")
-        self.assertEqual(trips.auto_filter.ref, "A4:R5")
+        self.assertEqual(trips.auto_filter.ref, "A4:Y5")
+        self.assertEqual(trips["Q5"].value, 1847)
+        self.assertIn("₱", trips["Q5"].number_format)
 
     def test_web_trip_history_export_uses_selected_group_and_search(self):
         vehicle = self.manager.add_vehicle("TRIP-XLS-2", "Toyota", "Hiace", 2024)
@@ -826,6 +1412,32 @@ class FleetManagerTests(unittest.TestCase):
         ):
             self.manager._execute(UnmigratedTripsQuery())
 
+    def test_missing_fuel_trip_link_migration_has_actionable_error(self):
+        class UnmigratedFuelAllocationQuery:
+            def execute(self):
+                raise RuntimeError(
+                    "{'message': 'column fuel_logs.trip_id does not exist', "
+                    "'code': '42703'}"
+                )
+
+        with self.assertRaisesRegex(
+            FleetManagementError, "supabase_fuel_allocation_migration.sql"
+        ):
+            self.manager._execute(UnmigratedFuelAllocationQuery())
+
+    def test_missing_route_rate_migration_has_actionable_error(self):
+        class UnmigratedRouteRatesQuery:
+            def execute(self):
+                raise RuntimeError(
+                    "{'message': 'column trips.route_id does not exist', "
+                    "'code': '42703'}"
+                )
+
+        with self.assertRaisesRegex(
+            FleetManagementError, "supabase_route_trip_rate_migration.sql"
+        ):
+            self.manager._execute(UnmigratedRouteRatesQuery())
+
     def test_outdated_payroll_finalization_function_has_actionable_error(self):
         class OutdatedPayrollFunctionQuery:
             def execute(self):
@@ -844,6 +1456,7 @@ class FleetManagerTests(unittest.TestCase):
         web_app.manager = self.manager
         web_app.app.config["TESTING"] = True
         client = web_app.app.test_client()
+        self.configure_davao_plas_routes()
 
         self.sign_in(client)
         response = client.get("/")
@@ -865,6 +1478,27 @@ class FleetManagerTests(unittest.TestCase):
         self.assertEqual(response.status_code, 201)
         self.assertEqual(response.json["data"]["plate_number"], "WEB-123")
 
+        invalid_trailer = client.post(
+            "/api/trailers",
+            json={
+                "plate_number": "WEB-TRAILER-BAD",
+                "pallet_capacity": 36.5,
+                "status": "active",
+            },
+            headers={"X-CSRF-Token": self.csrf_token(client)},
+        )
+        self.assertEqual(invalid_trailer.status_code, 400)
+        trailer_response = client.post(
+            "/api/trailers",
+            json={
+                "plate_number": "WEB-TRAILER",
+                "pallet_capacity": 36,
+                "status": "active",
+            },
+            headers={"X-CSRF-Token": self.csrf_token(client)},
+        )
+        self.assertEqual(trailer_response.status_code, 201)
+        trailer = trailer_response.json["data"]
         driver = self.manager.add_driver("Web Driver", "WEB-DL-1")
         vehicle = self.manager.list_vehicles()[0]
         response = client.post(
@@ -874,20 +1508,43 @@ class FleetManagerTests(unittest.TestCase):
                 "shipment_date": "2026-10-03",
                 "time_in": "08:15",
                 "time_out": "09:40",
-                "origin": "Manila",
-                "destination": "Cavite",
-                "vehicle_id": vehicle["id"],
+                "origin": "DAV1",
+                "destination": "PLAS",
+                "truck_id": vehicle["id"],
+                "trailer_id": trailer["id"],
                 "driver_id": driver["id"],
                 "load_details": "12 cartons",
                 "trip_fuel": "Diesel",
+                "fuel_allocation": 250,
+                "actual_fuel_expense": 0,
             },
             headers={"X-CSRF-Token": self.csrf_token(client)},
         )
         self.assertEqual(response.status_code, 201)
         self.assertEqual(response.json["data"]["ism_no"], "ISM-008")
-        self.assertEqual(response.json["data"]["origin"], "Manila")
+        self.assertEqual(response.json["data"]["origin"], "DAV1")
         self.assertEqual(response.json["data"]["time_in"], "08:15")
         self.assertEqual(response.json["data"]["trip_fuel"], "Diesel")
+        self.assertEqual(response.json["data"]["route_number"], 3)
+        self.assertEqual(response.json["data"]["pallet_capacity"], 36)
+        self.assertEqual(response.json["data"]["truck_route_rate"], "1847.00")
+        self.assertEqual(response.json["data"]["fuel_log"]["fuel_allocation"], 250)
+        self.assertEqual(response.json["data"]["fuel_log"]["actual_expense"], 0)
+        unconfigured_rate = client.post(
+            "/api/trips",
+            json={
+                "shipment_date": "2026-10-04",
+                "origin": "DAV1",
+                "destination": "DAV2",
+                "truck_id": vehicle["id"],
+                "trailer_id": trailer["id"],
+                "vehicle_id": vehicle["id"],
+                "driver_id": driver["id"],
+            },
+            headers={"X-CSRF-Token": self.csrf_token(client)},
+        )
+        self.assertEqual(unconfigured_rate.status_code, 400)
+        self.assertIn("Rate not configured", unconfigured_rate.json["error"])
 
         response = client.get("/api/bootstrap")
         self.assertEqual(response.status_code, 200)
@@ -899,6 +1556,80 @@ class FleetManagerTests(unittest.TestCase):
         self.assertEqual(trip["shipment_date"], "2026-10-03")
         self.assertEqual(trip["plate_number"], "WEB-123")
         self.assertEqual(trip["driver_name"], "Web Driver")
+        self.assertEqual(trip["truck_route_rate"], "1847.00")
+        self.assertEqual(len(response.json["truck_routes"]), 4)
+        self.assertEqual(response.json["trips"][0]["trailer_plate_number"], "WEB-TRAILER")
+
+    def test_admin_can_edit_existing_trailer_and_dispatcher_cannot(self):
+        web_app.manager = self.manager
+        web_app.app.config["TESTING"] = True
+        client = web_app.app.test_client()
+        self.sign_in(client)
+        csrf = self.csrf_token(client)
+
+        created = client.post(
+            "/api/trailers",
+            json={
+                "plate_number": "EDIT-TRAILER-1",
+                "year_model": 2007,
+                "make_model": "0",
+                "mv_file_no": "1244-00000043278",
+                "engine_no": "NA",
+                "chassis_no": "LTOX111010-048C",
+                "status": "active",
+            },
+            headers={"X-CSRF-Token": csrf},
+        )
+        self.assertEqual(created.status_code, 201)
+        trailer_id = created.json["data"]["id"]
+        self.assertIsNone(created.json["data"]["pallet_capacity"])
+        self.assertTrue(created.json["data"]["capacity_review_required"])
+
+        updated = client.patch(
+            f"/api/trailers/{trailer_id}",
+            json={
+                "plate_number": "EDIT-TRAILER-UPDATED",
+                "year_model": 2008,
+                "make_model": "Updated model",
+                "mv_file_no": "MV-UPDATED-001",
+                "engine_no": "ENGINE-UPDATED",
+                "chassis_no": "CHASSIS-UPDATED",
+                "pallet_capacity": 46,
+                "trailer_type": "Flatbed",
+                "status": "active",
+                "remarks": "Capacity verified",
+            },
+            headers={"X-CSRF-Token": csrf},
+        )
+        self.assertEqual(updated.status_code, 200)
+        self.assertEqual(updated.json["data"]["plate_number"], "EDIT-TRAILER-UPDATED")
+        self.assertEqual(updated.json["data"]["year_model"], 2008)
+        self.assertEqual(updated.json["data"]["pallet_capacity"], 46)
+        self.assertFalse(updated.json["data"]["capacity_review_required"])
+        self.assertEqual(updated.json["data"]["remarks"], "Capacity verified")
+        persisted = self.manager.list_trailers()[0]
+        self.assertEqual(persisted["mv_file_no"], "MV-UPDATED-001")
+        self.assertEqual(persisted["engine_no"], "ENGINE-UPDATED")
+        self.assertEqual(persisted["chassis_no"], "CHASSIS-UPDATED")
+
+        dispatcher_auth = FakeAuthClient()
+        dispatcher_auth.user.user_metadata = {"role": "dispatcher"}
+        dispatcher_client = web_app.app.test_client()
+        self.sign_in(dispatcher_client, dispatcher_auth)
+        dispatcher_response = dispatcher_client.patch(
+            f"/api/trailers/{trailer_id}",
+            json={
+                "plate_number": "UNAUTHORIZED-EDIT",
+                "pallet_capacity": 36,
+                "status": "active",
+            },
+            headers={"X-CSRF-Token": self.csrf_token(dispatcher_client)},
+        )
+        self.assertEqual(dispatcher_response.status_code, 403)
+        self.assertEqual(
+            self.manager.list_trailers()[0]["plate_number"],
+            "EDIT-TRAILER-UPDATED",
+        )
 
     def test_dispatcher_is_limited_to_owned_records_and_allowed_endpoints(self):
         web_app.manager = self.manager
@@ -939,6 +1670,11 @@ class FleetManagerTests(unittest.TestCase):
             headers={"X-CSRF-Token": csrf},
         )
         denied_vehicle_list = client.get("/api/vehicles")
+        denied_capacity_update = client.patch(
+            f"/api/vehicles/{vehicle['id']}/capacity",
+            json={"pallet_capacity": 46},
+            headers={"X-CSRF-Token": csrf},
+        )
         denied_driver_list = client.get("/api/drivers")
         denied_payroll = client.get("/api/payroll?start_date=2026-10-01&end_date=2026-10-31")
         denied_export = client.get("/api/export")
@@ -948,6 +1684,7 @@ class FleetManagerTests(unittest.TestCase):
         )
         self.assertEqual(denied_vehicle_create.status_code, 403)
         self.assertEqual(denied_vehicle_list.status_code, 403)
+        self.assertEqual(denied_capacity_update.status_code, 403)
         self.assertEqual(denied_driver_list.status_code, 403)
         self.assertEqual(denied_payroll.status_code, 403)
         self.assertEqual(denied_export.status_code, 403)
@@ -1049,18 +1786,22 @@ class FleetManagerTests(unittest.TestCase):
     def test_dispatcher_can_edit_owned_trip_and_view_its_edit_history(self):
         web_app.manager = self.manager
         web_app.app.config["TESTING"] = True
+        self.configure_davao_plas_routes()
         vehicle = self.manager.add_vehicle("EDIT-123", "Toyota", "Hiace", 2022)
+        trailer = self.manager.add_trailer("EDIT-TRAILER", 36)
         driver = self.manager.add_driver("Edit Driver", "EDIT-DL-1")
         own_trip = self.manager.add_trip(
             vehicle["id"],
             driver["id"],
-            "Old Origin to Old Destination",
+            "DAV1 to PLAS",
             0,
             0,
             ism_no="EDIT-TRIP",
             shipment_date="2026-10-01",
-            origin="Old Origin",
-            destination="Old Destination",
+            origin="DAV1",
+            destination="PLAS",
+            trailer_id=trailer["id"],
+            require_truck_rate=True,
             created_by="auth-user-1",
         )
         other_trip = self.manager.add_trip(
@@ -1085,8 +1826,10 @@ class FleetManagerTests(unittest.TestCase):
                 "shipment_date": "2026-10-02",
                 "time_in": "08:00",
                 "time_out": "10:00",
-                "origin": "New Origin",
-                "destination": "New Destination",
+                "origin": "GENSAN",
+                "destination": "DAV2",
+                "truck_id": vehicle["id"],
+                "trailer_id": trailer["id"],
                 "vehicle_id": vehicle["id"],
                 "driver_id": driver["id"],
                 "load_details": "Updated load",
@@ -1109,12 +1852,14 @@ class FleetManagerTests(unittest.TestCase):
 
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json["data"]["ism_no"], "EDIT-TRIP-UPDATED")
-        self.assertEqual(response.json["data"]["route"], "New Origin to New Destination")
+        self.assertEqual(response.json["data"]["route"], "GENSAN to DAV2")
+        self.assertEqual(response.json["data"]["route_number"], 7)
+        self.assertEqual(response.json["data"]["truck_route_rate"], "11000.00")
         self.assertEqual(response.json["data"]["last_edited_by"], "auth-user-1")
         self.assertEqual(denied.status_code, 403)
         self.assertEqual(
             self.manager.get_trip(own_trip["id"])["destination"],
-            "New Destination",
+            "DAV2",
         )
         self.manager.client.tables["trip_edit_history"] = [{
             "id": 1,
@@ -1133,6 +1878,11 @@ class FleetManagerTests(unittest.TestCase):
 
     def test_dispatcher_creates_notification_for_each_supported_record_type(self):
         vehicle = self.manager.add_vehicle("NOTIFY-1", "Toyota", "Hiace", 2024)
+        trailer = self.manager.add_trailer("NOTIFY-TRAILER", 46)
+        self.configure_route(
+            7, "GENSAN", "DAV2", "GENSAN ↔ DAV2",
+            {36: "11000.00", 46: "14000.00"},
+        )
         driver = self.manager.add_driver("Notify Driver", "NOTIFY-DL-1")
         web_app.manager = self.manager
         web_app.app.config["TESTING"] = True
@@ -1154,6 +1904,8 @@ class FleetManagerTests(unittest.TestCase):
                     "shipment_date": "2026-10-08",
                     "origin": "GENSAN",
                     "destination": "DAV2",
+                    "truck_id": vehicle["id"],
+                    "trailer_id": trailer["id"],
                     "vehicle_id": vehicle["id"],
                     "driver_id": driver["id"],
                 },
@@ -1325,6 +2077,11 @@ class FleetManagerTests(unittest.TestCase):
 
     def test_notification_failure_does_not_fail_successful_dispatcher_record(self):
         vehicle = self.manager.add_vehicle("NOTIFY-FAIL", "Toyota", "Hiace", 2024)
+        trailer = self.manager.add_trailer("NOTIFY-FAIL-TRAILER", 36)
+        self.configure_route(
+            7, "GENSAN", "DAV2", "GENSAN ↔ DAV2",
+            {36: "11000.00", 46: "14000.00"},
+        )
         driver = self.manager.add_driver("Notify Fail Driver", "NOTIFY-DL-FAIL")
         web_app.manager = self.manager
         web_app.app.config["TESTING"] = True
@@ -1338,6 +2095,8 @@ class FleetManagerTests(unittest.TestCase):
             "shipment_date": "2026-10-08",
             "origin": "GENSAN",
             "destination": "DAV2",
+            "truck_id": vehicle["id"],
+            "trailer_id": trailer["id"],
             "vehicle_id": vehicle["id"],
             "driver_id": driver["id"],
         }

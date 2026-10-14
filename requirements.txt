@@ -3,3 +3,4 @@ openpyxl>=3.1,<4
 Pillow>=11,<13
 python-dotenv>=1.1,<2
 supabase>=2.15,<3
+tzdata>=2024.1

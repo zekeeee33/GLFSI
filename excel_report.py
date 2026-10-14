@@ -16,6 +16,11 @@ EXCEL_REPORT_SHEETS = (
         "id", "plate_number", "make", "model", "year", "color", "status",
         "odometer", "registration_expiry", "insurance_expiry", "created_at",
     )),
+    ("trailers", "Trailers", (
+        "id", "plate_number", "year_model", "make_model", "mv_file_no",
+        "engine_no", "chassis_no", "pallet_capacity", "capacity_review_required",
+        "trailer_type", "status", "remarks", "created_at", "updated_at",
+    )),
     ("drivers", "Drivers", (
         "id", "name", "license_number", "phone", "email", "status", "created_at",
     )),
@@ -33,20 +38,27 @@ EXCEL_REPORT_SHEETS = (
     )),
     ("trips", "Trips", (
         "id", "record_date", "ism_no", "shipment_date", "time_in", "time_out",
-        "origin", "destination", "vehicle_id", "plate_no", "plate_number",
+        "origin", "destination", "vehicle_id", "truck_id", "truck_plate_number",
+        "trailer_id", "trailer_plate_number", "plate_no", "plate_number",
         "make", "model", "driver_id", "driver_name", "load_details", "trip_fuel",
-        "route", "start_odometer", "end_odometer", "trip_date", "notes",
+        "route", "route_number", "route_pair", "pallet_capacity", "truck_route_rate",
+        "trip_rate_review_required", "start_odometer", "end_odometer", "trip_date", "notes",
     )),
 )
 
 EXCEL_TRIP_FIELDS = (
     "id", "ism_no", "shipment_date", "time_in", "time_out", "origin",
     "destination", "plate_number", "make", "model", "driver_name",
-    "load_details", "trip_fuel", "route", "start_odometer", "end_odometer",
-    "trip_date", "notes",
+    "truck_plate_number", "trailer_plate_number", "route_number", "route_pair",
+    "pallet_capacity", "truck_route_rate",
+    "trip_rate_review_required", "load_details", "trip_fuel", "route",
+    "start_odometer", "end_odometer", "trip_date", "notes",
 )
 
-EXCEL_CURRENCY_FIELDS = {"cost", "price_per_liter", "total_cost"}
+EXCEL_CURRENCY_FIELDS = {
+    "cost", "price_per_liter", "total_cost", "truck_route_rate",
+    "fuel_allocation", "actual_expense",
+}
 EXCEL_DATE_FIELDS = {
     "advance_date", "assigned_date", "created_at", "effective_date",
     "insurance_expiry", "logged_on", "payroll_date", "performed_on",
@@ -58,6 +70,8 @@ EXCEL_DATE_FIELDS = {
 def _excel_cell_value(field: str, value: Any) -> Any:
     if value is None:
         return None
+    if field in EXCEL_CURRENCY_FIELDS:
+        return Decimal(str(value))
     if isinstance(value, (dict, list)):
         return json.dumps(value, ensure_ascii=False)
     if field in EXCEL_DATE_FIELDS and isinstance(value, str):
@@ -195,6 +209,7 @@ def build_trip_excel_report(
     group_labels = {
         "driver_name": "Driver",
         "plate_number": "Truck",
+        "truck_plate_number": "Truck",
         "origin": "Origin",
         "destination": "Destination",
     }
@@ -281,6 +296,8 @@ def build_trip_excel_report(
                     cell.number_format = "yyyy-mm-dd"
                 elif field in {"time_in", "time_out"} and isinstance(value, time):
                     cell.number_format = "hh:mm"
+                elif field in EXCEL_CURRENCY_FIELDS and value is not None:
+                    cell.number_format = '"₱"#,##0.00;[Red]-"₱"#,##0.00'
 
         last_column = get_column_letter(len(EXCEL_TRIP_FIELDS))
         last_row = max(4, 4 + len(group_trips))
@@ -473,19 +490,21 @@ def build_payroll_excel_report(
     summary.column_dimensions["B"].width = 16
 
     trip_headers = [
-        "Date", "Driver Name", "ISM Number", "Origin", "Destination", "Trip Rate", "Review",
+        "Date", "Driver Name", "ISM Number", "Origin", "Destination",
+        "Driver Trip Allowance", "Truck Hauling Rate", "Review",
     ]
     trip_fields = [
-        "payroll_date", "driver_name", "ism_no", "origin", "destination", "rate", "issue",
+        "payroll_date", "driver_name", "ism_no", "origin", "destination",
+        "rate", "truck_route_rate", "issue",
     ]
     trip_rows = [[
-        Decimal(str(trip[field])) if field == "rate" and trip.get(field) is not None
+        Decimal(str(trip[field])) if field in {"rate", "truck_route_rate"} and trip.get(field) is not None
         else trip.get(field)
         for field in trip_fields
     ] for trip in trips]
     trip_sheet = workbook.create_sheet("Trip Details")
     write_title(trip_sheet, "Payroll Trip Details", len(trip_headers))
-    write_table(trip_sheet, 5, trip_headers, trip_rows, {6})
+    write_table(trip_sheet, 5, trip_headers, trip_rows, {6, 7})
 
     related_driver_ids = {str(driver.get("driver_id")) for driver in summary_drivers}
     name_by_driver_id = {

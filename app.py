@@ -7,9 +7,11 @@ import secrets
 import time
 import uuid
 import warnings
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
+from decimal import Decimal, InvalidOperation
 from io import BytesIO
 from typing import Any
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from flask import Flask, g, jsonify, redirect, request, send_file, send_from_directory, session, url_for
 from dotenv import dotenv_values
@@ -24,8 +26,10 @@ from excel_report import (
 from fleet_management import (
     FleetManagementError,
     FleetManager,
+    TripRateValidationError,
     _supabase_project_url,
 )
+from manifest_ocr import extract_manifest_fields, scan_manifest_image
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 STATIC_DIR = os.path.join(BASE_DIR, "static")
@@ -51,6 +55,12 @@ app.config["PERMANENT_SESSION_LIFETIME"] = timedelta(seconds=SESSION_IDLE_TIMEOU
 
 manager: FleetManager | None = None
 logger = logging.getLogger(__name__)
+
+try:
+    BUSINESS_TIMEZONE = ZoneInfo("Asia/Manila")
+except ZoneInfoNotFoundError:
+    BUSINESS_TIMEZONE = timezone(timedelta(hours=8))
+
 
 def _supabase_setting(name: str) -> str | None:
     value = os.environ.get(name)
@@ -418,13 +428,15 @@ def bootstrap() -> Any:
     if _is_dispatcher():
         if not user_id:
             return _json_error("Authenticated dispatcher identity is missing.", 403)
-        trips = fleet.list_trips(user_id=user_id)
+        trips = fleet.list_trips(user_id=user_id, include_fuel=False)
         fuel_logs = fleet.list_fuel_logs(user_id=user_id)
+        _attach_trip_fuel(trips, fuel_logs)
         maintenance = fleet.list_maintenance(user_id=user_id)
         vehicles = fleet.list_vehicles()
         drivers = fleet.list_drivers()
         today = time.strftime("%Y-%m-%d")
         _add_document_links(trips, "manifest_object_path", "manifest_image_url", "trip_manifest_image")
+        _add_document_links(trips, "fuel_invoice_object_path", "fuel_invoice_image_url", "trip_fuel_invoice_image")
         _add_document_links(fuel_logs, "invoice_object_path", "invoice_image_url", "fuel_invoice_image")
         return jsonify(
             {
@@ -438,9 +450,13 @@ def bootstrap() -> Any:
                     "total_maintenance": len(maintenance),
                 },
                 "vehicles": [
-                    {key: row.get(key) for key in ("id", "plate_number", "make", "model")}
+                    {
+                        key: row.get(key)
+                        for key in ("id", "plate_number", "make", "model", "status")
+                    }
                     for row in vehicles
                 ],
+                "trailers": fleet.list_trailers(),
                 "drivers": [
                     {key: row.get(key) for key in ("id", "name", "status")}
                     for row in drivers
@@ -449,17 +465,21 @@ def bootstrap() -> Any:
                 "maintenance": maintenance,
                 "fuel_logs": fuel_logs,
                 "trips": trips,
+                "truck_routes": fleet.list_truck_routes(),
+                "truck_route_rates": fleet.list_truck_route_rates(),
                 "csrf_token": session.get("csrf_token"),
                 "user": g.current_user,
             }
         )
-    trips = fleet.list_trips()
+    trips = fleet.list_trips(include_fuel=False)
     fuel_logs = fleet.list_fuel_logs()
+    _attach_trip_fuel(trips, fuel_logs)
     maintenance = fleet.list_maintenance()
     vehicles = fleet.list_vehicles()
     drivers = fleet.list_drivers()
     assignments = fleet.list_assignments()
     _add_document_links(trips, "manifest_object_path", "manifest_image_url", "trip_manifest_image")
+    _add_document_links(trips, "fuel_invoice_object_path", "fuel_invoice_image_url", "trip_fuel_invoice_image")
     _add_document_links(fuel_logs, "invoice_object_path", "invoice_image_url", "fuel_invoice_image")
     dashboard = {
         "total_vehicles": len(vehicles),
@@ -473,11 +493,14 @@ def bootstrap() -> Any:
         {
             "dashboard": dashboard,
             "vehicles": vehicles,
+            "trailers": fleet.list_trailers(),
             "drivers": drivers,
             "assignments": assignments,
             "maintenance": maintenance,
             "fuel_logs": fuel_logs,
             "trips": trips,
+            "truck_routes": fleet.list_truck_routes(),
+            "truck_route_rates": fleet.list_truck_route_rates(),
             "csrf_token": session.get("csrf_token"),
             "user": g.current_user,
         }
@@ -491,8 +514,28 @@ def _add_document_links(
         object_path = row.pop(path_field, None)
         if object_path:
             row[url_field] = url_for(endpoint, **{
-                "trip_id" if endpoint == "trip_manifest_image" else "fuel_id": row["id"]
+                "trip_id" if endpoint in ("trip_manifest_image", "trip_fuel_invoice_image") else "fuel_id": row["id"]
             })
+
+
+def _attach_trip_fuel(
+    trips: list[dict[str, Any]], fuel_logs: list[dict[str, Any]]
+) -> None:
+    fuel_by_trip = {
+        row["trip_id"]: row
+        for row in fuel_logs
+        if row.get("trip_id") is not None
+    }
+    for trip in trips:
+        fuel = fuel_by_trip.get(trip["id"])
+        if fuel is None:
+            continue
+        trip["fuel_id"] = fuel.get("id")
+        trip["fuel_allocation"] = fuel.get("fuel_allocation")
+        trip["actual_fuel_expense"] = fuel.get("actual_expense")
+        trip["actual_expense"] = fuel.get("actual_expense")
+        trip["fuel_remarks"] = fuel.get("remarks")
+        trip["fuel_invoice_object_path"] = fuel.get("invoice_object_path")
 
 
 def _validated_image(file_storage: Any) -> tuple[bytes, str, str]:
@@ -547,6 +590,12 @@ def _record_for_document(kind: str, record_id: int) -> dict[str, Any]:
     try:
         if kind == "trip":
             return fleet.get_trip(record_id, user_id=user_id)
+        if kind == "trip_fuel":
+            trip = fleet.get_trip(record_id, user_id=user_id)
+            fuel_records = fleet._select_all("fuel_logs", "*", filters=[("trip_id", record_id)])
+            if fuel_records:
+                return fleet.get_fuel(fuel_records[0]["id"], user_id=user_id)
+            return {"_error": f"No fuel record linked to trip {record_id}", "_status": 404, "_trip": trip}
         return fleet.get_fuel(record_id, user_id=user_id)
     except FleetManagementError as exc:
         status = 403 if _is_dispatcher() else 404
@@ -556,10 +605,23 @@ def _record_for_document(kind: str, record_id: int) -> dict[str, Any]:
 def _handle_document_image(kind: str, record_id: int) -> Any:
     record = _record_for_document(kind, record_id)
     if "_error" in record:
-        return _json_error(record["_error"], record["_status"])
+        if request.method == "POST" and kind == "trip_fuel" and "_trip" in record:
+            trip = record["_trip"]
+            owner = str(trip.get("created_by") or (g.current_user or {}).get("id") or "")
+            fuel_log = get_manager().add_fuel(
+                vehicle_id=trip.get("vehicle_id") or trip.get("truck_id"),
+                fuel_type="diesel",
+                trip_id=record_id,
+                created_by=owner or None,
+            )
+            record = fuel_log
+        else:
+            return _json_error(record["_error"], record["_status"])
 
     is_trip = kind == "trip"
     path_field = "manifest_object_path" if is_trip else "invoice_object_path"
+    actual_record_id = record["id"]
+    upload_bucket_folder = "trips" if is_trip else "fuel"
     if request.method == "POST":
         image_file = request.files.get("image")
         if image_file is None:
@@ -569,7 +631,7 @@ def _handle_document_image(kind: str, record_id: int) -> Any:
         except ValueError as exc:
             return _json_error(str(exc), 400)
         owner_id = str(record.get("created_by") or (g.current_user or {}).get("id") or "admin")
-        object_path = f"{kind}s/{record_id}/{owner_id}/{uuid.uuid4().hex}.{extension}"
+        object_path = f"{upload_bucket_folder}/{actual_record_id}/{owner_id}/{uuid.uuid4().hex}.{extension}"
         storage = get_manager().client.storage.from_(app.config["DOCUMENT_IMAGE_BUCKET"])
         uploaded = False
         try:
@@ -577,7 +639,7 @@ def _handle_document_image(kind: str, record_id: int) -> Any:
             uploaded = True
             if is_trip:
                 get_manager().set_trip_manifest_path(
-                    record_id,
+                    actual_record_id,
                     object_path,
                     user_id=_document_user_id(),
                     edited_by=str((g.current_user or {}).get("id") or session.get("user_id") or ""),
@@ -585,7 +647,7 @@ def _handle_document_image(kind: str, record_id: int) -> Any:
                 )
             else:
                 get_manager().set_fuel_invoice_path(
-                    record_id, object_path, user_id=_document_user_id()
+                    actual_record_id, object_path, user_id=_document_user_id()
                 )
             if is_trip and _is_dispatcher() and not record.get(path_field):
                 _create_dispatcher_notifications(
@@ -602,7 +664,7 @@ def _handle_document_image(kind: str, record_id: int) -> Any:
                     storage.remove([object_path])
                 except Exception:
                     logger.exception("Could not clean up an unlinked document object.")
-            logger.exception("Could not store a trip document image.")
+            logger.exception("Could not store a document image.")
             return _json_error("Could not save the image. Please retry.", 503)
         return jsonify({"message": "Image uploaded successfully."}), 201
 
@@ -614,7 +676,7 @@ def _handle_document_image(kind: str, record_id: int) -> Any:
             app.config["DOCUMENT_IMAGE_BUCKET"]
         ).download(object_path)
     except Exception:
-        logger.exception("Could not retrieve a trip document image.")
+        logger.exception("Could not retrieve a document image.")
         return _json_error("Could not retrieve the image. Please retry.", 503)
 
     mime_type = {
@@ -627,7 +689,7 @@ def _handle_document_image(kind: str, record_id: int) -> Any:
         BytesIO(image_bytes),
         mimetype=mime_type,
         as_attachment=False,
-        download_name=f"{kind}-{record_id}{os.path.splitext(object_path)[1].lower()}",
+        download_name=f"{upload_bucket_folder}-{actual_record_id}{os.path.splitext(object_path)[1].lower()}",
         max_age=0,
     )
     response.headers["X-Content-Type-Options"] = "nosniff"
@@ -638,6 +700,11 @@ def _handle_document_image(kind: str, record_id: int) -> Any:
 @app.route("/api/trips/<int:trip_id>/manifest", methods=["GET", "POST"])
 def trip_manifest_image(trip_id: int) -> Any:
     return _handle_document_image("trip", trip_id)
+
+
+@app.route("/api/trips/<int:trip_id>/fuel-invoice", methods=["GET", "POST"])
+def trip_fuel_invoice_image(trip_id: int) -> Any:
+    return _handle_document_image("trip_fuel", trip_id)
 
 
 @app.route("/api/trips/<int:trip_id>/history")
@@ -663,35 +730,60 @@ def update_trip(trip_id: int) -> Any:
         destination = _required_text(payload, "destination")
         actor = g.current_user or {}
         editor_id = str(actor.get("id") or session.get("user_id") or "")
+        update_data = {
+            "ism_no": _optional_text(payload, "ism_no"),
+            "shipment_date": _required_text(payload, "shipment_date"),
+            "time_in": _optional_text(payload, "time_in"),
+            "time_out": _optional_text(payload, "time_out"),
+            "origin": origin,
+            "destination": destination,
+            "vehicle_id": (
+                _integer(payload, "truck_id" if payload.get("truck_id") not in (None, "") else "vehicle_id")
+                if payload.get("truck_id", payload.get("vehicle_id")) not in (None, "")
+                else None
+            ),
+            "truck_id": (
+                _integer(payload, "truck_id" if payload.get("truck_id") not in (None, "") else "vehicle_id")
+                if payload.get("truck_id", payload.get("vehicle_id")) not in (None, "")
+                else None
+            ),
+            "trailer_id": (
+                _integer(payload, "trailer_id")
+                if payload.get("trailer_id") not in (None, "")
+                else None
+            ),
+            "driver_id": (
+                _integer(payload, "driver_id")
+                if payload.get("driver_id") not in (None, "")
+                else None
+            ),
+            "load_details": _optional_text(payload, "load_details"),
+            "trip_fuel": _optional_text(payload, "trip_fuel"),
+            "notes": _optional_text(payload, "notes"),
+            "route": f"{origin} to {destination}",
+        }
+        if "fuel_allocation" in payload:
+            update_data["fuel_allocation"] = _optional_number(payload, "fuel_allocation")
+        if "actual_fuel_expense" in payload or "actual_expense" in payload:
+            exp_field = "actual_fuel_expense" if "actual_fuel_expense" in payload else "actual_expense"
+            update_data["actual_fuel_expense"] = _optional_number(payload, exp_field)
+        if "fuel_remarks" in payload:
+            update_data["fuel_remarks"] = _optional_text(payload, "fuel_remarks")
+
         record = get_manager().update_trip(
             trip_id,
-            {
-                "ism_no": _optional_text(payload, "ism_no"),
-                "shipment_date": _required_text(payload, "shipment_date"),
-                "time_in": _optional_text(payload, "time_in"),
-                "time_out": _optional_text(payload, "time_out"),
-                "origin": origin,
-                "destination": destination,
-                "vehicle_id": (
-                    _integer(payload, "vehicle_id")
-                    if payload.get("vehicle_id") not in (None, "")
-                    else None
-                ),
-                "driver_id": (
-                    _integer(payload, "driver_id")
-                    if payload.get("driver_id") not in (None, "")
-                    else None
-                ),
-                "load_details": _optional_text(payload, "load_details"),
-                "trip_fuel": _optional_text(payload, "trip_fuel"),
-                "notes": _optional_text(payload, "notes"),
-                "route": f"{origin} to {destination}",
-            },
+            update_data,
             edited_by=editor_id,
             editor_email=actor.get("email") or session.get("email"),
             user_id=editor_id if _is_dispatcher() else None,
         )
+        if record.get("manifest_object_path"):
+            record["manifest_image_url"] = f"/api/trips/{trip_id}/manifest"
+        if record.get("fuel_invoice_object_path"):
+            record["fuel_invoice_image_url"] = f"/api/trips/{trip_id}/fuel-invoice"
     except ValueError as exc:
+        return _json_error(str(exc), 400)
+    except TripRateValidationError as exc:
         return _json_error(str(exc), 400)
     except FleetManagementError as exc:
         message = str(exc)
@@ -706,6 +798,47 @@ def update_trip(trip_id: int) -> Any:
 @app.route("/api/fuel/<int:fuel_id>/invoice", methods=["GET", "POST"])
 def fuel_invoice_image(fuel_id: int) -> Any:
     return _handle_document_image("fuel", fuel_id)
+
+
+@app.route("/api/fuel/<int:fuel_id>", methods=["PATCH"])
+def update_fuel_log(fuel_id: int) -> Any:
+    try:
+        payload = _body()
+        actor = g.current_user or {}
+        editor_id = str(actor.get("id") or session.get("user_id") or "")
+        editor_email = actor.get("email") or session.get("email")
+        record = get_manager().update_fuel(
+            fuel_id,
+            payload,
+            edited_by=editor_id,
+            editor_email=editor_email,
+            user_id=editor_id if _is_dispatcher() else None,
+        )
+    except ValueError as exc:
+        return _json_error(str(exc), 400)
+    except FleetManagementError as exc:
+        message = str(exc)
+        if "not found" in message.lower():
+            return _json_error(message, 403 if _is_dispatcher() else 404)
+        if "do not have access" in message.lower():
+            return _json_error(message, 403)
+        return _json_error(message, 400)
+    return jsonify({"data": record})
+
+
+@app.route("/api/fuel/<int:fuel_id>/history")
+def fuel_edit_history(fuel_id: int) -> Any:
+    user_id = _document_user_id()
+    try:
+        history = get_manager().list_fuel_edit_history(fuel_id, user_id=user_id)
+    except FleetManagementError as exc:
+        message = str(exc)
+        if "not found" in message.lower():
+            return _json_error(message, 403 if _is_dispatcher() else 404)
+        if "do not have access" in message.lower():
+            return _json_error(message, 403)
+        raise
+    return jsonify({"history": history})
 
 
 def _body() -> dict[str, Any]:
@@ -724,6 +857,8 @@ def _required_text(payload: dict[str, Any], field: str) -> str:
 
 def _integer(payload: dict[str, Any], field: str, default: int | None = None) -> int:
     value = payload.get(field, default)
+    if isinstance(value, bool) or isinstance(value, float) and not value.is_integer():
+        raise ValueError(f"{field.replace('_', ' ').capitalize()} must be a whole number")
     try:
         return int(value)
     except (TypeError, ValueError) as exc:
@@ -732,6 +867,16 @@ def _integer(payload: dict[str, Any], field: str, default: int | None = None) ->
 
 def _number(payload: dict[str, Any], field: str, default: float | None = None) -> float:
     value = payload.get(field, default)
+    try:
+        return float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{field.replace('_', ' ').capitalize()} must be a number") from exc
+
+
+def _optional_number(payload: dict[str, Any], field: str, default: float | None = None) -> float | None:
+    value = payload.get(field, default)
+    if value in (None, ""):
+        return default
     try:
         return float(value)
     except (TypeError, ValueError) as exc:
@@ -757,6 +902,170 @@ def payroll_report() -> Any:
         return jsonify(get_manager().payroll_report(start_date, end_date))
     except ValueError as exc:
         return _json_error(str(exc), 400)
+
+
+def _revenue_management_request() -> tuple[dict[str, Any] | None, Any | None]:
+    if _is_dispatcher() or _user_role() != "administrator":
+        return None, _json_error("Revenue reporting is only available to administrators.", 403)
+    current_user = g.current_user or {}
+    actor_id = str(current_user.get("id") or "")
+    if not actor_id:
+        return None, _json_error("Authenticated administrator identity is missing.", 403)
+    return current_user, None
+
+
+def _revenue_date_parameter(value: str, field: str) -> date:
+    if len(value) != 10:
+        raise ValueError(f"{field} must use YYYY-MM-DD.")
+    try:
+        parsed = date.fromisoformat(value)
+    except ValueError as exc:
+        raise ValueError(f"{field} must use YYYY-MM-DD.") from exc
+    if parsed.isoformat() != value:
+        raise ValueError(f"{field} must use YYYY-MM-DD.")
+    return parsed
+
+
+def _optional_revenue_integer(value: str, field: str) -> int | None:
+    if not value:
+        return None
+    try:
+        parsed = int(value)
+    except ValueError as exc:
+        raise ValueError(f"{field} must be a whole number.") from exc
+    if parsed < 1:
+        raise ValueError(f"{field} must be a positive number.")
+    return parsed
+
+
+@app.route("/api/revenue")
+def revenue_dashboard() -> Any:
+    _, error = _revenue_management_request()
+    if error:
+        return error
+    today = datetime.now(BUSINESS_TIMEZONE).date()
+    try:
+        start_date = _revenue_date_parameter(
+            request.args.get("start_date", today.replace(day=1).isoformat()),
+            "Start date",
+        )
+        end_date = _revenue_date_parameter(
+            request.args.get("end_date", today.isoformat()),
+            "End date",
+        )
+        page = int(request.args.get("page", "1"))
+        page_size = int(request.args.get("page_size", "25"))
+        search = request.args.get("search", "").strip()
+        bucket = request.args.get("bucket", "day")
+        sort_by = request.args.get("sort_by", "shipment_date")
+        sort_dir = request.args.get("sort_dir", "desc")
+        if len(search) > 120:
+            raise ValueError("Search text must be 120 characters or fewer.")
+        if page < 1 or page_size < 1 or page_size > 100:
+            raise ValueError("Choose a valid ledger page.")
+        if bucket not in {"day", "week", "month"}:
+            raise ValueError("Trend bucket must be day, week, or month.")
+        if sort_by not in {"shipment_date", "id", "revenue", "route"}:
+            raise ValueError("Choose a valid ledger sort column.")
+        if sort_dir not in {"asc", "desc"}:
+            raise ValueError("Ledger sort direction must be asc or desc.")
+        filters = {
+            "p_start_date": start_date.isoformat(),
+            "p_end_date": end_date.isoformat(),
+            "p_origin": request.args.get("origin") or None,
+            "p_destination": request.args.get("destination") or None,
+            "p_route_number": _optional_revenue_integer(
+                request.args.get("route_number", ""), "Route number"
+            ),
+            "p_driver_id": _optional_revenue_integer(
+                request.args.get("driver_id", ""), "Driver"
+            ),
+            "p_truck_id": _optional_revenue_integer(
+                request.args.get("truck_id", ""), "Truck"
+            ),
+            "p_trailer_id": _optional_revenue_integer(
+                request.args.get("trailer_id", ""), "Trailer"
+            ),
+            "p_pallet_capacity": _optional_revenue_integer(
+                request.args.get("pallet_capacity", ""), "Pallet capacity"
+            ),
+            "p_search": search or None,
+            "p_page": page,
+            "p_page_size": page_size,
+            "p_sort_by": sort_by,
+            "p_sort_dir": sort_dir,
+            "p_bucket": bucket,
+        }
+        if start_date > end_date:
+            raise ValueError("Start date must be on or before end date.")
+        report = get_manager().revenue_dashboard(filters)
+    except ValueError as exc:
+        return _json_error(str(exc), 400)
+    except FleetManagementError as exc:
+        logger.warning("Could not load Revenue dashboard: %s", exc)
+        return _json_error(str(exc), 503)
+    return jsonify(report)
+
+
+@app.route("/api/revenue/trips/<int:trip_id>/status", methods=["POST"])
+def update_trip_revenue_status(trip_id: int) -> Any:
+    actor, error = _revenue_management_request()
+    if error:
+        return error
+    payload = _body()
+    status = _required_text(payload, "status").lower()
+    reason = _required_text(payload, "reason")
+    if status not in {"pending", "eligible", "cancelled"}:
+        return _json_error("Choose a supported revenue status.", 400)
+    if len(reason) > 1000:
+        return _json_error("Reason must be 1,000 characters or fewer.", 400)
+    try:
+        trip = get_manager().set_trip_revenue_status(
+            trip_id,
+            status,
+            reason,
+            str(actor["id"]),
+            str(actor.get("email") or ""),
+        )
+    except FleetManagementError as exc:
+        logger.warning("Could not update revenue status for trip %s: %s", trip_id, exc)
+        return _json_error(str(exc), 400)
+    return jsonify({"trip": trip})
+
+
+@app.route("/api/revenue/trips/<int:trip_id>/adjustments", methods=["POST"])
+def create_revenue_adjustment(trip_id: int) -> Any:
+    actor, error = _revenue_management_request()
+    if error:
+        return error
+    payload = _body()
+    try:
+        amount = Decimal(str(payload.get("amount", "")).strip())
+        if not amount.is_finite() or amount.quantize(Decimal("0.01")) != amount:
+            raise ValueError("Adjustment must be a finite amount with no more than two decimal places.")
+    except (InvalidOperation, ValueError) as exc:
+        return _json_error(str(exc) or "Enter a valid adjustment amount.", 400)
+    if amount == 0:
+        return _json_error("Adjustment must be non-zero.", 400)
+    reason = _required_text(payload, "reason")
+    if len(reason) > 1000:
+        return _json_error("Reason must be 1,000 characters or fewer.", 400)
+    try:
+        request_id = str(uuid.UUID(str(payload.get("idempotency_key", ""))))
+    except (ValueError, AttributeError) as exc:
+        return _json_error("Adjustment request identifier is invalid.", 400)
+    try:
+        adjustment = get_manager().add_revenue_adjustment(
+            trip_id,
+            amount,
+            reason,
+            str(actor["id"]),
+            request_id,
+        )
+    except FleetManagementError as exc:
+        logger.warning("Could not record revenue adjustment for trip %s: %s", trip_id, exc)
+        return _json_error(str(exc), 400)
+    return jsonify({"adjustment": adjustment}), 201
 
 
 @app.route("/api/payroll/export")
@@ -883,10 +1192,31 @@ def _create_record(resource: str, payload: dict[str, Any]) -> dict[str, Any]:
             model=_required_text(payload, "model"),
             year=_integer(payload, "year"),
             color=_optional_text(payload, "color"),
-            status=_optional_text(payload, "status") or "available",
+            status=_optional_text(payload, "status") or "active",
             odometer=_integer(payload, "odometer", 0),
             registration_expiry=_optional_text(payload, "registration_expiry"),
             insurance_expiry=_optional_text(payload, "insurance_expiry"),
+        )
+    if resource == "trailers":
+        return fleet.add_trailer(
+            plate_number=_required_text(payload, "plate_number"),
+            pallet_capacity=(
+                _integer(payload, "pallet_capacity")
+                if payload.get("pallet_capacity") not in (None, "")
+                else None
+            ),
+            trailer_type=_optional_text(payload, "trailer_type"),
+            status=_optional_text(payload, "status") or "active",
+            remarks=_optional_text(payload, "remarks"),
+            year_model=(
+                _integer(payload, "year_model")
+                if payload.get("year_model") not in (None, "")
+                else None
+            ),
+            make_model=_optional_text(payload, "make_model"),
+            mv_file_no=_optional_text(payload, "mv_file_no"),
+            engine_no=_optional_text(payload, "engine_no"),
+            chassis_no=_optional_text(payload, "chassis_no"),
         )
     if resource == "drivers":
         return fleet.add_driver(
@@ -917,24 +1247,25 @@ def _create_record(resource: str, payload: dict[str, Any]) -> dict[str, Any]:
         created_by = str(g.current_user["id"]) if _is_dispatcher() else None
         return fleet.add_fuel(
             vehicle_id=_integer(payload, "vehicle_id"),
-            fuel_type=_required_text(payload, "fuel_type"),
-            quantity=_number(payload, "quantity"),
-            price_per_liter=_number(payload, "price_per_liter"),
-            total_cost=(
-                _number(payload, "total_cost")
-                if payload.get("total_cost") not in (None, "")
-                else None
-            ),
+            fuel_type=_optional_text(payload, "fuel_type") or "diesel",
+            quantity=_optional_number(payload, "quantity"),
+            price_per_liter=_optional_number(payload, "price_per_liter"),
+            total_cost=_optional_number(payload, "total_cost"),
             logged_on=_optional_text(payload, "logged_on"),
             created_by=created_by,
+            trip_id=_integer(payload, "trip_id") if payload.get("trip_id") not in (None, "") else None,
+            fuel_allocation=_optional_number(payload, "fuel_allocation"),
+            actual_expense=_optional_number(payload, "actual_expense") or _optional_number(payload, "actual_fuel_expense"),
+            remarks=_optional_text(payload, "remarks") or _optional_text(payload, "fuel_remarks"),
         )
     if resource == "trips":
         origin = _required_text(payload, "origin")
         destination = _required_text(payload, "destination")
         shipment_date = _optional_text(payload, "shipment_date")
         created_by = str(g.current_user["id"]) if _is_dispatcher() else None
-        return fleet.add_trip(
-            vehicle_id=_integer(payload, "vehicle_id"),
+        truck_field = "truck_id" if payload.get("truck_id") not in (None, "") else "vehicle_id"
+        created_trip = fleet.add_trip(
+            vehicle_id=_integer(payload, truck_field),
             driver_id=_integer(payload, "driver_id"),
             route=f"{origin} to {destination}",
             start_odometer=0,
@@ -950,7 +1281,22 @@ def _create_record(resource: str, payload: dict[str, Any]) -> dict[str, Any]:
             trip_fuel=_optional_text(payload, "trip_fuel"),
             notes=_optional_text(payload, "notes"),
             created_by=created_by,
+            require_truck_rate=True,
+            trailer_id=_integer(payload, "trailer_id"),
+            fuel_allocation=_optional_number(payload, "fuel_allocation"),
+            actual_fuel_expense=(
+                _optional_number(payload, "actual_fuel_expense")
+                if payload.get("actual_fuel_expense") not in (None, "")
+                else _optional_number(payload, "actual_expense")
+            ),
+            fuel_remarks=_optional_text(payload, "fuel_remarks") or _optional_text(payload, "remarks"),
+            create_fuel_log=bool(payload.get("create_fuel_log")),
         )
+        if created_trip.get("manifest_object_path"):
+            created_trip["manifest_image_url"] = f"/api/trips/{created_trip['id']}/manifest"
+        if created_trip.get("fuel_invoice_object_path"):
+            created_trip["fuel_invoice_image_url"] = f"/api/trips/{created_trip['id']}/fuel-invoice"
+        return created_trip
     raise ValueError("Unknown resource")
 
 
@@ -1222,29 +1568,98 @@ def mark_all_notifications_read() -> Any:
     return jsonify({"updated": len(result.data or [])})
 
 
+@app.route("/api/trips/scan-manifest", methods=["POST"])
+def scan_manifest_route() -> Any:
+    file_storage = request.files.get("image") or request.files.get("manifest_image")
+    if file_storage is None or not getattr(file_storage, "filename", ""):
+        return _json_error("Attach a load-manifest image to scan.", 400)
+    try:
+        content = file_storage.read()
+        if not content:
+            raise ValueError("The selected manifest image is empty.")
+        result = scan_manifest_image(content, file_storage.filename)
+        return jsonify({"data": result})
+    except ValueError as exc:
+        return _json_error(str(exc), 400)
+    except Exception:
+        logger.exception("Could not process a load manifest image.")
+        return _json_error("The manifest image could not be processed. Please retry or enter the details manually.", 503)
+
+
 @app.route(
-    "/api/<any(vehicles,drivers,assignments,maintenance,fuel,trips):resource>",
+    "/api/<any(vehicles,trailers,drivers,assignments,maintenance,fuel,trips):resource>",
     methods=["POST"],
 )
 def create_record(resource: str) -> Any:
-    if resource not in {"vehicles", "drivers", "assignments", "maintenance", "fuel", "trips"}:
+    if resource not in {"vehicles", "trailers", "drivers", "assignments", "maintenance", "fuel", "trips"}:
         return jsonify({"error": "Unknown resource"}), 404
     try:
         record = _create_record(resource, _body())
     except ValueError as exc:
         return jsonify({"error": str(exc)}), 400
+    except TripRateValidationError as exc:
+        return _json_error(str(exc), 400)
     if _is_dispatcher() and resource in {"trips", "fuel", "maintenance"}:
         _create_dispatcher_notifications(resource, record, g.current_user or {})
     return jsonify({"data": record}), 201
 
 
+@app.route("/api/<any(vehicles,trailers):resource>/<int:record_id>", methods=["PATCH"])
+def update_fleet_asset(resource: str, record_id: int) -> Any:
+    if _is_dispatcher():
+        return _json_error("Dispatchers cannot modify fleet assets.", 403)
+    try:
+        payload = _body()
+        if resource == "vehicles":
+            values = {
+                "plate_number": _required_text(payload, "plate_number"),
+                "make": _required_text(payload, "make"),
+                "model": _required_text(payload, "model"),
+                "year": _integer(payload, "year"),
+                "color": _optional_text(payload, "color"),
+                "status": _required_text(payload, "status"),
+                "odometer": _integer(payload, "odometer", 0),
+                "registration_expiry": _optional_text(payload, "registration_expiry"),
+                "insurance_expiry": _optional_text(payload, "insurance_expiry"),
+            }
+            record = get_manager().update_vehicle(record_id, values)
+        else:
+            values = {
+                "plate_number": _required_text(payload, "plate_number"),
+                "pallet_capacity": (
+                    _integer(payload, "pallet_capacity")
+                    if payload.get("pallet_capacity") not in (None, "")
+                    else None
+                ),
+                "year_model": (
+                    _integer(payload, "year_model")
+                    if payload.get("year_model") not in (None, "")
+                    else None
+                ),
+                "make_model": _optional_text(payload, "make_model"),
+                "mv_file_no": _optional_text(payload, "mv_file_no"),
+                "engine_no": _optional_text(payload, "engine_no"),
+                "chassis_no": _optional_text(payload, "chassis_no"),
+                "trailer_type": _optional_text(payload, "trailer_type"),
+                "status": _required_text(payload, "status"),
+                "remarks": _optional_text(payload, "remarks"),
+            }
+            record = get_manager().update_trailer(record_id, values)
+    except ValueError as exc:
+        return _json_error(str(exc), 400)
+    except FleetManagementError as exc:
+        return _json_error(str(exc), 400)
+    return jsonify({"data": record})
+
+
 @app.route(
-    "/api/<any(vehicles,drivers,assignments,maintenance,fuel,trips):resource>/<int:record_id>",
+    "/api/<any(vehicles,trailers,drivers,assignments,maintenance,fuel,trips):resource>/<int:record_id>",
     methods=["DELETE"],
 )
 def delete_record(resource: str, record_id: int) -> Any:
     method_names = {
         "vehicles": "delete_vehicle",
+        "trailers": "delete_trailer",
         "drivers": "delete_driver",
         "assignments": "delete_assignment",
         "maintenance": "delete_maintenance",
@@ -1271,6 +1686,7 @@ def export_report() -> Any:
     if _is_dispatcher() and user_id:
         report = {
             "vehicles": fleet.list_vehicles(),
+            "trailers": fleet.list_trailers(),
             "drivers": fleet.list_drivers(),
             "assignments": fleet.list_assignments(),
             "trips": fleet.list_trips(user_id=user_id),
@@ -1281,6 +1697,7 @@ def export_report() -> Any:
     else:
         report = {
             "vehicles": fleet.list_vehicles(),
+            "trailers": fleet.list_trailers(),
             "drivers": fleet.list_drivers(),
             "assignments": fleet.list_assignments(),
             "trips": fleet.list_trips(),
@@ -1299,7 +1716,7 @@ def export_report() -> Any:
 @app.route("/api/export/trips")
 def export_trip_history() -> Any:
     group_by = request.args.get("group_by", "")
-    valid_group_fields = {"", "driver_name", "plate_number", "origin", "destination"}
+    valid_group_fields = {"", "driver_name", "plate_number", "truck_plate_number", "origin", "destination"}
     if group_by not in valid_group_fields:
         return _json_error("Choose a valid trip grouping.", 400)
 
