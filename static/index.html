@@ -122,6 +122,17 @@
           <section id="app-view" aria-live="polite" aria-busy="true">
             <div class="loading-card">Loading fleet information…</div>
           </section>
+          <dialog class="record-dialog image-preview-dialog" aria-labelledby="image-preview-title">
+            <div class="dialog-header">
+              <div><p class="eyebrow">IMAGE PREVIEW</p><h2 id="image-preview-title">Image preview</h2></div>
+              <button class="icon-button dialog-close" data-action="close-image-preview" type="button" aria-label="Close image preview">×</button>
+            </div>
+            <div class="fuel-invoice-full-preview">
+              <p class="fuel-invoice-image-loading" role="status" hidden>Loading image…</p>
+              <p class="fuel-invoice-image-error" role="alert" hidden>Image is unavailable.</p>
+              <img alt="Image preview" hidden />
+            </div>
+          </dialog>
         </main>
         <footer class="footer">
           <span>Good Luck Forwarding Systems Inc. · Fleet operations workspace</span>

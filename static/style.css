@@ -357,15 +357,21 @@ h2 { margin-bottom: 0; font-size: 15px; font-weight: 700; letter-spacing: -.3px;
 .records-panel { overflow: hidden; }
 .trips-report { width: 100%; }
 .trips-report .table-wrap { overflow-x: auto; }
-.trips-report table { min-width: 800px; table-layout: fixed; }
+.trips-report table { min-width: 840px; table-layout: fixed; }
 .trips-report th, .trips-report td { padding: 8px 10px; font-size: 11px; }
-.trips-report th:nth-child(1) { width: 11%; }
-.trips-report th:nth-child(2) { width: 14%; }
-.trips-report th:nth-child(3) { width: 27%; }
-.trips-report th:nth-child(4),
-.trips-report th:nth-child(5) { width: 15%; }
-.trips-report th:nth-child(6) { width: 18%; }
+.trips-report th:nth-child(2) { width: 11%; }
+.trips-report th:nth-child(3) { width: 14%; }
+.trips-report th:nth-child(4) { width: 27%; }
+.trips-report th:nth-child(5),
+.trips-report th:nth-child(6) { width: 15%; }
+.trips-report th:nth-child(7) { width: 18%; }
 .trips-report td { overflow: hidden; text-overflow: ellipsis; }
+.trips-report .trip-select-column { width: 38px; padding-inline: 6px; text-align: center; }
+.trip-select-column input { width: 15px; height: 15px; accent-color: var(--blue); cursor: pointer; }
+.trip-bulk-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 7px; margin: 0 0 9px; }
+.trip-bulk-actions .record-count { margin: 0 auto 0 0; }
+.trip-bulk-delete-button { color: var(--danger); }
+.trip-bulk-delete-button:hover:not(:disabled) { border-color: var(--danger); color: var(--danger); }
 .trip-table-hint { color: var(--muted); font-size: 11px; }
 .trip-view-tabs { display: flex; flex-wrap: wrap; gap: 7px; margin: 0 0 13px; }
 .trip-view-tab { min-height: 34px; padding: 0 12px; border: 1px solid var(--border); border-radius: var(--radius-control); background: var(--surface); color: var(--muted); cursor: pointer; font: inherit; font-size: 11px; font-weight: 600; }
@@ -559,6 +565,7 @@ tbody tr:hover { background: var(--table-hover); }
 .trip-manifest-preview { margin-top: 20px; }
 .trip-manifest-preview h3 { margin-bottom: 10px; font-size: 14px; }
 .trip-manifest-preview p { color: var(--muted); font-size: 12px; }
+.image-preview-button { display: block; width: 100%; padding: 0; border: 0; background: transparent; cursor: zoom-in; }
 .trip-manifest-preview img { display: block; width: 100%; max-height: 55vh; object-fit: contain; border: 1px solid var(--border); border-radius: var(--radius-inset); background: var(--surface-soft); }
 .fuel-allocation-section { margin-top: 22px; padding-top: 20px; border-top: 1px solid var(--border); }
 .fuel-allocation-heading, .fuel-record-heading { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
@@ -582,7 +589,7 @@ tbody tr:hover { background: var(--table-hover); }
 .fuel-invoice-thumbnail { display: block; max-width: min(100%, 240px); max-height: 180px; object-fit: contain; border-radius: var(--radius-sm); }
 .fuel-invoice-media p { margin: 0; }
 .fuel-invoice-image-error { color: var(--danger) !important; }
-.fuel-invoice-preview-dialog { width: min(94vw, 1100px); max-width: 1100px; }
+.image-preview-dialog { width: min(94vw, 1100px); max-width: 1100px; }
 .fuel-invoice-full-preview { display: grid; min-height: 180px; place-items: center; padding: 14px; overflow: auto; }
 .fuel-invoice-full-preview p { margin: 0; }
 .fuel-invoice-full-preview img { display: block; max-width: 100%; max-height: calc(88vh - 100px); object-fit: contain; }

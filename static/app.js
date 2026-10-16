@@ -158,7 +158,7 @@ const RESOURCE_CONFIG = {
       ["quantity", "Quantity", (value) => value != null ? `${formatNumber(value)} L` : "—"],
       ["total_cost", "Total Cost", (value) => value != null ? formatCurrency(value) : "—"],
       ["logged_on", "Date"],
-      ["invoice_image_url", "Receipt", formatImageLink],
+      ["invoice_image_url", "Receipt", (value) => formatImageLink(value, "Fuel invoice")],
     ],
   },
   trips: {
@@ -201,8 +201,8 @@ const RESOURCE_CONFIG = {
       ["load_details", "LOAD"],
       ["driver_name", "DRIVER"],
       ["trip_fuel", "TRIP/FUEL"],
-      ["manifest_image_url", "MANIFEST", formatImageLink],
-      ["fuel_invoice_image_url", "FUEL RECEIPT", formatImageLink],
+      ["manifest_image_url", "MANIFEST", (value) => formatImageLink(value, "Load manifest")],
+      ["fuel_invoice_image_url", "FUEL RECEIPT", (value) => formatImageLink(value, "Fuel invoice")],
     ],
   },
 };
@@ -214,9 +214,9 @@ function isoDate(date) {
   return `${year}-${month}-${day}`;
 }
 
-function formatImageLink(url) {
+function formatImageLink(url, label = "Image") {
   return url
-    ? `<a href="${escapeHtml(url)}" target="_blank" rel="noopener">View image</a>`
+    ? `<button class="text-button image-preview-link" type="button" data-action="preview-image" data-image-url="${escapeHtml(url)}" data-image-title="${escapeHtml(label)}" data-image-alt="${escapeHtml(label)}">View image</button>`
     : "—";
 }
 
@@ -273,6 +273,8 @@ const state = {
     selectedTripId: "",
   },
   tripsGroupBy: "",
+  selectedTripIds: new Set(),
+  bulkDeletingTrips: false,
   vehicleSection: "trucks",
   editingTrip: null,
   tripWizard: {
@@ -678,9 +680,15 @@ function tableMarkup(rows, columns, resource, options = {}) {
   if (!rows.length) {
     return `<div class="empty-state"><span aria-hidden="true">⌁</span><strong>${escapeHtml(options.empty || "Nothing here yet")}</strong><small>Records you add will appear here.</small></div>`;
   }
+  const selectionHeader = options.selectTrips
+    ? '<th class="trip-select-column" scope="col"><span class="sr-only">Select trip</span></th>'
+    : "";
   const headings = columns.map(([, label]) => `<th scope="col">${escapeHtml(label)}</th>`).join("");
   const actionHeader = resource ? '<th class="action-column" scope="col">Action</th>' : "";
   const body = rows.map((row) => {
+    const selectionCell = options.selectTrips
+      ? `<td class="trip-select-column" data-label="Select trip"><input type="checkbox" data-trip-select="${escapeHtml(row.id)}" aria-label="Select trip ${escapeHtml(row.ism_no || row.id)}" ${state.selectedTripIds.has(String(row.id)) ? "checked" : ""} ${state.bulkDeletingTrips ? "disabled" : ""} /></td>`
+      : "";
     const cells = columns.map(([key, label, formatter]) => {
       const value = formatter ? formatter(row[key], row) : escapeHtml(row[key] ?? "—");
       return `<td data-label="${escapeHtml(label)}">${value}</td>`;
@@ -691,9 +699,9 @@ function tableMarkup(rows, columns, resource, options = {}) {
     const rowAttributes = options.rowAction
         ? `tabindex="0" role="button" class="clickable-row" data-action="${escapeHtml(options.rowAction)}" data-id="${escapeHtml(row.id)}" data-record-id="${escapeHtml(row.id)}" aria-label="${escapeHtml(options.rowLabel ? options.rowLabel(row) : `View trip ${row.ism_no || row.id}`)}"`
         : (resource ? `data-record-id="${escapeHtml(row.id)}"` : "");
-    return `<tr ${rowAttributes}>${cells}${action}</tr>`;
+    return `<tr ${rowAttributes}>${selectionCell}${cells}${action}</tr>`;
   }).join("");
-  return `<div class="table-wrap"><table><thead><tr>${headings}${actionHeader}</tr></thead><tbody>${body}</tbody></table></div>`;
+  return `<div class="table-wrap"><table><thead><tr>${selectionHeader}${headings}${actionHeader}</tr></thead><tbody>${body}</tbody></table></div>`;
 }
 
 function panel(title, content, link = "") {
@@ -979,10 +987,16 @@ function groupedTripMarkup(rows, config) {
   ];
   const selectedGroup = groupOptions.find(([key]) => key === state.tripsGroupBy);
   if (!selectedGroup) {
-    return tableMarkup(rows, TRIP_HISTORY_COLUMNS, null, {
-      empty: "No trip records",
-      rowAction: "trip-details",
-    });
+    return tableMarkup(
+      rows,
+      TRIP_HISTORY_COLUMNS,
+      state.data.user?.role === "dispatcher" ? null : config.api,
+      {
+        empty: "No trip records",
+        rowAction: "trip-details",
+        selectTrips: state.data.user?.role !== "dispatcher",
+      },
+    );
   }
 
   const [groupKey, groupLabel] = selectedGroup;
@@ -1001,10 +1015,16 @@ function groupedTripMarkup(rows, config) {
           <h3>${escapeHtml(groupName)}</h3>
           <span class="record-count">${formatNumber(trips.length)} ${trips.length === 1 ? "trip" : "trips"}</span>
         </div>
-        ${tableMarkup(trips, TRIP_HISTORY_COLUMNS, null, {
-          empty: "No trip records",
-          rowAction: "trip-details",
-        })}
+        ${tableMarkup(
+          trips,
+          TRIP_HISTORY_COLUMNS,
+          state.data.user?.role === "dispatcher" ? null : config.api,
+          {
+            empty: "No trip records",
+            rowAction: "trip-details",
+            selectTrips: state.data.user?.role !== "dispatcher",
+          },
+        )}
       </section>`)
     .join("") || `<p class="trip-empty">No trip records</p>`;
 }
@@ -1017,17 +1037,6 @@ function tripDetailsDialogMarkup() {
         <button class="icon-button dialog-close" data-action="close-trip-details" type="button" aria-label="Close trip details">×</button>
       </div>
       <div class="trip-details-content"></div>
-    </dialog>
-    <dialog class="record-dialog fuel-invoice-preview-dialog" aria-labelledby="fuel-invoice-preview-title">
-      <div class="dialog-header">
-        <div><p class="eyebrow">FUEL INVOICE</p><h2 id="fuel-invoice-preview-title">Invoice preview</h2></div>
-        <button class="icon-button dialog-close" data-action="close-fuel-invoice-preview" type="button" aria-label="Close invoice preview">×</button>
-      </div>
-      <div class="fuel-invoice-full-preview">
-        <p class="fuel-invoice-image-loading" role="status" hidden>Loading invoice image…</p>
-        <p class="fuel-invoice-image-error" role="alert" hidden>Invoice image is unavailable.</p>
-        <img alt="Fuel invoice preview" hidden />
-      </div>
     </dialog>`;
 }
 
@@ -1609,6 +1618,12 @@ function renderResource(page) {
   const config = RESOURCE_CONFIG[page];
   const listKey = page === "fuel" ? "fuel_logs" : page;
   const rows = filterRows(state.data[listKey], config.columns);
+  if (page === "trips") {
+    const visibleTripIds = new Set(rows.map((trip) => String(trip.id)));
+    state.selectedTripIds = new Set(
+      [...state.selectedTripIds].filter((tripId) => visibleTripIds.has(tripId)),
+    );
+  }
   const hasOptions = config.fields.some((field) =>
     ["vehicle", "truck", "trailer", "driver"].includes(field.type),
   );
@@ -1638,6 +1653,13 @@ function renderResource(page) {
           <button class="trip-view-tab ${state.tripsGroupBy === "origin" ? "trip-view-tab-active" : ""}" type="button" data-action="trip-group" data-group-by="origin" aria-pressed="${state.tripsGroupBy === "origin"}">By origin</button>
           <button class="trip-view-tab ${state.tripsGroupBy === "destination" ? "trip-view-tab-active" : ""}" type="button" data-action="trip-group" data-group-by="destination" aria-pressed="${state.tripsGroupBy === "destination"}">By destination</button>
         </nav>
+        ${state.data.user?.role !== "dispatcher" ? `
+          <div class="trip-bulk-actions" aria-label="Bulk trip actions">
+            <span class="record-count" aria-live="polite">${formatNumber(state.selectedTripIds.size)} selected</span>
+            <button class="button button-secondary button-small" type="button" data-action="select-visible-trips" ${rows.length && !state.bulkDeletingTrips ? "" : "disabled"}>Select all ${formatNumber(rows.length)} visible</button>
+            <button class="button button-secondary button-small" type="button" data-action="clear-trip-selection" ${state.selectedTripIds.size && !state.bulkDeletingTrips ? "" : "disabled"}>Clear selection</button>
+            <button class="button button-secondary button-small trip-bulk-delete-button" type="button" data-action="bulk-delete-trips" ${state.selectedTripIds.size && !state.bulkDeletingTrips ? "" : "disabled"}>${state.bulkDeletingTrips ? "Deleting…" : "Delete selected"}</button>
+          </div>` : ""}
         <p class="record-count trip-table-hint">${formatNumber(rows.length)} ${rows.length === 1 ? "record" : "records"} · Select a trip to view full details</p>
         <div class="trip-view-content">
           ${groupedTripMarkup(rows, config)}
@@ -2519,7 +2541,8 @@ function fuelInvoiceMarkup(record, tripTitle) {
   const recordId = escapeHtml(record.id);
   return `
     <div class="fuel-invoice-media">
-      <button class="fuel-invoice-image-button" type="button" data-action="preview-fuel-invoice"
+      <button class="fuel-invoice-image-button" type="button" data-action="preview-image"
+        data-image-title="Fuel invoice"
         data-image-url="${imageUrl}" data-image-alt="Fuel invoice for ${escapeHtml(tripTitle)} (record #${recordId})"
         aria-label="Enlarge fuel invoice for record ${recordId}" disabled>
         <img class="fuel-invoice-thumbnail" src="${imageUrl}" alt="Fuel invoice thumbnail for ${escapeHtml(tripTitle)}"
@@ -2555,6 +2578,41 @@ function updateFuelInvoiceImageState(container) {
       else markUnavailable();
     }
   });
+}
+
+function openImagePreview(button) {
+  const previewDialog = document.querySelector(".image-preview-dialog");
+  const previewImage = previewDialog?.querySelector("img");
+  const loading = previewDialog?.querySelector(".fuel-invoice-image-loading");
+  const error = previewDialog?.querySelector(".fuel-invoice-image-error");
+  if (!previewDialog || !previewImage || !loading || !error) return;
+
+  previewDialog.querySelector("#image-preview-title").textContent =
+    `${button.dataset.imageTitle || "Image"} preview`;
+  previewImage.hidden = true;
+  loading.hidden = false;
+  error.hidden = true;
+  previewImage.alt = button.dataset.imageAlt || button.dataset.imageTitle || "Image preview";
+  previewImage.onload = () => {
+    previewImage.hidden = false;
+    loading.hidden = true;
+  };
+  previewImage.onerror = () => {
+    previewImage.hidden = true;
+    loading.hidden = true;
+    error.hidden = false;
+  };
+  previewImage.src = button.dataset.imageUrl;
+  if (previewImage.complete) {
+    if (previewImage.naturalWidth > 0) {
+      previewImage.hidden = false;
+      loading.hidden = true;
+    } else {
+      loading.hidden = true;
+      error.hidden = false;
+    }
+  }
+  if (!previewDialog.open) previewDialog.showModal();
 }
 
 function tripFuelDetailsMarkup(trip, tripTitle) {
@@ -2676,9 +2734,11 @@ function openTripDetails(tripId) {
   const imageMarkup = trip.manifest_image_url
     ? `<section class="trip-manifest-preview">
         <h3>Load manifest</h3>
-        <a href="${escapeHtml(trip.manifest_image_url)}" target="_blank" rel="noopener">
+        <button class="image-preview-button" type="button" data-action="preview-image"
+          data-image-url="${escapeHtml(trip.manifest_image_url)}" data-image-title="Load manifest"
+          data-image-alt="Load manifest for ${escapeHtml(title)}">
           <img src="${escapeHtml(trip.manifest_image_url)}" alt="Load manifest for ${escapeHtml(title)}" />
-        </a>
+        </button>
       </section>`
     : `<section class="trip-manifest-preview"><h3>Load manifest</h3><p>No manifest image uploaded yet.</p></section>`;
   const editFields = RESOURCE_CONFIG.trips.fields
@@ -3006,6 +3066,43 @@ async function deleteRecord(button) {
   }
 }
 
+async function deleteSelectedTrips(button) {
+  const selectedIds = [...state.selectedTripIds];
+  if (!selectedIds.length || state.bulkDeletingTrips) return;
+  const count = selectedIds.length;
+  if (!window.confirm(
+    `Delete ${count} selected ${count === 1 ? "trip" : "trips"}? This cannot be undone. Trips referenced by payroll records may not be deletable.`,
+  )) return;
+
+  state.bulkDeletingTrips = true;
+  button.disabled = true;
+  const failures = [];
+  let deletedCount = 0;
+  for (const tripId of selectedIds) {
+    try {
+      await api(`/api/trips/${encodeURIComponent(tripId)}`, { method: "DELETE" });
+      removeResourceRecord("trips", tripId);
+      state.selectedTripIds.delete(tripId);
+      deletedCount += 1;
+    } catch (error) {
+      failures.push({ tripId, message: error.message });
+    }
+  }
+  state.bulkDeletingTrips = false;
+  render();
+  if (failures.length) {
+    const failureDetails = failures
+      .map(({ tripId, message }) => `#${tripId}: ${message}`)
+      .join("; ");
+    showToast(
+      `Deleted ${deletedCount} of ${count} trips. Could not delete ${failureDetails}`,
+      "error",
+    );
+  } else {
+    showToast(`${deletedCount} ${deletedCount === 1 ? "trip" : "trips"} deleted.`);
+  }
+}
+
 async function submitPayrollForm(form) {
   const values = Object.fromEntries(new FormData(form).entries());
   const submit = form.querySelector('button[type="submit"]');
@@ -3296,11 +3393,6 @@ view.addEventListener("input", (event) => {
 });
 
 view.addEventListener("click", (event) => {
-  const invoiceDialog = event.target.closest(".fuel-invoice-preview-dialog");
-  if (invoiceDialog && event.target === invoiceDialog) {
-    invoiceDialog.close();
-    return;
-  }
   const button = event.target.closest("[data-action]");
   if (!button) return;
   if (button.dataset.action === "fleet-section") {
@@ -3360,7 +3452,7 @@ view.addEventListener("click", (event) => {
     return;
   }
   if (button.dataset.action === "trip-details") {
-    if (event.target.closest("a, button")) return;
+    if (event.target.closest("a, button, input")) return;
     openTripDetails(button.dataset.id);
     return;
   }
@@ -3425,6 +3517,19 @@ view.addEventListener("click", (event) => {
     state.tripsGroupBy = button.dataset.groupBy || "";
     render();
   }
+  if (button.dataset.action === "select-visible-trips") {
+    for (const trip of filterRows(state.data.trips, RESOURCE_CONFIG.trips.columns)) {
+      state.selectedTripIds.add(String(trip.id));
+    }
+    render();
+  }
+  if (button.dataset.action === "clear-trip-selection") {
+    state.selectedTripIds.clear();
+    render();
+  }
+  if (button.dataset.action === "bulk-delete-trips") {
+    deleteSelectedTrips(button);
+  }
   if (button.dataset.action === "new-record") {
     const isTrips = state.page === "trips";
     const dialog = isTrips
@@ -3440,39 +3545,6 @@ view.addEventListener("click", (event) => {
     button.closest("dialog")?.close();
   }
   if (button.dataset.action === "close-trip-details") {
-    button.closest("dialog")?.close();
-  }
-  if (button.dataset.action === "preview-fuel-invoice") {
-    const previewDialog = view.querySelector(".fuel-invoice-preview-dialog");
-    const previewImage = previewDialog.querySelector("img");
-    const loading = previewDialog.querySelector(".fuel-invoice-image-loading");
-    const error = previewDialog.querySelector(".fuel-invoice-image-error");
-    previewImage.hidden = true;
-    loading.hidden = false;
-    error.hidden = true;
-    previewImage.alt = button.dataset.imageAlt || "Fuel invoice preview";
-    previewImage.onload = () => {
-      previewImage.hidden = false;
-      loading.hidden = true;
-    };
-    previewImage.onerror = () => {
-      previewImage.hidden = true;
-      loading.hidden = true;
-      error.hidden = false;
-    };
-    previewImage.src = button.dataset.imageUrl;
-    if (previewImage.complete) {
-      if (previewImage.naturalWidth > 0) {
-        previewImage.hidden = false;
-        loading.hidden = true;
-      } else {
-        loading.hidden = true;
-        error.hidden = false;
-      }
-    }
-    if (!previewDialog.open) previewDialog.showModal();
-  }
-  if (button.dataset.action === "close-fuel-invoice-preview") {
     button.closest("dialog")?.close();
   }
   if (button.dataset.action === "close-fleet-edit") {
@@ -3493,6 +3565,20 @@ view.addEventListener("click", (event) => {
     form.closest(".trip-details-content").querySelector('[data-action="edit-trip"]').hidden = false;
   }
   if (button.dataset.action === "delete") deleteRecord(button);
+});
+
+document.addEventListener("click", (event) => {
+  const button = event.target.closest("[data-action]");
+  if (button?.dataset.action === "preview-image") {
+    openImagePreview(button);
+    return;
+  }
+  if (button?.dataset.action === "close-image-preview") {
+    button.closest("dialog")?.close();
+    return;
+  }
+  const previewDialog = event.target.closest(".image-preview-dialog");
+  if (previewDialog && event.target === previewDialog) previewDialog.close();
 });
 
 function cancelTripWizard(form) {
@@ -3557,12 +3643,19 @@ view.addEventListener("keydown", (event) => {
     return;
   }
   const row = event.target.closest('tr[data-action="trip-details"]');
-  if (!row || !["Enter", " "].includes(event.key)) return;
+  if (!row || event.target.matches("input") || !["Enter", " "].includes(event.key)) return;
   event.preventDefault();
   openTripDetails(row.dataset.id);
 });
 
 view.addEventListener("change", (event) => {
+  if (event.target.matches("[data-trip-select]")) {
+    const tripId = String(event.target.dataset.tripSelect);
+    if (event.target.checked) state.selectedTripIds.add(tripId);
+    else state.selectedTripIds.delete(tripId);
+    render();
+    return;
+  }
   const wizardForm = event.target.closest(".trip-wizard-form");
   if (wizardForm) return;
   const tripForm = event.target.closest('form[data-form="trips"], .trip-edit-form');
