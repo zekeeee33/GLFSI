@@ -295,6 +295,8 @@ const state = {
 const view = document.querySelector("#app-view");
 const appShell = document.querySelector(".app-shell");
 const sidebarToggle = document.querySelector("#sidebar-collapse");
+const mobileNavToggle = document.querySelector("#mobile-nav-toggle");
+const navigation = document.querySelector("#main-navigation");
 
 view.addEventListener("toggle", (event) => {
   if (event.target.matches?.("details[data-revenue-filters]")) {
@@ -314,6 +316,54 @@ function setSidebarCollapsed(collapsed) {
   sidebarToggle.title = collapsed ? "Expand navigation" : "Collapse navigation";
 }
 
+function closeMegaMenu(restoreFocus = false) {
+  const openGroup = navigation.querySelector(".nav-group.is-open");
+  navigation.querySelectorAll("[data-nav-category]").forEach((group) => {
+    group.classList.remove("is-open");
+    const toggle = group.querySelector(".nav-category-toggle");
+    const panel = group.querySelector(".nav-mega-panel");
+    toggle.setAttribute("aria-expanded", "false");
+    panel.hidden = true;
+    panel.style.removeProperty("left");
+    panel.style.removeProperty("top");
+    panel.style.removeProperty("width");
+  });
+  if (restoreFocus && openGroup) openGroup.querySelector(".nav-category-toggle").focus();
+}
+
+function positionMegaMenu(group) {
+  const panel = group.querySelector(".nav-mega-panel");
+  const toggle = group.querySelector(".nav-category-toggle");
+  const toggleRect = toggle.getBoundingClientRect();
+  let left = toggleRect.right + 12;
+  let width = Math.min(540, window.innerWidth - left - 16);
+  if (width < 360) {
+    left = 8;
+    width = Math.min(540, window.innerWidth - 16);
+  }
+  panel.style.left = `${left}px`;
+  panel.style.width = `${width}px`;
+  panel.style.top = "12px";
+  const panelHeight = panel.getBoundingClientRect().height;
+  const top = Math.min(Math.max(12, toggleRect.top - 12), window.innerHeight - panelHeight - 12);
+  panel.style.top = `${Math.max(12, top)}px`;
+}
+
+function openMegaMenu(group) {
+  closeMegaMenu();
+  group.classList.add("is-open");
+  const toggle = group.querySelector(".nav-category-toggle");
+  const panel = group.querySelector(".nav-mega-panel");
+  toggle.setAttribute("aria-expanded", "true");
+  panel.hidden = false;
+  if (!window.matchMedia("(max-width: 760px)").matches) positionMegaMenu(group);
+}
+
+function setMobileNavigationOpen(open) {
+  document.querySelector(".sidebar").classList.toggle("is-mobile-open", open);
+  mobileNavToggle.setAttribute("aria-expanded", String(open));
+}
+
 let sidebarInitiallyCollapsed = false;
 try {
   sidebarInitiallyCollapsed = localStorage.getItem("glfs-sidebar-collapsed") === "true";
@@ -328,6 +378,60 @@ sidebarToggle.addEventListener("click", () => {
     localStorage.setItem("glfs-sidebar-collapsed", String(collapsed));
   } catch {
     // The navigation remains usable for this page if preference storage is unavailable.
+  }
+  closeMegaMenu();
+});
+
+mobileNavToggle.addEventListener("click", () => {
+  const open = mobileNavToggle.getAttribute("aria-expanded") !== "true";
+  setMobileNavigationOpen(open);
+  if (!open) closeMegaMenu();
+});
+
+navigation.addEventListener("click", (event) => {
+  const toggle = event.target.closest(".nav-category-toggle");
+  if (toggle) {
+    const group = toggle.closest("[data-nav-category]");
+    if (toggle.getAttribute("aria-expanded") === "true") {
+      closeMegaMenu();
+    } else {
+      openMegaMenu(group);
+    }
+    return;
+  }
+  if (event.target.closest(".nav-link")) {
+    closeMegaMenu();
+    setMobileNavigationOpen(false);
+  }
+});
+
+document.addEventListener("click", (event) => {
+  if (!navigation.contains(event.target)) closeMegaMenu();
+  if (!document.querySelector(".sidebar").contains(event.target)) setMobileNavigationOpen(false);
+});
+
+document.addEventListener("keydown", (event) => {
+  if (event.key !== "Escape") return;
+  const hadOpenMenu = Boolean(navigation.querySelector(".nav-group.is-open"));
+  const hadOpenDrawer = mobileNavToggle.getAttribute("aria-expanded") === "true";
+  if (!hadOpenMenu && !hadOpenDrawer) return;
+  closeMegaMenu(hadOpenMenu && !hadOpenDrawer);
+  if (hadOpenDrawer) {
+    setMobileNavigationOpen(false);
+    mobileNavToggle.focus();
+  }
+});
+
+window.addEventListener("resize", () => {
+  const openGroup = navigation.querySelector(".nav-group.is-open");
+  if (!openGroup) return;
+  if (window.matchMedia("(max-width: 760px)").matches) {
+    const panel = openGroup.querySelector(".nav-mega-panel");
+    panel.style.removeProperty("left");
+    panel.style.removeProperty("top");
+    panel.style.removeProperty("width");
+  } else {
+    positionMegaMenu(openGroup);
   }
 });
 
@@ -1253,7 +1357,7 @@ function wizardFieldsMarkup(config, names) {
   }).join("");
 }
 
-function tripCreationWizardMarkup(config, needsReferences) {
+function tripCreationWizardMarkup(config, needsReferences, standalone = false) {
   const steps = TRIP_WIZARD_STEPS.map((step, index) => `
     <li class="trip-wizard-progress-item">
       <button class="trip-wizard-progress-step" type="button" data-action="trip-wizard-go-step"
@@ -1271,13 +1375,18 @@ function tripCreationWizardMarkup(config, needsReferences) {
   const fuelFields = wizardFieldsMarkup(config, [
     "fuel_allocation", "actual_fuel_expense", "invoice_image", "fuel_remarks",
   ]);
+  const cancelLabel = standalone ? "Back to Trips" : "Cancel";
+  const wrapper = standalone
+    ? `<section class="trip-wizard-page" aria-labelledby="trip-wizard-title">`
+    : `<dialog class="record-dialog trip-wizard-dialog" aria-labelledby="trip-wizard-title">`;
+  const closeTag = standalone ? "</section>" : "</dialog>";
+  const closeButton = standalone
+    ? `<a class="button button-secondary trip-wizard-cancel" href="/#trips" data-action="trip-wizard-cancel">${cancelLabel}</a>`
+    : `<button class="icon-button dialog-close" data-action="trip-wizard-cancel" type="button" aria-label="Cancel trip creation">×</button>`;
 
   return `
-    <dialog class="record-dialog trip-wizard-dialog" aria-labelledby="trip-wizard-title">
-      <div class="dialog-header">
-        <div><p class="eyebrow">NEW TRIP · STEP <span data-wizard-current-step>1</span> OF ${TRIP_WIZARD_STEPS.length}</p><h2 id="trip-wizard-title">Trip Details</h2></div>
-        <button class="icon-button dialog-close" data-action="trip-wizard-cancel" type="button" aria-label="Cancel trip creation">×</button>
-      </div>
+    ${wrapper}
+      ${standalone ? `<div class="page-heading"><div><p class="eyebrow">DISPATCHER</p><h1 id="trip-wizard-title">Add New Trip</h1><p class="page-description">Create a shipment record, confirm its route and rate, then save the trip and any supporting document.</p></div><a class="button button-secondary" href="#trips">Back to Trips</a></div>` : `<div class="dialog-header"><div><p class="eyebrow">NEW TRIP · STEP <span data-wizard-current-step>1</span> OF ${TRIP_WIZARD_STEPS.length}</p><h2 id="trip-wizard-title">Trip Details</h2></div>${closeButton}</div>`}
       <form class="trip-wizard-form" data-form="trips" novalidate>
         <div class="trip-wizard-content">
           <div class="trip-wizard-progress-wrap">
@@ -1330,13 +1439,13 @@ function tripCreationWizardMarkup(config, needsReferences) {
           <p class="dialog-error trip-wizard-error" role="alert" hidden></p>
           <div class="trip-wizard-actions">
             <button class="button button-secondary trip-wizard-back" data-action="trip-wizard-back" type="button" hidden>Back</button>
-            <button class="button button-secondary trip-wizard-cancel" data-action="trip-wizard-cancel" type="button">Cancel</button>
+            <button class="button button-secondary trip-wizard-cancel" data-action="trip-wizard-cancel" type="button">${cancelLabel}</button>
             <button class="button button-secondary trip-wizard-continue" data-action="trip-wizard-continue" type="button">Continue</button>
             <button class="button button-primary trip-wizard-submit" data-action="trip-wizard-submit" type="button" hidden ${needsReferences ? "disabled" : ""}>Confirm and Save Trip</button>
           </div>
         </div>
       </form>
-    </dialog>`;
+    ${closeTag}`;
 }
 
 function tripWizardForm() {
@@ -1449,8 +1558,17 @@ function updateTripWizard(form) {
     panel.hidden = index !== step;
   });
   const dialog = form.closest(".trip-wizard-dialog");
-  dialog.querySelector("[data-wizard-current-step]").textContent = String(step + 1);
-  dialog.querySelector("#trip-wizard-title").textContent = current.title;
+  if (dialog) {
+    const stepMarker = dialog.querySelector("[data-wizard-current-step]");
+    const title = dialog.querySelector("#trip-wizard-title");
+    if (stepMarker) stepMarker.textContent = String(step + 1);
+    if (title) title.textContent = current.title;
+  }
+  const isStandalonePage = window.location.pathname === "/dispatcher/add-trip";
+  if (isStandalonePage) {
+    const title = form.closest(".trip-wizard-page")?.querySelector("#trip-wizard-title");
+    if (title) title.textContent = current.title;
+  }
   form.querySelector(".trip-wizard-progress-bar").value = step + 1;
   form.querySelectorAll(".trip-wizard-progress-step").forEach((button, index) => {
     button.classList.toggle("is-complete", index < step);
@@ -2415,32 +2533,57 @@ function renderPayroll() {
 
 function render() {
   if (!state.data) return;
-  state.page = location.hash.slice(1) in TITLES ? location.hash.slice(1) : "dashboard";
+  navigation.hidden = false;
+  const isDedicatedAddTripPage =
+    window.location.pathname === "/dispatcher/add-trip" && !window.location.hash;
   const dispatcherPages = new Set(["dashboard", "trips", "fuel", "maintenance"]);
   const isDispatcher = state.data.user?.role === "dispatcher";
+  if (isDedicatedAddTripPage) {
+    state.page = "trips";
+  } else {
+    state.page = location.hash.slice(1) in TITLES ? location.hash.slice(1) : "dashboard";
+  }
   if (isDispatcher && !dispatcherPages.has(state.page)) {
     location.hash = "dashboard";
     state.page = "dashboard";
   }
   document.querySelectorAll(".nav-link").forEach((link) => {
-    link.hidden = isDispatcher && !dispatcherPages.has(link.dataset.page);
+    link.hidden = (isDispatcher && link.dataset.page && !dispatcherPages.has(link.dataset.page))
+      || (link.dataset.role === "administrator" && isDispatcher);
   });
   document.querySelectorAll(".nav-group").forEach((group) => {
     group.hidden = !group.querySelector(".nav-link:not([hidden])");
   });
-  document.querySelector(".topbar > .button[href='/api/export']")?.toggleAttribute("hidden", isDispatcher);
   document.title = `${TITLES[state.page]} · Good Luck Forwarding Systems Inc.`;
-  document.querySelectorAll(".nav-link").forEach((link) => {
-    const active = link.dataset.page === state.page;
+  const isAddTripRoute =
+    window.location.pathname === "/dispatcher/add-trip" && !window.location.hash;
+  document.querySelectorAll(".nav-link[data-page]").forEach((link) => {
+    const active = link.dataset.navRoute === "add-trip"
+      ? isAddTripRoute
+      : !link.dataset.navRoute && link.dataset.page === state.page && !isAddTripRoute;
     link.classList.toggle("active", active);
     if (active) link.setAttribute("aria-current", "page");
     else link.removeAttribute("aria-current");
   });
-  view.innerHTML = state.page === "dashboard"
-    ? renderDashboard()
-    : state.page === "payroll" ? renderPayroll()
-      : state.page === "revenue" ? revenueDashboardMarkup(state.revenue.report)
-        : renderResource(state.page);
+  document.querySelectorAll("[data-nav-category]").forEach((group) => {
+    group.classList.toggle("has-active-page", Boolean(group.querySelector(".nav-link.active")));
+  });
+  if (isDedicatedAddTripPage) {
+    const config = RESOURCE_CONFIG.trips;
+    const needsReferences = config.fields.some(
+      (field) =>
+        (field.type === "truck" && !state.data.vehicles.some((item) => ["active", "available", "assigned"].includes(item.status))) ||
+        (field.type === "trailer" && !(state.data.trailers || []).some((item) => item.status === "active")) ||
+        (field.type === "driver" && !state.data.drivers.length),
+    );
+    view.innerHTML = tripCreationWizardMarkup(config, needsReferences, true);
+  } else {
+    view.innerHTML = state.page === "dashboard"
+      ? renderDashboard()
+      : state.page === "payroll" ? renderPayroll()
+        : state.page === "revenue" ? revenueDashboardMarkup(state.revenue.report)
+          : renderResource(state.page);
+  }
   if (state.page === "revenue" && !state.revenue.loading
       && state.revenue.reportKey !== revenueQueryKey()) {
     loadRevenueReport();
@@ -2455,9 +2598,11 @@ function render() {
     }
     refreshTripDestinationOptions(wizardForm);
     updateTripWizard(wizardForm);
-    wizardForm.closest(".trip-wizard-dialog").addEventListener("close", () => {
-      resetTripWizard(wizardForm);
-    });
+    if (!window.location.pathname.endsWith("/dispatcher/add-trip")) {
+      wizardForm.closest(".trip-wizard-dialog").addEventListener("close", () => {
+        resetTripWizard(wizardForm);
+      });
+    }
   }
   if (state.notificationTarget?.module === state.page) {
     const recordRow = [...view.querySelectorAll("[data-record-id]")].find(
@@ -2883,12 +3028,13 @@ async function submitTripWizard(form) {
   }
   const saveButton = form.querySelector(".trip-wizard-submit");
   const saveError = form.querySelector(".trip-wizard-save-error");
+  const dialog = form.closest(".trip-wizard-dialog");
   saveError.hidden = true;
   saveError.textContent = "";
   state.tripWizard.submitting = true;
   saveButton.disabled = true;
   saveButton.textContent = state.tripWizard.createdTripId ? "Retrying uploads…" : "Saving trip…";
-  form.closest(".trip-wizard-dialog").setAttribute("aria-busy", "true");
+  if (dialog) dialog.setAttribute("aria-busy", "true");
   try {
     let tripId = state.tripWizard.createdTripId;
     if (!tripId) {
@@ -2961,8 +3107,12 @@ async function submitTripWizard(form) {
       showToast(`Trip saved, but the trip list could not be refreshed: ${refreshError.message}`, "error");
     }
     const dialog = form.closest(".trip-wizard-dialog");
-    dialog.close();
+    if (dialog && typeof dialog.close === "function") dialog.close();
     render();
+    if (window.location.pathname === "/dispatcher/add-trip") {
+      window.location.href = "/#trips";
+      return;
+    }
     showToast("Trip saved successfully.");
   } catch (error) {
     saveError.textContent = state.tripWizard.createdTripId
@@ -2971,7 +3121,8 @@ async function submitTripWizard(form) {
     saveError.hidden = false;
   } finally {
     state.tripWizard.submitting = false;
-    form.closest(".trip-wizard-dialog").removeAttribute("aria-busy");
+    const dialog = form.closest(".trip-wizard-dialog");
+    if (dialog) dialog.removeAttribute("aria-busy");
     if (saveButton.isConnected) {
       saveButton.disabled = false;
       saveButton.textContent = "Confirm and Save Trip";
@@ -3585,11 +3736,16 @@ function cancelTripWizard(form) {
   if (state.tripWizard.submitting) return;
   if (state.tripWizard.dirty) {
     const message = state.tripWizard.createdTripId
-      ? `Trip #${state.tripWizard.createdTripId} is already saved. Close this wizard and discard any remaining image retry?`
+      ? `Trip #${state.tripWizard.createdTripId} is already saved. Leave this page and discard any remaining image retry?`
       : "Discard the trip information entered so far?";
     if (!window.confirm(message)) return;
   }
-  form.closest(".trip-wizard-dialog").close();
+  if (window.location.pathname === "/dispatcher/add-trip") {
+    window.location.href = "/#trips";
+    return;
+  }
+  const dialog = form.closest(".trip-wizard-dialog");
+  if (dialog) dialog.close();
 }
 
 view.addEventListener("cancel", (event) => {
@@ -3838,8 +3994,12 @@ document.querySelector("#sign-out").addEventListener("click", async (event) => {
 window.addEventListener("hashchange", () => {
   state.search = "";
   window.clearTimeout(searchRenderTimer);
+  closeMegaMenu();
+  setMobileNavigationOpen(false);
   render();
 });
 
-if (!location.hash) location.hash = "dashboard";
+if (!location.hash && window.location.pathname !== "/dispatcher/add-trip") {
+  location.hash = "dashboard";
+}
 loadData();

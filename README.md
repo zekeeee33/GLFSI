@@ -127,11 +127,12 @@ role retain the existing administrator access model.
 Dispatchers can access their own trips, fuel logs, and maintenance records and
 the shared vehicle/driver choices needed to submit them. Payroll, system
 exports, fleet-wide pages, and delete requests are denied by the server as well
-as hidden in the dispatcher interface.
+as hidden in the dispatcher interface. The dedicated trip-entry page is available
+at `/dispatcher/add-trip` and opens the same verified trip wizard and business
+logic used in the in-app Add Trip flow.
 
 Trip entry accepts an optional load-manifest image, and fuel-log entry accepts
-an optional invoice image. JPG, PNG, and WEBP files are decoded and validated
-on the server and limited to 10 MB by default. Set
+an optional invoice image. JPG, PNG, and WEBP files are decoded and validatedon the server and limited to 10 MB by default. Set
 `DOCUMENT_IMAGE_MAX_BYTES` to change the server-side per-image limit (up to the
 bucket's 50 MB limit). Images are stored in a private Supabase Storage bucket
 and delivered through record-ownership-checked app endpoints; they are not

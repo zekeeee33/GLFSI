@@ -173,6 +173,7 @@ def enforce_authentication() -> Any:
     protected_path = (
         request.path in {"/", "/static/index.html"}
         or request.path.startswith("/api/")
+        or request.path.startswith("/dispatcher/")
     )
     if (
         protected_path
@@ -334,6 +335,13 @@ def handle_request_too_large(_error: Any) -> tuple[Any, int]:
 
 @app.route("/")
 def index() -> Any:
+    return send_from_directory(STATIC_DIR, "index.html")
+
+
+@app.route("/dispatcher/add-trip")
+def dispatcher_add_trip() -> Any:
+    if not session.get("user_id"):
+        return redirect(url_for("login_page"))
     return send_from_directory(STATIC_DIR, "index.html")
 
 
