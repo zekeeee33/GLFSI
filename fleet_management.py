@@ -81,6 +81,14 @@ class FleetManager:
                     if related is not None:
                         pending.append(related)
             combined_error = " ".join(error_details)
+            if "fleet_bootstrap_payload" in combined_error and any(
+                marker in combined_error
+                for marker in ("does not exist", "schema cache", "could not find the function")
+            ):
+                raise FleetManagementError(
+                    "Optimized bootstrap is not installed in Supabase. Apply "
+                    "supabase_bootstrap_payload_migration.sql, then retry."
+                ) from exc
             if "getaddrinfo failed" in combined_error or "11001" in combined_error:
                 project_url = os.environ.get("SUPABASE_URL", "")
                 hostname = urlsplit(project_url).hostname
@@ -242,6 +250,224 @@ class FleetManager:
             if len(page) < page_size:
                 return result
             offset += page_size
+
+    def _select_page(
+        self,
+        table: str,
+        select: str,
+        order: tuple[str, str],
+        page: int,
+        page_size: int,
+        filters: Optional[
+            List[tuple[str, Any] | tuple[str, str, Any]]
+        ] = None,
+        search_columns: Optional[List[str]] = None,
+        search: str = "",
+    ) -> tuple[List[Dict[str, Any]], int]:
+        query = self.client.table(table).select(select, count="exact")
+        for filter_spec in filters or []:
+            if len(filter_spec) == 2:
+                column, value = filter_spec
+                query = query.eq(column, value)
+            else:
+                operator, column, value = filter_spec
+                query = getattr(query, operator)(column, value)
+        if search and search_columns:
+            literal = search.replace("\\", "\\\\").replace('"', '\\"')
+            pattern = f'"*{literal}*"'
+            query = query.or_(
+                ",".join(f"{column}.ilike.{pattern}" for column in search_columns)
+            )
+        column, direction = order
+        offset = (page - 1) * page_size
+        response = self._execute(
+            query.order(column, desc=direction == "desc")
+            .range(offset, offset + page_size - 1)
+        )
+        rows = [dict(row) for row in (response.data or [])]
+        total = response.count
+        if total is None:
+            raise FleetManagementError(
+                f"Supabase did not return a total count for the {table} page."
+            )
+        return rows, int(total)
+
+    def _related_page(
+        self,
+        table: str,
+        select: str,
+        order: tuple[str, str],
+        page: int,
+        page_size: int,
+        owner_id: Optional[str] = None,
+        filters: Optional[
+            List[tuple[str, Any] | tuple[str, str, Any]]
+        ] = None,
+        search_columns: Optional[List[str]] = None,
+        search: str = "",
+    ) -> tuple[List[Dict[str, Any]], int]:
+        query_filters = list(filters or [])
+        if owner_id is not None:
+            query_filters.append(("created_by", owner_id))
+        records, total = self._select_page(
+            table,
+            select,
+            order,
+            page,
+            page_size,
+            query_filters,
+            search_columns,
+            search,
+        )
+        rows = []
+        for row in records:
+            driver = row.pop("driver", None)
+            vehicle = row.pop("truck", None) if table == "trips" else row.pop("vehicle", None)
+            trailer = row.pop("trailer", None)
+            trip = row.pop("trip", None) if table == "fuel_logs" else None
+            if isinstance(driver, dict):
+                row["driver_name"] = driver.get("name")
+            if isinstance(vehicle, dict):
+                row.update(
+                    {
+                        key: value
+                        for key, value in vehicle.items()
+                        if key in ("plate_number", "make", "model")
+                    }
+                )
+                if table == "trips":
+                    row["truck_plate_number"] = vehicle.get("plate_number")
+            elif table == "trips" and row.get("plate_no"):
+                row["plate_number"] = row["plate_no"]
+            if isinstance(trailer, dict):
+                row["trailer_plate_number"] = trailer.get("plate_number")
+                row["trailer_type"] = trailer.get("trailer_type")
+                row["trailer_status"] = trailer.get("status")
+            if isinstance(trip, dict) and (
+                owner_id is None or self._matches_owner(trip, owner_id)
+            ):
+                row["trip_ism_no"] = trip.get("ism_no")
+                row["trip_origin"] = trip.get("origin")
+                row["trip_destination"] = trip.get("destination")
+                row["trip_route_number"] = trip.get("route_number")
+                row["trip_route"] = trip.get("route")
+            rows.append(row)
+        if owner_id is not None:
+            rows = self._filter_owned_rows(rows, owner_id)
+        return rows, total
+
+    def list_resource_page(
+        self,
+        resource: str,
+        page: int = 1,
+        page_size: int = 50,
+        user_id: Optional[str] = None,
+        search: str = "",
+        filters: Optional[
+            List[tuple[str, Any] | tuple[str, str, Any]]
+        ] = None,
+    ) -> tuple[List[Dict[str, Any]], int]:
+        specifications: Dict[str, tuple[str, str, tuple[str, str], List[str]]] = {
+            "trips": (
+                "trips",
+                "*,driver:drivers(name),truck:vehicles!trips_truck_id_fkey(plate_number,make,model),trailer:trailers(plate_number,pallet_capacity,trailer_type,status)",
+                ("shipment_date", "desc"),
+                [
+                    "ism_no", "shipment_date", "time_in", "time_out", "origin",
+                    "destination", "plate_no", "load_details", "driver_name",
+                    "trip_fuel", "route", "driver.name", "truck.plate_number",
+                    "trailer.plate_number",
+                ],
+            ),
+            "fuel": (
+                "fuel_logs",
+                "*,vehicle:vehicles(plate_number),trip:trips(ism_no,origin,destination,route_number,route,created_by)",
+                ("logged_on", "desc"),
+                [
+                    "logged_on", "fuel_type", "remarks", "vehicle.plate_number",
+                    "trip.ism_no", "trip.origin", "trip.destination", "trip.route",
+                ],
+            ),
+            "maintenance": (
+                "maintenance",
+                "*,vehicle:vehicles(plate_number)",
+                ("performed_on", "desc"),
+                ["performed_on", "service_type", "description", "vehicle.plate_number"],
+            ),
+            "assignments": (
+                "assignments",
+                "*,driver:drivers(name),vehicle:vehicles(plate_number,make,model)",
+                ("assigned_date", "desc"),
+                [
+                    "assigned_date", "notes", "driver.name", "vehicle.plate_number",
+                    "vehicle.make", "vehicle.model",
+                ],
+            ),
+        }
+        specification = specifications.get(resource)
+        if specification is None:
+            raise FleetManagementError(f"Unsupported paginated resource: {resource}")
+        table, select, order, search_columns = specification
+        rows, total = self._related_page(
+            table,
+            select,
+            order,
+            page,
+            page_size,
+            owner_id=user_id if resource in {"trips", "fuel", "maintenance"} else None,
+            filters=filters,
+            search_columns=search_columns,
+            search=search,
+        )
+        if resource == "trips" and rows:
+            fuel_logs = self._select_by_values(
+                "fuel_logs",
+                "id,trip_id,vehicle_id,fuel_type,quantity,price_per_liter,total_cost,fuel_allocation,actual_expense,remarks,invoice_object_path,logged_on,created_by",
+                "trip_id",
+                [row.get("id") for row in rows],
+                filters=[("created_by", user_id)] if user_id is not None else None,
+            )
+            fuel_by_trip = {
+                fuel["trip_id"]: fuel
+                for fuel in fuel_logs
+                if fuel.get("trip_id") is not None
+            }
+            for row in rows:
+                fuel = fuel_by_trip.get(row.get("id"))
+                if fuel:
+                    row["fuel_id"] = fuel.get("id")
+                    row["fuel_allocation"] = fuel.get("fuel_allocation")
+                    row["actual_fuel_expense"] = fuel.get("actual_expense")
+                    row["actual_expense"] = fuel.get("actual_expense")
+                    row["fuel_remarks"] = fuel.get("remarks")
+                    row["fuel_invoice_object_path"] = fuel.get("invoice_object_path")
+                    row["related_fuel"] = fuel
+        return rows, total
+
+    def bootstrap_payload(
+        self,
+        user_id: Optional[str],
+        today: str,
+        dispatcher: bool,
+    ) -> Dict[str, Any]:
+        response = self._execute(
+            self.client.rpc(
+                "fleet_bootstrap_payload",
+                {
+                    "p_user_id": user_id,
+                    "p_today": today,
+                    "p_dispatcher": dispatcher,
+                },
+            )
+        )
+        data = response.data
+        if isinstance(data, list):
+            data = data[0] if data else None
+        if not isinstance(data, dict):
+            raise FleetManagementError(
+                "Supabase did not return the initial fleet bootstrap data."
+            )
+        return dict(data)
 
     def _select_by_values(
         self,

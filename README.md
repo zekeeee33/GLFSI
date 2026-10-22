@@ -22,15 +22,21 @@ by default, and remembers the selected theme in the browser.
    does not add missing columns to an existing table. If the app reports that
    `fuel_logs.trip_id` does not exist, run this migration in the SQL Editor and
    refresh the app.
-5. Copy `.env.example` to `.env`.
-6. Fill in `SUPABASE_URL`, `SUPABASE_ANON_KEY`, and
+5. Run [`supabase_bootstrap_payload_migration.sql`](./supabase_bootstrap_payload_migration.sql)
+   after the base schema, trips, fuel-allocation, and dispatcher-ownership
+   migrations. It adds a service-role-only RPC used by the optimized initial
+   bootstrap to return dashboard aggregates and reference data without loading
+   operational history. Apply this migration before deploying the frontend
+   that requests `/api/bootstrap?mode=initial`.
+6. Copy `.env.example` to `.env`.
+7. Fill in `SUPABASE_URL`, `SUPABASE_ANON_KEY`, and
    `SUPABASE_SERVICE_ROLE_KEY` from the project's API settings. The anon or
    publishable key is used for password authentication; the service-role/secret
    key is used only by the server for fleet data access. Never put the
    service-role key in browser code or commit either secret to source control.
-7. Replace `SECRET_KEY` with a long random value (for example, generate one with
+8. Replace `SECRET_KEY` with a long random value (for example, generate one with
    `python -c "import secrets; print(secrets.token_hex(32))"`).
-8. In Supabase **Authentication → Users**, invite or create each authorized
+9. In Supabase **Authentication → Users**, invite or create each authorized
    user's email/password account. Public sign-up is not enabled by this app.
 
 ## Dispatcher roles and data isolation
@@ -195,10 +201,24 @@ The interface uses grouped, collapsible desktop navigation and a compact
 scrollable navigation bar on mobile. Record tables adapt into labeled cards on
 narrow screens and dialogs use device-safe viewport sizing. Fonts use local
 system stacks to avoid blocking initial rendering on an external font download.
-The bootstrap endpoint reuses its loaded records to calculate its dashboard
-summary instead of requesting those tables a second time. The dispatcher
+The optimized `/api/bootstrap?mode=initial` response keeps the existing
+top-level dashboard and reference-data fields but leaves trips, fuel,
+maintenance, and assignments empty until needed. Dashboard previews and
+operational pages load through the authenticated
+`/api/data/{trips,fuel,maintenance,assignments}` endpoint, which applies
+database-side filters and page ranges (50 rows by default, 100 maximum) and
+returns `page`, `page_size`, `total`, and `pages` metadata. Legacy callers of
+`/api/bootstrap` without `mode=initial` retain the original complete response.
+Excel and payroll reports continue to use complete-data report paths; they are
+not limited to the visible page. The dispatcher
 migration adds indexes for commonly sorted trip, fuel, maintenance, and
 assignment lists.
+
+For rollout, apply the bootstrap RPC migration before deploying the optimized
+frontend. If the application release needs to be rolled back, restore the
+previous application version; the legacy complete-bootstrap endpoint remains
+available, and the added RPC can remain installed without affecting it. Do not
+remove the RPC migration while an optimized frontend is still deployed.
 
 The web app requires Supabase email/password authentication. Its access and
 refresh tokens are stored in HttpOnly, SameSite browser-session cookies;
@@ -270,14 +290,17 @@ export endpoint is registered.
 
 ## Data retrieval performance
 
-Trip and fuel list enrichment reads only fuel records linked to the loaded trip
-IDs and only trips linked to the loaded fuel IDs. The bootstrap reuses its fuel
-result rather than issuing another enrichment query. Draft payroll reports
+Paginated trip and fuel pages enrich only the records on the requested page.
+Trip pages return their one-to-one linked fuel rows with the trip page, and fuel
+pages select linked trip fields through the relationship. Draft payroll reports
 filter trips by shipment date in Supabase; reviewed or finalized reports load
 their saved payroll items without first loading trip history. Existing ownership
 filters and date/foreign-key indexes remain in place.
 
 ## Run the app
+
+The Flask-served legacy frontend remains the default, so existing deployments
+do not need a frontend migration to continue running:
 
 ```powershell
 python -m pip install -r requirements.txt
@@ -290,6 +313,78 @@ Authentication. Flask serves the static frontend from
 and [`static/app.js`](./static/app.js), plus the sign-in screen in
 [`static/login.html`](./static/login.html). The JavaScript client uses the
 same-origin `/api/` endpoints for data.
+
+## Vite and Tailwind frontend
+
+The frontend uses Vite to build the existing HTML and vanilla JavaScript into
+the dedicated `frontend-dist/` directory. Flask and Supabase continue to handle
+authentication, sessions, authorization, API requests, storage, and reports.
+The Vite development server proxies `/api`, `/static`, `/login`, and
+`/dispatcher/add-trip` to Flask; it does not enable CORS or bypass backend
+authorization.
+
+Install the locked Node dependencies and start Flask in the first PowerShell
+terminal (Node.js `^20.19.0` or `>=22.12.0` is required by the Vite version):
+
+```powershell
+npm ci
+python app.py
+```
+
+Start Vite in a second terminal:
+
+```powershell
+npm run dev
+```
+
+Open <http://127.0.0.1:5173>. Flask must be running at
+`http://127.0.0.1:5000`; for a different Flask address, set
+`$env:FLASK_PROXY_TARGET = "http://127.0.0.1:8000"` before `npm run dev`.
+The app entry is still `static/index.html` plus `static/app.js`; Vite treats the
+script as a module but no behavior modules have been split out yet. Login
+continues to use the existing Flask-served `static/login.js`.
+
+Tailwind CSS v4 is introduced without Preflight. Its theme and utility layers
+are loaded from `static/app.css`; the established palette and stylesheets remain
+unlayered and therefore win on properties already managed by the legacy design.
+The first utility adoption is `text-balance` on page headings. Existing CSS
+continues to own the application layout and component visuals.
+The 768×768, 783 KB source logo is retained as the `<picture>` fallback, while
+the UI uses a 192×192 WebP derivative and the favicon uses a 64×64 PNG
+derivative. This reduces the normal logo request to about 10 KB without
+removing the original asset.
+
+Create a production build, then start Flask with the Vite-serving switch enabled
+and run Preview in another terminal:
+
+```powershell
+npm run build
+$env:SERVE_VITE_FRONTEND = "true"
+python app.py
+```
+
+```powershell
+npm run preview
+```
+
+Open <http://127.0.0.1:4173>. Preview proxies backend and `/static/` requests
+to Flask just like the development server.
+
+For production, run `npm run build` during deployment and set
+`SERVE_VITE_FRONTEND=true` in the Flask process environment. Flask then serves
+the built `index.html` and `login.html` from `frontend-dist/` and hashed files
+from `frontend-dist/assets/`; `/static/` continues to serve the original static
+assets. The app routes and API routes are unchanged. If Vite mode is enabled
+without the build output, page requests return an actionable HTTP 503 instead
+of silently falling back to the legacy page. `VITE_FRONTEND_DIR` can override
+the build directory if the deployment publishes it elsewhere.
+
+Rollback is controlled by the Flask environment switch: unset
+`SERVE_VITE_FRONTEND` or set it to `false`, then restart Flask to resume serving
+the legacy frontend from `static/` without requiring a Vite build. The build
+directory is separate and ignored by Git. A pre-migration copy of the original
+static frontend and `app.py` was also saved outside the project for this
+migration session if an exact source restore is needed.
 
 The same Supabase project is used by the command-line interface:
 

@@ -1,0 +1,13 @@
+@layer theme, base, legacy, components, utilities;
+
+@import "tailwindcss/theme.css" layer(theme);
+@import "tailwindcss/utilities.css" layer(utilities);
+
+@source "./app.js";
+@source "./index.html";
+@source "./login.html";
+
+/*
+ * The existing stylesheets remain unlayered, so they intentionally win over
+ * utilities on properties already owned by the legacy design.
+ */

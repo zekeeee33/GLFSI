@@ -557,6 +557,183 @@ function showToast(message, kind = "success") {
 }
 
 let dataLoadPromise = null;
+const resourcePageCache = new Map();
+const resourcePageRequests = new Map();
+const resourcePageStatus = new Map();
+let dashboardPreviewError = "";
+const dashboardPreview = {
+  trips: null,
+  fuel_logs: null,
+  maintenance: null,
+  assignments: null,
+};
+const RESOURCE_PAGE_SIZE = 50;
+
+function resourceCollectionKey(resource) {
+  return resource === "fuel" ? "fuel_logs" : resource;
+}
+
+function resourcePageCacheKey(resource, page, pageSize, search) {
+  return `${resource}:${page}:${pageSize}:${search}`;
+}
+
+function setCurrentResourcePage(resource, result) {
+  const collection = resourceCollectionKey(resource);
+  state.data[collection] = result.data;
+  state.data.pagination ||= {};
+  state.data.pagination[resource] = result.pagination;
+  if (resource === "trips" && Array.isArray(result.fuel_logs)) {
+    state.data.fuel_logs = result.fuel_logs;
+  }
+}
+
+async function loadResourcePage(
+  resource,
+  { page = 1, pageSize = RESOURCE_PAGE_SIZE, search = "", dashboard = false, force = false } = {},
+) {
+  const key = resourcePageCacheKey(resource, page, pageSize, search);
+  const cache = resourcePageCache;
+  if (!force && cache?.has(key)) {
+    const result = cache.get(key);
+    if (dashboard) {
+      dashboardPreview[resource] = result.data;
+      state.data[resourceCollectionKey(resource)] = result.data;
+      if (resource === "trips" && Array.isArray(result.fuel_logs)) {
+        state.data.fuel_logs = result.fuel_logs;
+      }
+    } else {
+      setCurrentResourcePage(resource, result);
+      resourcePageStatus.set(resource, { loading: false, error: "" });
+    }
+    return result;
+  }
+  if (resourcePageRequests.has(key)) return resourcePageRequests.get(key);
+
+  if (!dashboard) {
+    resourcePageStatus.set(resource, { loading: true, error: "" });
+    if (state.data && state.page === (resource === "fuel" ? "fuel" : resource)) render();
+  }
+  const request = (async () => {
+    try {
+      const params = new URLSearchParams({
+        page: String(page),
+        page_size: String(pageSize),
+      });
+      if (search) params.set("search", search);
+      const result = await api(`/api/data/${encodeURIComponent(resource)}?${params}`);
+      if (!Array.isArray(result.data) || !result.pagination) {
+        throw new Error("The server returned an invalid page of records.");
+      }
+      if (cache) cache.set(key, result);
+      if (dashboard) {
+        dashboardPreview[resource] = result.data;
+      }
+      setCurrentResourcePage(resource, result);
+      resourcePageStatus.set(resource, { loading: false, error: "" });
+      if (state.data && (dashboard || state.page === (resource === "fuel" ? "fuel" : resource))) {
+        render();
+      }
+      return result;
+    } catch (error) {
+      if (!dashboard) {
+        resourcePageStatus.set(resource, { loading: false, error: error.message });
+        if (state.data && state.page === (resource === "fuel" ? "fuel" : resource)) render();
+      }
+      throw error;
+    } finally {
+      resourcePageRequests.delete(key);
+    }
+  })();
+  resourcePageRequests.set(key, request);
+  return request;
+}
+
+async function loadDashboardPreview() {
+  dashboardPreviewError = "";
+  const requests = [
+    loadResourcePage("trips", { pageSize: 5, dashboard: true }),
+    loadResourcePage("maintenance", { pageSize: 5, dashboard: true }),
+  ];
+  if (state.data?.user?.role === "dispatcher") {
+    requests.push(loadResourcePage("fuel", { pageSize: 5, dashboard: true }));
+  } else {
+    requests.push(loadResourcePage("assignments", { pageSize: 5, dashboard: true }));
+  }
+  const results = await Promise.allSettled(requests);
+  const failures = results.filter((result) => result.status === "rejected");
+  if (failures.length) {
+    dashboardPreviewError = failures.map((result) => result.reason.message).join(" ");
+    showToast(`Could not load dashboard activity: ${dashboardPreviewError}`, "error");
+    render();
+  }
+}
+
+async function loadCurrentPageData({ force = false } = {}) {
+  if (!state.data) return;
+  const page = state.page;
+  if (page === "dashboard") {
+    await loadDashboardPreview();
+    return;
+  }
+  if (page === "fuel" || page === "maintenance" || page === "assignments") {
+    const pagination = state.data.pagination?.[page];
+    const pageNumber = pagination?.page || 1;
+    const search = state.search.trim();
+    await loadResourcePage(page === "fuel" ? "fuel" : page, {
+      page: pageNumber,
+      search,
+      force,
+    });
+    return;
+  }
+  if (page === "trips" && state.data.user?.role !== "dispatcher") {
+    const pagination = state.data.pagination?.trips;
+    await loadResourcePage("trips", {
+      page: pagination?.page || 1,
+      search: state.search.trim(),
+      force,
+    });
+  }
+}
+
+let bootstrapRefreshTimer = null;
+let bootstrapRefreshPromise = null;
+
+function scheduleBootstrapRefresh() {
+  if (bootstrapRefreshTimer !== null) window.clearTimeout(bootstrapRefreshTimer);
+  bootstrapRefreshTimer = window.setTimeout(async () => {
+    bootstrapRefreshTimer = null;
+    if (bootstrapRefreshPromise) return;
+    bootstrapRefreshPromise = (async () => {
+      try {
+        const refreshed = await api("/api/bootstrap?mode=initial");
+        if (!state.data) return;
+        state.data.dashboard = refreshed.dashboard;
+        for (const key of ["vehicles", "drivers", "trailers", "truck_routes", "truck_route_rates"]) {
+          state.data[key] = refreshed[key] || [];
+        }
+        resourcePageCache.clear();
+        await loadCurrentPageData({ force: true });
+        render();
+      } catch (error) {
+        showToast(`Records were saved, but dashboard totals could not be refreshed: ${error.message}`, "error");
+      } finally {
+        bootstrapRefreshPromise = null;
+      }
+    })();
+  }, 120);
+}
+
+function resourcePaginationMarkup(resource) {
+  const pagination = state.data?.pagination?.[resource];
+  if (!pagination || pagination.pages <= 1) return "";
+  const label = resource === "fuel" ? "fuel records" : resource;
+  return `<nav class="resource-pagination" aria-label="${escapeHtml(label)} pages">
+    <button class="button button-secondary button-small" type="button" data-action="resource-page" data-resource="${escapeHtml(resource)}" data-page="${Math.max(1, pagination.page - 1)}" ${pagination.page <= 1 ? "disabled" : ""}>Previous</button>
+    <span>Page ${formatNumber(pagination.page)} of ${formatNumber(pagination.pages)} · ${formatNumber(pagination.total)} records</span>
+    <button class="button button-secondary button-small" type="button" data-action="resource-page" data-resource="${escapeHtml(resource)}" data-page="${Math.min(pagination.pages, pagination.page + 1)}" ${pagination.page >= pagination.pages ? "disabled" : ""}>Next</button>
+  </nav>`;
+}
 
 function collectionKeyForResource(resource) {
   return resource === "fuel" ? "fuel_logs" : resource;
@@ -603,6 +780,7 @@ function hydrateResourceRecord(resource, record) {
 
 function refreshDashboardSummary() {
   if (!state.data) return;
+  if (state.data.initial_bootstrap) return;
   const { vehicles = [], drivers = [], fuel_logs: fuelLogs = [], maintenance = [], trips = [] } = state.data;
   if (state.data.user?.role === "dispatcher") {
     const todayLabel = isoDate(new Date());
@@ -641,6 +819,7 @@ function upsertResourceRecord(resource, record) {
     collection.push(hydrateResourceRecord(resource, record));
   }
   refreshDashboardSummary();
+  scheduleBootstrapRefresh();
   return true;
 }
 
@@ -655,6 +834,7 @@ function removeResourceRecord(resource, recordId) {
   if (updated.length === initialLength) return false;
   state.data[key] = updated;
   refreshDashboardSummary();
+  scheduleBootstrapRefresh();
   return true;
 }
 
@@ -765,7 +945,13 @@ async function loadData({ force = false } = {}) {
   view.setAttribute("aria-busy", "true");
   dataLoadPromise = (async () => {
     try {
-      state.data = await api("/api/bootstrap");
+      state.data = await api("/api/bootstrap?mode=initial");
+      state.data.initial_bootstrap = true;
+      state.data.pagination = {};
+      resourcePageCache.clear();
+      resourcePageStatus.clear();
+      dashboardPreviewError = "";
+      for (const key of Object.keys(dashboardPreview)) dashboardPreview[key] = null;
       state.csrfToken = state.data.csrf_token || "";
       const user = state.data.user || {};
       document.querySelector("#signed-in-user").textContent =
@@ -773,6 +959,7 @@ async function loadData({ force = false } = {}) {
       registerSessionActivity();
       render();
       initializeNotificationPolling();
+      await loadCurrentPageData();
       return state.data;
     } catch (error) {
       view.innerHTML = `
@@ -796,7 +983,7 @@ function header(eyebrow, title, description = "", action = "") {
     <div class="page-heading">
       <div>
         <p class="eyebrow">${escapeHtml(eyebrow)}</p>
-        <h1>${escapeHtml(title)}</h1>
+        <h1 class="text-balance">${escapeHtml(title)}</h1>
         ${description ? `<p class="page-description">${escapeHtml(description)}</p>` : ""}
       </div>
       <div class="page-heading-actions">
@@ -870,14 +1057,21 @@ function renderDashboard() {
         ${statCard("My maintenance records", formatNumber(summary.total_maintenance), "red", "⚙")}
       </div>
       <div class="dashboard-grid">
-        ${panel("My recent trips", tableMarkup(data.trips.slice(0, 5), [
+        ${dashboardPreviewError ? `<p class="error-card" role="alert">${escapeHtml(dashboardPreviewError)}</p>` : ""}
+        ${panel("My recent trips", dashboardPreview.trips
+          ? tableMarkup(dashboardPreview.trips, [
           ["ism_no", "ISM no"],
           ["origin", "Origin"],
           ["destination", "Destination"],
           ["shipment_date", "Shipment date"],
-        ], null, { empty: "No trips recorded", rowAction: "trip-details" }), "trips")}
-        ${panel("My fuel logs", tableMarkup(data.fuel_logs.slice(0, 5), RESOURCE_CONFIG.fuel.columns, null, { empty: "No fuel logs recorded" }), "fuel")}
-        ${panel("My maintenance", tableMarkup(data.maintenance.slice(0, 5), RESOURCE_CONFIG.maintenance.columns, null, { empty: "No maintenance records" }), "maintenance")}
+        ], null, { empty: "No trips recorded", rowAction: "trip-details" })
+          : "<p>Loading recent trips…</p>", "trips")}
+        ${panel("My fuel logs", dashboardPreview.fuel_logs
+          ? tableMarkup(dashboardPreview.fuel_logs, RESOURCE_CONFIG.fuel.columns, null, { empty: "No fuel logs recorded" })
+          : "<p>Loading fuel records…</p>", "fuel")}
+        ${panel("My maintenance", dashboardPreview.maintenance
+          ? tableMarkup(dashboardPreview.maintenance, RESOURCE_CONFIG.maintenance.columns, null, { empty: "No maintenance records" })
+          : "<p>Loading maintenance records…</p>", "maintenance")}
       </div>
       ${tripDetailsDialogMarkup()}`;
   }
@@ -892,21 +1086,28 @@ function renderDashboard() {
       ${statCard("Trips recorded", formatNumber(summary.recent_trips), "teal", "⌁")}
     </div>
     <div class="dashboard-grid">
+      ${dashboardPreviewError ? `<p class="error-card" role="alert">${escapeHtml(dashboardPreviewError)}</p>` : ""}
       ${panel("Trucks", tableMarkup(data.vehicles.slice(0, 5), [
         ["plate_number", "Truck plate"],
         ["make", "Make"],
         ["model", "Model"],
         ["status", "Status", statusBadge],
       ], null, { empty: "No trucks registered" }), "vehicles")}
-      ${panel("Recent trips", tableMarkup(data.trips.slice(0, 5), [
+      ${panel("Recent trips", dashboardPreview.trips
+        ? tableMarkup(dashboardPreview.trips, [
         ["origin", "Origin"],
         ["destination", "Destination"],
         ["plate_number", "Plate no"],
         ["driver_name", "Driver"],
         ["shipment_date", "Shipment date"],
-      ], null, { empty: "No trips recorded", rowAction: "trip-details" }), "trips")}
-      ${panel("Vehicle assignments", tableMarkup(data.assignments.slice(0, 5), RESOURCE_CONFIG.assignments.columns, null, { empty: "No assignments yet" }), "assignments")}
-      ${panel("Maintenance", tableMarkup(data.maintenance.slice(0, 5), RESOURCE_CONFIG.maintenance.columns, null, { empty: "No maintenance records" }), "maintenance")}
+      ], null, { empty: "No trips recorded", rowAction: "trip-details" })
+        : "<p>Loading recent trips…</p>", "trips")}
+      ${panel("Vehicle assignments", dashboardPreview.assignments
+        ? tableMarkup(dashboardPreview.assignments, RESOURCE_CONFIG.assignments.columns, null, { empty: "No assignments yet" })
+        : "<p>Loading assignments…</p>", "assignments")}
+      ${panel("Maintenance", dashboardPreview.maintenance
+        ? tableMarkup(dashboardPreview.maintenance, RESOURCE_CONFIG.maintenance.columns, null, { empty: "No maintenance records" })
+        : "<p>Loading maintenance records…</p>", "maintenance")}
     </div>
     ${tripDetailsDialogMarkup()}`;
 }
@@ -2448,9 +2649,13 @@ function renderDispatchWorkflow() {
   const listMarkup = pageRows.length
     ? `<div class="dispatch-movement-list">${pageRows.map((row) => dispatchMovementCard(row, tab)).join("")}</div>${pageMarkup}`
     : `<div class="empty-state"><span>↗</span><strong>No ${tab === "departures" ? "departures" : tab === "arrivals" ? "incoming movements" : "completed movements"} found</strong><small>${state.dispatch.search ? "Try another search." : "New movements will appear here when they match this workflow."}</small></div>`;
+  const tripsStatus = resourcePageStatus.get("trips");
   const legacyRows = isAdmin
     ? `<section class="panel records-panel"><div class="panel-heading"><div><p class="eyebrow">HISTORICAL RECORDS</p><h2>Trips recorded before the dispatch workflow</h2></div></div>
-        ${tableMarkup(state.data.trips || [], RESOURCE_CONFIG.trips.columns, null, { empty: "No historical trip records" })}</section>`
+        ${tripsStatus?.error ? `<p class="error-card" role="alert">${escapeHtml(tripsStatus.error)}</p>` : ""}
+        ${tripsStatus?.loading ? `<p class="record-count" role="status">Loading historical trips…</p>` : ""}
+        ${tableMarkup(state.data.trips || [], RESOURCE_CONFIG.trips.columns, null, { empty: "No historical trip records" })}
+        ${resourcePaginationMarkup("trips")}</section>`
     : "";
   return `
     ${header("LOCATION DISPATCH", "Departure → Arrival", "One movement ID. The receiving dispatcher verifies the manifest before arrival; only admins finalize financial trips.", '<button class="button button-secondary" data-action="dispatch-reload" type="button">Refresh</button>')}
@@ -2827,7 +3032,10 @@ function renderResource(page) {
   if (page === "vehicles") return renderVehicleManagement();
   const config = RESOURCE_CONFIG[page];
   const listKey = page === "fuel" ? "fuel_logs" : page;
-  const rows = filterRows(state.data[listKey], config.columns);
+  const rows = filterRows(state.data[listKey] || [], config.columns);
+  const pageStatus = resourcePageStatus.get(page);
+  const pagination = state.data.pagination?.[page];
+  const displayedCount = pagination?.total ?? rows.length;
   if (page === "trips") {
     const visibleTripIds = new Set(rows.map((trip) => String(trip.id)));
     state.selectedTripIds = new Set(
@@ -2886,8 +3094,11 @@ function renderResource(page) {
           <div><p class="eyebrow">RECORDS</p><h2>${escapeHtml(config.title)}</h2></div>
           <label class="search-box"><span class="sr-only">Search ${escapeHtml(config.title.toLowerCase())}</span><span aria-hidden="true">⌕</span><input type="search" id="record-search" placeholder="Search records" value="${escapeHtml(state.search)}" /></label>
         </div>
-        <p class="record-count">${formatNumber(rows.length)} ${rows.length === 1 ? "record" : "records"}</p>
+        ${pageStatus?.error ? `<p class="error-card" role="alert">${escapeHtml(pageStatus.error)}</p>` : ""}
+        ${pageStatus?.loading ? `<p class="record-count" role="status">Loading records…</p>` : ""}
+        <p class="record-count">${formatNumber(displayedCount)} ${displayedCount === 1 ? "record" : "records"}</p>
         ${tableMarkup(rows, config.columns, state.data.user?.role === "dispatcher" ? null : config.api, { empty: `No ${config.singular} records` })}
+        ${resourcePaginationMarkup("fuel")}
       </section>`;
   }
 
@@ -2971,8 +3182,11 @@ function renderResource(page) {
           <div><p class="eyebrow">RECORDS</p><h2>${escapeHtml(config.title)}</h2></div>
           <label class="search-box"><span class="sr-only">Search ${escapeHtml(config.title.toLowerCase())}</span><span aria-hidden="true">⌕</span><input type="search" id="record-search" placeholder="Search records" value="${escapeHtml(state.search)}" /></label>
         </div>
-        <p class="record-count">${formatNumber(rows.length)} ${rows.length === 1 ? "record" : "records"}</p>
+        ${pageStatus?.error ? `<p class="error-card" role="alert">${escapeHtml(pageStatus.error)}</p>` : ""}
+        ${pageStatus?.loading ? `<p class="record-count" role="status">Loading records…</p>` : ""}
+        <p class="record-count">${formatNumber(displayedCount)} ${displayedCount === 1 ? "record" : "records"}</p>
         ${tableMarkup(rows, config.columns, state.data.user?.role === "dispatcher" || page === "trips" ? null : config.api, { empty: `No ${config.singular} records` })}
+        ${page === "assignments" ? resourcePaginationMarkup("assignments") : page === "maintenance" ? resourcePaginationMarkup("maintenance") : ""}
       </section>
     </div>`;
 }
@@ -3934,7 +4148,7 @@ function tripFuelDetailsMarkup(trip, tripTitle) {
 }
 
 function openTripDetails(tripId) {
-  const trip = state.data?.trips.find((record) => String(record.id) === String(tripId));
+  const trip = (state.data?.trips || []).find((record) => String(record.id) === String(tripId));
   const dialog = view.querySelector(".trip-details-dialog");
   if (!trip || !dialog) return;
 
@@ -4785,6 +4999,27 @@ view.addEventListener("input", (event) => {
   state.search = event.target.value;
   window.clearTimeout(searchRenderTimer);
   searchRenderTimer = window.setTimeout(() => {
+    if (
+      ["fuel", "maintenance", "assignments"].includes(state.page)
+      || (state.page === "trips" && state.data.user?.role !== "dispatcher")
+    ) {
+      state.data.pagination[state.page] = {
+        ...(state.data.pagination[state.page] || {}),
+        page: 1,
+      };
+      loadResourcePage(state.page === "fuel" ? "fuel" : state.page, {
+        page: 1,
+        search: state.search.trim(),
+        force: true,
+      }).then(() => {
+        if (!restoreFocus) return;
+        const nextInput = document.querySelector("#record-search");
+        nextInput?.focus();
+        nextInput?.setSelectionRange(position, position);
+      }).catch(() => {});
+      render();
+      return;
+    }
     render();
     if (!restoreFocus) return;
     const nextInput = document.querySelector("#record-search");
@@ -4796,6 +5031,18 @@ view.addEventListener("input", (event) => {
 view.addEventListener("click", (event) => {
   const button = event.target.closest("[data-action]");
   if (!button) return;
+  if (button.dataset.action === "resource-page") {
+    const resource = button.dataset.resource;
+    const page = Math.max(1, Number(button.dataset.page) || 1);
+    const pagination = state.data.pagination?.[resource] || {};
+    state.data.pagination[resource] = { ...pagination, page };
+    loadResourcePage(resource, {
+      page,
+      search: state.search.trim(),
+      force: true,
+    }).catch(() => {});
+    return;
+  }
   if (button.dataset.action === "dispatch-tab") {
     state.dispatch.tab = button.dataset.tab;
     state.dispatch.page = 1;
@@ -5380,6 +5627,9 @@ window.addEventListener("hashchange", () => {
   closeMegaMenu();
   setMobileNavigationOpen(false);
   render();
+  loadCurrentPageData().catch((error) => {
+    showToast(`Could not load this page: ${error.message}`, "error");
+  });
 });
 
 if (!location.hash && window.location.pathname !== "/dispatcher/add-trip") {

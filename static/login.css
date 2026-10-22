@@ -88,6 +88,7 @@ button:focus-visible, a:focus-visible, input:focus-visible { outline: 3px solid 
   border-radius: 50%;
   object-fit: contain;
 }
+.login-brand-picture { display: block; width: 52px; height: 52px; flex: 0 0 auto; }
 .login-brand strong, .login-brand small { display: block; }
 .login-brand strong { font-size: 13px; }
 .login-brand small { margin-top: 4px; color: var(--login-muted); font-size: 11px; }

@@ -140,6 +140,8 @@ button:focus-visible, a:focus-visible, input:focus-visible, select:focus-visible
   object-fit: contain;
 }
 
+.brand-mark-picture { display: block; width: 48px; height: 48px; flex: 0 0 auto; }
+
 .brand-copy { display: grid; max-width: 190px; gap: 3px; overflow: hidden; opacity: 1; white-space: nowrap; transition: max-width .28s var(--ease-ui), opacity .16s ease, visibility .16s linear; }
 .brand-copy strong { font-size: 13px; letter-spacing: -.15px; }
 .brand-copy small { color: var(--muted); font-size: 11px; }
@@ -409,6 +411,7 @@ h2 { margin-bottom: 0; font-size: 15px; font-weight: 700; letter-spacing: -.3px;
 .dispatch-verify-form .form-field { min-width: 0; }
 .dispatch-review-actions { display: flex; flex-wrap: wrap; gap: 8px; }
 .dispatch-queue-panel .pagination { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin-top: 12px; color: var(--muted); font-size: 11px; }
+.resource-pagination { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin-top: 12px; color: var(--muted); font-size: 12px; }
 .badge-awaiting_arrival, .badge-needs_correction { background: #fff4e8; color: #a86627; }
 .badge-arrival_submitted { background: #eaf0f7; color: #4b637f; }
 .badge-completed { background: #e7f4eb; color: var(--success); }
@@ -416,6 +419,7 @@ h2 { margin-bottom: 0; font-size: 15px; font-weight: 700; letter-spacing: -.3px;
   .dispatch-verify-form { grid-template-columns: minmax(0, 1fr); }
   .dispatch-movement-heading { flex-direction: column; }
   .dispatch-queue-panel .pagination { align-items: stretch; flex-direction: column; }
+  .resource-pagination { align-items: stretch; flex-direction: column; }
 }
 .trip-group + .trip-group { margin-top: 17px; padding-top: 16px; border-top: 1px solid var(--border); }
 .trip-group-heading { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin-bottom: 9px; }
@@ -929,7 +933,7 @@ body { overflow-x: clip; }
   border-bottom: 0;
 }
 .brand { min-height: 52px; padding: 0 40px 0 7px; color: var(--color-on-primary); }
-.brand-mark { width: 40px; height: 40px; }
+.brand-mark, .brand-mark-picture { width: 40px; height: 40px; }
 .brand-copy { max-width: 130px; }
 .brand-copy strong, .brand-copy small { overflow: hidden; text-overflow: ellipsis; }
 .sidebar .brand-copy small { color: var(--nav-muted); }

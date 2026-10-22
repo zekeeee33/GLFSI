@@ -1,0 +1,21 @@
+{
+  "name": "dcc-fleet-management-system",
+  "version": "1.0.0",
+  "description": "Vite and Tailwind build for the Flask fleet management frontend.",
+  "scripts": {
+    "dev": "vite --host 127.0.0.1",
+    "build": "vite build",
+    "preview": "vite preview --host 127.0.0.1",
+    "check:frontend": "node --check static/app.js"
+  },
+  "type": "module",
+  "private": true,
+  "engines": {
+    "node": "^20.19.0 || >=22.12.0"
+  },
+  "devDependencies": {
+    "@tailwindcss/vite": "^4.3.3",
+    "tailwindcss": "^4.3.3",
+    "vite": "^8.3.5"
+  }
+}
