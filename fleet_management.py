@@ -91,6 +91,24 @@ class FleetManager:
                     "Project URL in Supabase Settings > API, check your internet "
                     "or VPN/DNS settings, and restart the app."
                 ) from exc
+            if any(
+                marker in combined_error
+                for marker in (
+                    "tire_monitoring",
+                    "tire_monitoring_sheet",
+                    "get_tire_monitoring_summary",
+                    "replace_tire_monitoring",
+                    "remove_tire_monitoring",
+                )
+            ) and any(
+                marker in combined_error
+                for marker in ("does not exist", "schema cache", "could not find the function")
+            ):
+                raise FleetManagementError(
+                    "Tire Monitoring is not installed in Supabase. Apply "
+                    "supabase_tire_monitoring_migration.sql after the base schema "
+                    "and truck/trailer migrations, then refresh the app."
+                ) from exc
             if "column trips.shipment_date does not exist" in combined_error:
                 raise FleetManagementError(
                     "The Supabase trips table needs its shipment fields. Run "
@@ -1029,6 +1047,97 @@ class FleetManager:
 
         return row
 
+    @staticmethod
+    def _normalize_trip_time(value: Any, field_name: str) -> str:
+        if value is None:
+            raise FleetManagementError(f"{field_name} is required.")
+        text = str(value).strip()
+        if not text:
+            raise FleetManagementError(f"{field_name} is required.")
+        for pattern in ("%H:%M", "%H:%M:%S"):
+            try:
+                return datetime.strptime(text, pattern).strftime("%H:%M")
+            except ValueError:
+                pass
+        try:
+            iso_value = text[:-1] + "+00:00" if text.endswith("Z") else text
+            parsed = datetime.fromisoformat(iso_value)
+            return parsed.time().strftime("%H:%M")
+        except ValueError as exc:
+            raise FleetManagementError(f"{field_name} must be a valid time like 08:30.") from exc
+
+    def record_trip_time_out(
+        self,
+        trip_id: int,
+        time_value: Any,
+        location: Optional[str],
+        edited_by: str,
+        editor_email: Optional[str],
+        user_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        current_trip = self.get_trip(trip_id, user_id)
+        if current_trip.get("time_out") not in (None, ""):
+            raise FleetManagementError("Time Out is already recorded for this trip. Use the correction workflow to change it.")
+        if current_trip.get("time_in") not in (None, ""):
+            raise FleetManagementError("This trip has already been completed and cannot be departed again.")
+        departure_time = self._normalize_trip_time(time_value, "Time Out")
+        departure_location = (location or current_trip.get("origin") or "").strip()
+        if not departure_location:
+            raise FleetManagementError("The departure location is required.")
+        if current_trip.get("origin") and canonical_warehouse_code(current_trip.get("origin")) != canonical_warehouse_code(departure_location):
+            raise FleetManagementError("The recorded departure location must match the trip origin.")
+        update_values = {
+            "shipment_date": current_trip.get("shipment_date") or current_trip.get("trip_date") or datetime.now().date().isoformat(),
+            "origin": current_trip.get("origin") or departure_location,
+            "destination": current_trip.get("destination"),
+            "vehicle_id": current_trip.get("vehicle_id") or current_trip.get("truck_id"),
+            "truck_id": current_trip.get("truck_id") or current_trip.get("vehicle_id"),
+            "driver_id": current_trip.get("driver_id"),
+            "route": current_trip.get("route") or f"{current_trip.get('origin') or departure_location} to {current_trip.get('destination') or ''}".strip(),
+            "time_out": departure_time,
+            "last_edited_by": edited_by,
+            "last_edited_by_email": editor_email,
+        }
+        if not update_values["route"] or update_values["route"].endswith(" to "):
+            update_values["route"] = current_trip.get("route") or "Recorded trip"
+        return self.update_trip(trip_id, update_values, edited_by, editor_email, user_id=user_id)
+
+    def record_trip_time_in(
+        self,
+        trip_id: int,
+        time_value: Any,
+        location: Optional[str],
+        edited_by: str,
+        editor_email: Optional[str],
+        user_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        current_trip = self.get_trip(trip_id, user_id)
+        if current_trip.get("time_in") not in (None, ""):
+            raise FleetManagementError("Time In is already recorded for this trip. Use the correction workflow to change it.")
+        if current_trip.get("time_out") in (None, ""):
+            raise FleetManagementError("This trip does not have a recorded Time Out. Record departure before arrival.")
+        arrival_time = self._normalize_trip_time(time_value, "Time In")
+        arrival_location = (location or current_trip.get("destination") or "").strip()
+        if not arrival_location:
+            raise FleetManagementError("The arrival location is required.")
+        if current_trip.get("destination") and canonical_warehouse_code(current_trip.get("destination")) != canonical_warehouse_code(arrival_location):
+            raise FleetManagementError("The recorded arrival location must match the trip destination.")
+        update_values = {
+            "shipment_date": current_trip.get("shipment_date") or current_trip.get("trip_date") or datetime.now().date().isoformat(),
+            "origin": current_trip.get("origin"),
+            "destination": current_trip.get("destination") or arrival_location,
+            "vehicle_id": current_trip.get("vehicle_id") or current_trip.get("truck_id"),
+            "truck_id": current_trip.get("truck_id") or current_trip.get("vehicle_id"),
+            "driver_id": current_trip.get("driver_id"),
+            "route": current_trip.get("route") or f"{current_trip.get('origin') or ''} to {current_trip.get('destination') or arrival_location}".strip(),
+            "time_in": arrival_time,
+            "last_edited_by": edited_by,
+            "last_edited_by_email": editor_email,
+        }
+        if not update_values["route"] or update_values["route"].endswith(" to "):
+            update_values["route"] = current_trip.get("route") or "Recorded trip"
+        return self.update_trip(trip_id, update_values, edited_by, editor_email, user_id=user_id)
+
     def update_trip(
         self,
         trip_id: int,
@@ -1064,55 +1173,71 @@ class FleetManager:
             "driver_id",
             "route",
         }
-        if (
-            not required_fields.issubset(values)
-            or set(values) - editable_fields
-        ):
-            raise FleetManagementError("The trip contains unsupported fields.")
         current_trip = self.get_trip(trip_id, user_id)
+        normalized_values = dict(current_trip)
+        normalized_values.update({k: v for k, v in values.items() if k in editable_fields})
+        if "truck_id" in values and values.get("truck_id") is not None:
+            normalized_values["truck_id"] = values["truck_id"]
+        if "vehicle_id" in values and values.get("vehicle_id") is not None:
+            normalized_values["vehicle_id"] = values["vehicle_id"]
+        if "driver_id" in values and values.get("driver_id") is not None:
+            normalized_values["driver_id"] = values["driver_id"]
+        if "time_in" in values and values.get("time_in") is not None:
+            normalized_values["time_in"] = values["time_in"]
+        if "time_out" in values and values.get("time_out") is not None:
+            normalized_values["time_out"] = values["time_out"]
 
-        fuel_values: Dict[str, Any] = {}
-        if "fuel_allocation" in values:
-            fuel_values["fuel_allocation"] = values.pop("fuel_allocation")
-        if "actual_fuel_expense" in values:
-            fuel_values["actual_expense"] = values.pop("actual_fuel_expense")
-        if "fuel_remarks" in values:
-            fuel_values["remarks"] = values.pop("fuel_remarks")
-
-        truck_id = values.get("truck_id") or values.get("vehicle_id")
+        truck_id = normalized_values.get("truck_id") or normalized_values.get("vehicle_id")
+        if truck_id is None:
+            raise FleetManagementError("Trip update requires an assigned truck.")
+        if not self._exists("vehicles", truck_id):
+            raise FleetManagementError(f"Truck {truck_id} not found")
         previous_truck_id = current_trip.get("truck_id") or current_trip.get("vehicle_id")
         truck_changed = str(previous_truck_id or "") != str(truck_id or "")
-        if truck_changed and truck_id is not None:
-            if not self._exists("vehicles", truck_id):
-                raise FleetManagementError(f"Truck {truck_id} not found")
+        if truck_changed:
             truck = self.get_vehicle(truck_id)
             if truck.get("status") not in {"active", "available", "assigned"}:
                 raise TripRateValidationError("This truck is inactive or under maintenance.")
-        if values["driver_id"] is not None and not self._exists("drivers", values["driver_id"]):
-            raise FleetManagementError(f"Driver {values['driver_id']} not found")
+        driver_id = normalized_values.get("driver_id")
+        if driver_id is not None and not self._exists("drivers", driver_id):
+            raise FleetManagementError(f"Driver {driver_id} not found")
+        if not required_fields.issubset(normalized_values):
+            raise FleetManagementError("The trip contains unsupported fields.")
+        if set(values) - editable_fields:
+            raise FleetManagementError("The trip contains unsupported fields.")
 
+        fuel_values: Dict[str, Any] = {}
+        if "fuel_allocation" in values:
+            fuel_values["fuel_allocation"] = values["fuel_allocation"]
+        if "actual_fuel_expense" in values:
+            fuel_values["actual_expense"] = values["actual_fuel_expense"]
+        if "fuel_remarks" in values:
+            fuel_values["remarks"] = values["fuel_remarks"]
+
+        route_origin = normalized_values.get("origin")
+        route_destination = normalized_values.get("destination")
         rate_determining_fields_changed = (
             canonical_warehouse_code(current_trip.get("origin"))
-            != canonical_warehouse_code(values.get("origin"))
+            != canonical_warehouse_code(route_origin)
             or canonical_warehouse_code(current_trip.get("destination"))
-            != canonical_warehouse_code(values.get("destination"))
+            != canonical_warehouse_code(route_destination)
             or str(current_trip.get("trailer_id") or "")
-            != str(values.get("trailer_id") or "")
+            != str(normalized_values.get("trailer_id") or "")
         )
         update_values = {
-            **values,
+            **{k: v for k, v in normalized_values.items() if k in editable_fields},
             "truck_id": truck_id,
             "vehicle_id": truck_id,
-            "trip_date": values["shipment_date"],
+            "trip_date": normalized_values["shipment_date"],
             "last_edited_by": edited_by,
             "last_edited_by_email": editor_email,
         }
         if rate_determining_fields_changed:
             route_snapshot = self._resolve_trip_route_rate(
-                values.get("origin"),
-                values.get("destination"),
+                route_origin,
+                route_destination,
                 truck_id,
-                values.get("trailer_id"),
+                normalized_values.get("trailer_id"),
             )
             update_values.update(
                 {

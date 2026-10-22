@@ -6,7 +6,7 @@ import unittest
 from decimal import Decimal
 from io import BytesIO
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import app as web_app
 from PIL import Image
@@ -102,6 +102,295 @@ class PayrollCalculationTests(unittest.TestCase):
 
         self.assertIn("pg_advisory_xact_lock(item_row.trip_id)", migration)
         self.assertNotIn("hashtextext", migration)
+
+    def test_dispatch_api_uses_authenticated_database_pagination(self):
+        movements = [{
+            "id": "11111111-1111-4111-8111-111111111111",
+            "ism_no": None,
+            "status": "awaiting_arrival",
+        }]
+        with patch.dict(
+            web_app.app.config,
+            {"TESTING": True, "TEST_AUTH_BYPASS": True, "TEST_AUTH_ROLE": "dispatcher"},
+        ), patch.object(web_app, "_dispatch_rpc", return_value={
+            "total": 1, "movements": movements,
+        }) as dispatch_rpc:
+            response = web_app.app.test_client().get(
+                "/api/dispatch/movements?queue=arrivals&page=2&page_size=10&search=truck"
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json["movements"], movements)
+        self.assertEqual(response.json["total"], 1)
+        dispatch_rpc.assert_called_once_with(
+            "list_dispatch_movements_page",
+            {
+                "p_queue": "arrivals",
+                "p_page": 2,
+                "p_page_size": 10,
+                "p_search": "truck",
+            },
+        )
+
+    def test_dispatch_client_uses_bounded_postgrest_timeout(self):
+        request_client = SimpleNamespace(
+            options=SimpleNamespace(headers={}),
+            postgrest=SimpleNamespace(auth=Mock()),
+            auth=SimpleNamespace(close=Mock()),
+        )
+        request_client.postgrest.session = SimpleNamespace(close=Mock())
+        with patch.object(web_app, "_supabase_setting", side_effect={
+            "SUPABASE_URL": "https://example.supabase.co",
+            "SUPABASE_ANON_KEY": "test-anon-key",
+        }.get), patch.object(
+            web_app, "_supabase_project_url", return_value="https://example.supabase.co"
+        ), patch.object(web_app, "create_client", return_value=request_client) as create:
+            with web_app.app.test_request_context("/api/dispatch/movements"):
+                web_app.g.dispatch_access_token = "user-access-token"
+                result = web_app.get_dispatch_client()
+
+        self.assertIs(result, request_client)
+        self.assertEqual(create.call_args.kwargs["options"].postgrest_client_timeout, 15)
+        request_client.postgrest.auth.assert_called_once_with("user-access-token")
+
+    def test_dispatch_rpc_reports_specific_database_failures(self):
+        class DispatchDatabaseError(Exception):
+            def __init__(self, code, message, status=None):
+                super().__init__(message)
+                self.code = code
+                self.message = message
+                self.status = status
+
+        with patch.object(
+            web_app,
+            "get_dispatch_client",
+            side_effect=DispatchDatabaseError("PGRST202", "function is missing"),
+        ):
+            with self.assertRaisesRegex(FleetManagementError, "function.*is missing"):
+                web_app._dispatch_rpc("list_dispatch_movements_page")
+
+        with patch.object(
+            web_app,
+            "get_dispatch_client",
+            side_effect=DispatchDatabaseError("42501", "permission denied"),
+        ):
+            with self.assertRaisesRegex(FleetManagementError, "permission denied.*42501"):
+                web_app._dispatch_rpc("list_dispatch_locations")
+
+        with patch.object(
+            web_app,
+            "get_dispatch_client",
+            side_effect=DispatchDatabaseError("XX000", "specific database failure"),
+        ):
+            with self.assertRaisesRegex(FleetManagementError, "specific database failure"):
+                web_app._dispatch_rpc("list_dispatch_locations")
+
+    def test_dispatchers_cannot_create_legacy_financial_trip_rows(self):
+        with web_app.app.test_request_context("/api/trips", method="POST"):
+            web_app.g.current_user = {"role": "dispatcher"}
+            response, status = web_app._authorize_dispatcher_request()
+
+        self.assertEqual(status, 403)
+        self.assertIn("Departure", response.get_json()["error"])
+
+    def test_dispatch_migration_never_grants_direct_ism_column_access(self):
+        migration_path = os.path.join(
+            os.path.dirname(__file__), "..", "supabase_location_dispatch_migration.sql"
+        )
+        with open(migration_path, encoding="utf-8") as migration_file:
+            migration = migration_file.read()
+
+        create_movement = migration.split(
+            "create or replace function public.create_dispatch_movement", 1
+        )[1].split("create or replace function public.list_dispatch_movements_page", 1)[0]
+        self.assertIn("select count(*)", create_movement)
+        self.assertIn(") <> 2 then", create_movement)
+        self.assertNotIn("group by true", create_movement)
+
+        grant_block = migration.split(
+            "grant select (", 1
+        )[1].split(") on public.dispatch_movements", 1)[0]
+        self.assertNotIn("ism_no", grant_block)
+        self.assertIn(
+            "movement.arrival_verified_by = auth.uid()",
+            migration,
+        )
+        self.assertIn(
+            "revoke all on public.dispatch_movements from anon, authenticated",
+            migration,
+        )
+        listing = migration.split(
+            "create or replace function public.list_dispatch_movements()", 1
+        )[1].split("create or replace function public.create_dispatch_movement", 1)[0]
+        self.assertIn(
+            "or movement.arrival_verified_by = auth.uid()\n"
+            "            then movement.arrival_manifest_path",
+            listing,
+        )
+        storage_read = migration.split(
+            "create policy dispatch_movement_documents_read", 1
+        )[1].split(
+            "drop policy if exists dispatch_movement_documents_scope_guard", 1
+        )[0]
+        self.assertIn("or movement.arrival_verified_by = auth.uid()", storage_read)
+        self.assertNotIn(
+            "or public.dispatch_has_location(movement.destination_location_id, 'view')",
+            storage_read,
+        )
+
+    def test_dispatcher_add_trip_path_renders_location_workflow(self):
+        app_js_path = os.path.join(
+            os.path.dirname(__file__), "..", "static", "app.js"
+        )
+        index_path = os.path.join(
+            os.path.dirname(__file__), "..", "static", "index.html"
+        )
+        with open(app_js_path, encoding="utf-8") as app_js_file:
+            app_js = app_js_file.read()
+        with open(index_path, encoding="utf-8") as index_file:
+            index_html = index_file.read()
+
+        self.assertIn('if (isDedicatedAddTripPage) {\n    state.page = "trips";', app_js)
+        self.assertIn(
+            "if (isDedicatedAddTripPage && !isDispatcher) {",
+            app_js,
+        )
+        self.assertIn('if (page === "trips") return renderDispatchWorkflow();', app_js)
+        self.assertIn('app.js?v=location-dispatch-7', index_html)
+        self.assertIn("window.setTimeout(() => controller.abort(), 20000)", app_js)
+        self.assertIn("The dispatch service did not respond within 20 seconds.", app_js)
+        render_workflow = app_js.split("function renderDispatchWorkflow() {", 1)[1].split(
+            "function dispatchStatusLabel", 1
+        )[0]
+        self.assertLess(
+            render_workflow.index("if (state.dispatch.error && !state.dispatch.loaded)"),
+            render_workflow.index("if (!state.dispatch.loaded && !state.dispatch.loading)"),
+        )
+        self.assertIn(
+            "updateDispatchDepartureAvailability(form);",
+            app_js.split("function refreshDispatchDestinations", 1)[1].split(
+                "function validateDispatchPalletQuantity", 1
+            )[0],
+        )
+
+    def test_dispatcher_code_migration_assigns_matching_dav_location(self):
+        migration_path = os.path.join(
+            os.path.dirname(__file__),
+            "..",
+            "supabase_dispatcher_code_location_migration.sql",
+        )
+        with open(migration_path, encoding="utf-8") as migration_file:
+            migration = migration_file.read()
+
+        self.assertIn("profile.dispatcher_code)) ~ '^D[1-6]$'", migration)
+        self.assertIn("'DAV' || substring(upper(trim(profile.dispatcher_code)) from 2)", migration)
+        self.assertIn("join auth.users as auth_user on auth_user.id = profile.id", migration)
+        self.assertNotIn("auth_user.raw_app_meta_data ->> 'role' = 'dispatcher'", migration)
+        dispatcher_migration_path = os.path.join(
+            os.path.dirname(__file__), "..", "supabase_location_dispatch_migration.sql"
+        )
+        with open(
+            dispatcher_migration_path,
+            encoding="utf-8",
+        ) as dispatcher_migration_file:
+            dispatcher_functions = dispatcher_migration_file.read()
+        self.assertIn(
+            "or users.raw_user_meta_data ->> 'role' = 'dispatcher'",
+            dispatcher_functions,
+        )
+        self.assertIn(
+            "or raw_user_meta_data ->> 'role' = 'dispatcher'",
+            dispatcher_functions,
+        )
+        self.assertIn("information_schema.tables", migration)
+        self.assertIn("profile_table_count > 1", migration)
+        self.assertNotIn("from public.users as profile", migration)
+        self.assertIn("can_depart, can_arrive", migration)
+        self.assertIn("on conflict (user_id, location_id) do update set", migration)
+
+    def test_dispatch_origin_access_is_any_active_origin_but_requires_assignment(self):
+        migration_path = os.path.join(
+            os.path.dirname(__file__),
+            "..",
+            "supabase_dispatch_origin_access_migration.sql",
+        )
+        with open(migration_path, encoding="utf-8") as migration_file:
+            migration = migration_file.read()
+
+        helper = migration.split(
+            "create or replace function public.dispatch_has_location", 1
+        )[1].split(
+            "create or replace function public.list_dispatch_movements", 1
+        )[0]
+        self.assertIn("p_permission = 'depart'", helper)
+        self.assertIn("where location.id = p_location_id", helper)
+        self.assertIn("and location.active", helper)
+        self.assertIn("and assignment.can_depart", helper)
+        self.assertNotIn("auth.jwt() -> 'user_metadata'", helper)
+        self.assertIn("p_permission = 'arrive' and assignment.can_arrive", helper)
+
+        listing = migration.split(
+            "create or replace function public.list_dispatch_movements", 1
+        )[1].split("drop policy if exists dispatch_movements_read", 1)[0]
+        self.assertIn("or movement.departure_user_id = auth.uid()", listing)
+        self.assertIn(
+            "movement.status <> 'completed'\n"
+            "           and public.dispatch_has_location(movement.origin_location_id, 'depart')",
+            listing,
+        )
+        ism_visibility = listing.split("case\n            when", 1)[1].split(
+            "then movement.ism_no", 1
+        )[0]
+        self.assertNotIn(
+            "public.dispatch_has_location(movement.origin_location_id, 'view')",
+            ism_visibility,
+        )
+        self.assertIn("then movement.arrival_manifest_path", listing)
+        movement_policy = migration.split(
+            "create policy dispatch_movements_read", 1
+        )[1].split("drop policy if exists dispatch_audit_read", 1)[0]
+        self.assertIn("public.dispatch_has_location(origin_location_id, 'depart')", movement_policy)
+
+    def test_dispatch_page_reuses_eligible_movements_for_count_and_rows(self):
+        migration_path = os.path.join(
+            os.path.dirname(__file__),
+            "..",
+            "supabase_dispatch_origin_access_migration.sql",
+        )
+        with open(migration_path, encoding="utf-8") as migration_file:
+            migration = migration_file.read()
+
+        page_function = migration.split(
+            "create or replace function public.list_dispatch_movements_page", 1
+        )[1].split("drop policy if exists dispatch_movements_read", 1)[0]
+        self.assertIn("with eligible as materialized", page_function)
+        self.assertEqual(page_function.count("public.list_dispatch_movements()"), 1)
+        self.assertIn("(select count(*) from eligible)", page_function)
+        self.assertIn(
+            "jsonb_agg(\n"
+            "                to_jsonb(page_row)\n"
+            "                order by page_row.departure_at desc, page_row.id",
+            page_function,
+        )
+
+    def test_app_pages_are_not_cached(self):
+        with patch.dict(
+            web_app.app.config,
+            {"TESTING": True, "TEST_AUTH_BYPASS": True},
+        ):
+            client = web_app.app.test_client()
+            with client.session_transaction() as session:
+                session["user_id"] = "test-user"
+
+            index_response = client.get("/")
+            dispatch_response = client.get("/dispatcher/add-trip")
+            self.assertEqual(index_response.headers["Cache-Control"], "no-store")
+            self.assertEqual(
+                dispatch_response.headers["Cache-Control"],
+                "no-store",
+            )
+            index_response.close()
+            dispatch_response.close()
 
     def test_payroll_get_route_is_not_claimed_by_generic_resource_routes(self):
         adapter = web_app.app.url_map.bind("127.0.0.1")
@@ -752,6 +1041,121 @@ class FakeAuthClient:
         if refresh_token != self.auth_session.refresh_token:
             raise ValueError("Invalid refresh token")
         return SimpleNamespace(session=self.auth_session, user=self.user)
+
+class TireMonitoringTests(unittest.TestCase):
+    def test_tire_date_and_percentage_validation(self):
+        self.assertEqual(web_app._tire_date("2026-10-19", "date_installed", True), "2026-10-19")
+        with self.assertRaisesRegex(ValueError, "valid date"):
+            web_app._tire_date("19/10/2026", "date_installed", True)
+        self.assertEqual(web_app._tire_lifespan_percent({"remaining_lifespan_pct": "82.5"}), 82.5)
+        with self.assertRaisesRegex(ValueError, "percentage between 0 and 100"):
+            web_app._tire_lifespan_percent({"remaining_lifespan_pct": 101})
+
+    def test_tire_api_rejects_invalid_pagination_and_install_dates(self):
+        with patch.dict(
+            web_app.app.config, {"TESTING": True, "TEST_AUTH_BYPASS": True}
+        ), patch.object(web_app, "get_manager", return_value=SimpleNamespace()):
+            client = web_app.app.test_client()
+            invalid_page = client.get("/api/tires?page=0")
+            self.assertEqual(invalid_page.status_code, 400)
+
+            with client.session_transaction() as browser_session:
+                browser_session["csrf_token"] = "test-csrf"
+                browser_session["user_id"] = "test-user"
+            invalid_date = client.post(
+                "/api/tires",
+                json={
+                    "asset_type": "truck",
+                    "vehicle_id": 1,
+                    "brand": "Test",
+                    "size": "11R22.5",
+                    "tire_type": "Steer",
+                    "date_installed": "not-a-date",
+                },
+                headers={"X-CSRF-Token": "test-csrf"},
+            )
+            self.assertEqual(invalid_date.status_code, 400)
+            self.assertIn("valid date", invalid_date.json["error"])
+
+            invalid_percentage = client.post(
+                "/api/tires",
+                json={
+                    "asset_type": "truck",
+                    "vehicle_id": 1,
+                    "brand": "Test",
+                    "size": "11R22.5",
+                    "tire_type": "Steer",
+                    "date_installed": "2026-10-19",
+                    "remaining_lifespan_pct": 101,
+                },
+                headers={"X-CSRF-Token": "test-csrf"},
+            )
+            self.assertEqual(invalid_percentage.status_code, 400)
+            self.assertIn("percentage between 0 and 100", invalid_percentage.json["error"])
+    def test_dispatchers_cannot_replace_or_remove_tire_records(self):
+        with patch.dict(
+            web_app.app.config, {"TESTING": True, "TEST_AUTH_BYPASS": True}
+        ), patch.object(web_app, "_is_dispatcher", return_value=True):
+            client = web_app.app.test_client()
+            with client.session_transaction() as browser_session:
+                browser_session["csrf_token"] = "test-csrf"
+                browser_session["user_id"] = "test-user"
+
+            for action in ("replace", "remove"):
+                response = client.post(
+                    f"/api/tires/12/{action}",
+                    json={},
+                    headers={"X-CSRF-Token": "test-csrf"},
+                )
+                self.assertEqual(response.status_code, 403)
+
+    def test_tire_migration_preserves_history_and_enforces_asset_and_role_rules(self):
+        migration_path = os.path.join(
+            os.path.dirname(__file__), "..", "supabase_tire_monitoring_migration.sql"
+        )
+        with open(migration_path, encoding="utf-8") as migration_file:
+            migration = migration_file.read().lower()
+
+        self.assertIn("create table if not exists public.tire_monitoring", migration)
+        self.assertIn("references public.vehicles(id) on delete restrict", migration)
+        self.assertIn("references public.trailers(id) on delete restrict", migration)
+        self.assertIn("tire_monitoring_asset_assignment_check", migration)
+        self.assertIn("tire_monitoring_lifecycle_check", migration)
+        self.assertIn("remaining_lifespan_pct numeric(5, 2) not null default 100", migration)
+        self.assertIn("check (remaining_lifespan_pct between 0 and 100)", migration)
+        self.assertIn("create table if not exists public.tire_monitoring_history", migration)
+        self.assertIn("create policy tire_monitoring_dispatcher_select", migration)
+        self.assertIn("created_by = (select auth.uid())", migration)
+        self.assertIn("create or replace function public.replace_tire_monitoring", migration)
+        self.assertIn("replaces_tire_id bigint references public.tire_monitoring(id)", migration)
+        self.assertIn("add column if not exists replaces_tire_id bigint", migration)
+        self.assertLess(
+            migration.index("add column if not exists replaces_tire_id bigint"),
+            migration.index("on public.tire_monitoring (replaces_tire_id)"),
+        )
+        self.assertIn(
+            "add column if not exists remaining_lifespan_pct numeric(5, 2) not null default 100",
+            migration,
+        )
+        view_definition = migration.split(
+            "create or replace view public.tire_monitoring_sheet", 1
+        )[1].split("create or replace function public.get_tire_monitoring_summary", 1)[0]
+        self.assertNotIn("tire.*", view_definition)
+        self.assertLess(
+            view_definition.index("null::integer as expected_lifespan_days"),
+            view_definition.index("tire.reason"),
+        )
+        self.assertLess(
+            view_definition.index("as plate_number"),
+            view_definition.index("tire.remaining_lifespan_pct::numeric as remaining_lifespan_pct"),
+        )
+        self.assertLess(
+            view_definition.index("tire.remaining_lifespan_pct::numeric as remaining_lifespan_pct"),
+            view_definition.index("tire.replaces_tire_id"),
+        )
+        self.assertIn("btrim(p_brand), btrim(p_size), btrim(p_tire_type), old_tire.id", migration)
+        self.assertNotIn("drop table", migration)
+
 
 class FleetManagerTests(unittest.TestCase):
     def setUp(self):
@@ -1703,27 +2107,19 @@ class FleetManagerTests(unittest.TestCase):
             },
             headers={"X-CSRF-Token": csrf},
         )
-        self.assertEqual(created_trip.status_code, 400)
+        self.assertEqual(created_trip.status_code, 403)
+        self.assertIn("Departure", created_trip.json["error"])
         self.assertEqual(len(self.manager.list_trips(user_id="auth-user-1")), 1)
 
-    def test_dispatcher_can_upload_and_view_owned_trip_manifest_and_fuel_invoice(self):
+    def test_dispatcher_cannot_upload_legacy_trip_manifest(self):
         web_app.manager = self.manager
         web_app.app.config["TESTING"] = True
-        self.manager.client.storage = FakeStorage()
         vehicle = self.manager.add_vehicle("DOC-123", "Toyota", "Hiace", 2022)
         driver = self.manager.add_driver("Document Driver", "DOC-DL-1")
         trip = self.manager.add_trip(
             vehicle["id"], driver["id"], "Origin to Destination", 0, 0,
             ism_no="DOC-TRIP", origin="Origin", destination="Destination",
             created_by="auth-user-1",
-        )
-        other_trip = self.manager.add_trip(
-            vehicle["id"], driver["id"], "Other to Destination", 0, 0,
-            ism_no="OTHER-DOC-TRIP", origin="Other", destination="Destination",
-            created_by="another-dispatcher",
-        )
-        fuel = self.manager.add_fuel(
-            vehicle["id"], "diesel", 20, 1.5, created_by="auth-user-1"
         )
 
         auth_client = FakeAuthClient()
@@ -1732,58 +2128,16 @@ class FleetManagerTests(unittest.TestCase):
         self.sign_in(client, auth_client)
         csrf = self.csrf_token(client)
 
-        image = BytesIO()
-        Image.new("RGB", (2, 2), color="blue").save(image, format="PNG")
-        image_bytes = image.getvalue()
-        with patch.object(web_app, "_admin_recipient_ids", return_value=["admin-user"]):
-            manifest_upload = client.post(
-                f"/api/trips/{trip['id']}/manifest",
-                data={"image": (BytesIO(image_bytes), "manifest.png")},
-                headers={"X-CSRF-Token": csrf},
-            )
-        invoice_upload = client.post(
-            f"/api/fuel/{fuel['id']}/invoice",
-            data={"image": (BytesIO(image_bytes), "invoice.png")},
-            headers={"X-CSRF-Token": csrf},
-        )
-        bootstrap = client.get("/api/bootstrap")
-        manifest_view = client.get(f"/api/trips/{trip['id']}/manifest")
-        invoice_view = client.get(f"/api/fuel/{fuel['id']}/invoice")
-        other_manifest_view = client.get(f"/api/trips/{other_trip['id']}/manifest")
-
-        self.assertEqual(manifest_upload.status_code, 201)
-        self.assertEqual(
-            self.client.tables["notifications"][0]["notification_type"],
-            "NEW_LOAD_MANIFEST",
-        )
-        self.assertEqual(invoice_upload.status_code, 201)
-        self.assertEqual(
-            bootstrap.json["trips"][0]["manifest_image_url"],
+        response = client.post(
             f"/api/trips/{trip['id']}/manifest",
-        )
-        self.assertTrue(bootstrap.json["fuel_logs"][0]["invoice_image_url"].endswith("/invoice"))
-        self.assertEqual(manifest_view.status_code, 200)
-        self.assertEqual(invoice_view.status_code, 200)
-        self.assertEqual(manifest_view.mimetype, "image/png")
-        self.assertEqual(manifest_view.data, image_bytes)
-        self.assertEqual(invoice_view.data, image_bytes)
-        self.assertEqual(other_manifest_view.status_code, 403)
-
-        other_manifest_upload = client.post(
-            f"/api/trips/{other_trip['id']}/manifest",
-            data={"image": (BytesIO(image_bytes), "manifest.png")},
+            data={"image": (BytesIO(b"legacy manifest"), "manifest.png")},
             headers={"X-CSRF-Token": csrf},
         )
-        self.assertEqual(other_manifest_upload.status_code, 403)
+        self.assertEqual(response.status_code, 403)
+        self.assertIn("Departure", response.json["error"])
+        self.assertFalse(self.client.tables.get("notifications"))
 
-        invalid_image = client.post(
-            f"/api/trips/{trip['id']}/manifest",
-            data={"image": (BytesIO(b"not an image"), "manifest.png")},
-            headers={"X-CSRF-Token": csrf},
-        )
-        self.assertEqual(invalid_image.status_code, 400)
-
-    def test_dispatcher_can_edit_owned_trip_and_view_its_edit_history(self):
+    def test_dispatcher_cannot_edit_legacy_trip_but_can_view_its_history(self):
         web_app.manager = self.manager
         web_app.app.config["TESTING"] = True
         self.configure_davao_plas_routes()
@@ -1850,16 +2204,12 @@ class FleetManagerTests(unittest.TestCase):
             headers={"X-CSRF-Token": csrf},
         )
 
-        self.assertEqual(response.status_code, 200)
-        self.assertEqual(response.json["data"]["ism_no"], "EDIT-TRIP-UPDATED")
-        self.assertEqual(response.json["data"]["route"], "GENSAN to DAV2")
-        self.assertEqual(response.json["data"]["route_number"], 7)
-        self.assertEqual(response.json["data"]["truck_route_rate"], "11000.00")
-        self.assertEqual(response.json["data"]["last_edited_by"], "auth-user-1")
+        self.assertEqual(response.status_code, 403)
+        self.assertIn("Departure", response.json["error"])
         self.assertEqual(denied.status_code, 403)
         self.assertEqual(
             self.manager.get_trip(own_trip["id"])["destination"],
-            "DAV2",
+            "PLAS",
         )
         self.manager.client.tables["trip_edit_history"] = [{
             "id": 1,
@@ -1896,21 +2246,23 @@ class FleetManagerTests(unittest.TestCase):
         self.sign_in(client, auth_client)
         csrf = self.csrf_token(client)
 
+        trip_response = client.post(
+            "/api/trips",
+            json={
+                "ism_no": "31946326",
+                "shipment_date": "2026-10-08",
+                "origin": "GENSAN",
+                "destination": "DAV2",
+                "truck_id": vehicle["id"],
+                "trailer_id": trailer["id"],
+                "vehicle_id": vehicle["id"],
+                "driver_id": driver["id"],
+            },
+            headers={"X-CSRF-Token": csrf},
+        )
+        self.assertEqual(trip_response.status_code, 403)
+
         requests = [
-            (
-                "trips",
-                {
-                    "ism_no": "31946326",
-                    "shipment_date": "2026-10-08",
-                    "origin": "GENSAN",
-                    "destination": "DAV2",
-                    "truck_id": vehicle["id"],
-                    "trailer_id": trailer["id"],
-                    "vehicle_id": vehicle["id"],
-                    "driver_id": driver["id"],
-                },
-                "NEW_TRIP",
-            ),
             (
                 "fuel",
                 {
@@ -1945,7 +2297,7 @@ class FleetManagerTests(unittest.TestCase):
                 created_records.append((response.json["data"], expected_type))
 
         notifications = self.client.tables["notifications"]
-        self.assertEqual(len(notifications), 3)
+        self.assertEqual(len(notifications), 2)
         for record, expected_type in created_records:
             matching = [
                 item for item in notifications
@@ -1958,8 +2310,10 @@ class FleetManagerTests(unittest.TestCase):
             self.assertEqual(matching[0]["actor_user_id"], "auth-user-1")
             self.assertEqual(matching[0]["actor_name"], "Juan Dela Cruz")
             self.assertFalse(matching[0]["is_read"])
-        self.assertIn("GENSAN → DAV2", notifications[0]["message"])
-        self.assertIn("31946326", notifications[0]["message"])
+        self.assertNotIn(
+            "31946326",
+            [item.get("ism_no") for item in self.client.tables["trips"]],
+        )
 
     def test_dispatcher_notification_creation_is_idempotent_per_record(self):
         web_app.manager = self.manager
@@ -2075,14 +2429,8 @@ class FleetManagerTests(unittest.TestCase):
         self.assertEqual(client.get("/api/notifications").status_code, 403)
         self.assertEqual(client.get("/api/notifications/unread-count").status_code, 403)
 
-    def test_notification_failure_does_not_fail_successful_dispatcher_record(self):
+    def test_notification_failure_does_not_fail_successful_dispatcher_fuel_record(self):
         vehicle = self.manager.add_vehicle("NOTIFY-FAIL", "Toyota", "Hiace", 2024)
-        trailer = self.manager.add_trailer("NOTIFY-FAIL-TRAILER", 36)
-        self.configure_route(
-            7, "GENSAN", "DAV2", "GENSAN ↔ DAV2",
-            {36: "11000.00", 46: "14000.00"},
-        )
-        driver = self.manager.add_driver("Notify Fail Driver", "NOTIFY-DL-FAIL")
         web_app.manager = self.manager
         web_app.app.config["TESTING"] = True
         auth_client = FakeAuthClient()
@@ -2092,21 +2440,19 @@ class FleetManagerTests(unittest.TestCase):
         csrf = self.csrf_token(client)
 
         payload = {
-            "shipment_date": "2026-10-08",
-            "origin": "GENSAN",
-            "destination": "DAV2",
-            "truck_id": vehicle["id"],
-            "trailer_id": trailer["id"],
             "vehicle_id": vehicle["id"],
-            "driver_id": driver["id"],
+            "fuel_type": "Diesel",
+            "quantity": 50,
+            "price_per_liter": 70,
+            "total_cost": 3500,
         }
         with patch.object(
             self.manager,
-            "add_trip",
-            side_effect=FleetManagementError("Trip insert failed"),
+            "add_fuel",
+            side_effect=FleetManagementError("Fuel log insert failed"),
         ):
             failed_insert = client.post(
-                "/api/trips",
+                "/api/fuel",
                 json=payload,
                 headers={"X-CSRF-Token": csrf},
             )
@@ -2118,13 +2464,13 @@ class FleetManagerTests(unittest.TestCase):
         ):
             with self.assertLogs(web_app.logger, level="ERROR"):
                 response = client.post(
-                    "/api/trips",
+                    "/api/fuel",
                     json=payload,
                     headers={"X-CSRF-Token": csrf},
                 )
 
         self.assertEqual(response.status_code, 201)
-        self.assertEqual(len(self.client.tables["trips"]), 1)
+        self.assertEqual(len(self.client.tables["fuel_logs"]), 1)
         self.assertFalse(self.client.tables.get("notifications"))
 
     def test_web_reports_missing_supabase_configuration(self):

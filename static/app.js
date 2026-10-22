@@ -7,7 +7,8 @@ const TITLES = {
   assignments: "Assignments",
   maintenance: "Maintenance",
   fuel: "Fuel logs",
-  trips: "Trips",
+  tires: "Tire Monitoring Sheet",
+  trips: "Movement workflow",
   payroll: "Payroll",
   revenue: "Revenue & hauling performance",
 };
@@ -246,6 +247,28 @@ const state = {
   payroll: null,
   payrollKey: "",
   payrollRequestedKey: "",
+  tires: {
+    items: [],
+    summary: null,
+    total: 0,
+    page: 1,
+    page_size: 25,
+    search: "",
+    asset_type: "",
+    asset_id: "",
+    status: "",
+    date_from: "",
+    date_to: "",
+    lifespan_min: "",
+    lifespan_max: "",
+    condition: "",
+    sort_by: "date_installed",
+    sort_dir: "desc",
+    warning_percent: 20,
+    requestedKey: "",
+    loading: false,
+    error: "",
+  },
   revenue: {
     start_date: `${businessToday.slice(0, 7)}-01`,
     end_date: businessToday,
@@ -277,6 +300,21 @@ const state = {
   bulkDeletingTrips: false,
   vehicleSection: "trucks",
   editingTrip: null,
+  dispatch: {
+    tab: "departures",
+    movements: [],
+    total: 0,
+    locations: [],
+    users: [],
+    assignments: [],
+    loaded: false,
+    loading: false,
+    requestId: 0,
+    error: "",
+    search: "",
+    page: 1,
+    departureOrigin: "",
+  },
   tripWizard: {
     step: 0,
     dirty: false,
@@ -1731,7 +1769,1061 @@ function lockTripWizardForm(form) {
   });
 }
 
+function tireQueryKey() {
+  const {
+    items, summary, total, loading, error, requestedKey, warning_percent, ...filters
+  } = state.tires;
+  return JSON.stringify(filters);
+}
+
+async function loadTireMonitoring() {
+  const key = tireQueryKey();
+  state.tires.requestedKey = key;
+  state.tires.loading = true;
+  state.tires.error = "";
+  if (state.page === "tires") render();
+  const params = new URLSearchParams();
+  for (const keyName of [
+    "search", "asset_type", "asset_id", "status", "date_from", "date_to",
+    "lifespan_min", "lifespan_max", "condition", "sort_by", "sort_dir",
+  ]) {
+    if (state.tires[keyName]) params.set(keyName, state.tires[keyName]);
+  }
+  params.set("page", String(state.tires.page));
+  params.set("page_size", String(state.tires.page_size));
+  try {
+    const result = await api(`/api/tires?${params.toString()}`);
+    if (key !== tireQueryKey() || state.page !== "tires") return;
+    state.tires.items = result.data || [];
+    state.tires.summary = result.summary || {};
+    state.tires.total = Number(result.total || 0);
+    state.tires.warning_percent = Number(result.warning_percent ?? 20);
+  } catch (error) {
+    if (key !== tireQueryKey() || state.page !== "tires") return;
+    state.tires.error = error.message || "Could not load tire records.";
+  } finally {
+    if (key === state.tires.requestedKey) {
+      state.tires.loading = false;
+      if (state.page === "tires") render();
+    }
+  }
+}
+
+function tireLifeMarkup(row) {
+  if (row.remaining_lifespan_pct === null || row.remaining_lifespan_pct === undefined
+      || row.remaining_lifespan_pct === "") return "N/A";
+  const value = Number(row.remaining_lifespan_pct);
+  if (!Number.isFinite(value)) return "N/A";
+  const percent = Math.max(0, Math.min(100, value));
+  const warning = percent <= state.tires.warning_percent;
+  return `<span class="tire-life ${warning ? "is-warning" : ""}">
+    <span class="tire-life-track" role="progressbar" aria-label="Remaining tire lifespan"
+      aria-valuemin="0" aria-valuemax="100" aria-valuenow="${percent.toFixed(1)}">
+      <span style="width:${percent}%"></span>
+    </span><strong>${percent.toFixed(1)}%</strong></span>`;
+}
+
+function tireStatusBadge(status) {
+  const label = status === "installed" ? "Installed" : status === "replaced" ? "Replaced" : "Removed";
+  return `<span class="badge badge-${escapeHtml(status)}">${label}</span>`;
+}
+
+function tireMonitoringTable() {
+  const labels = [
+    "Reference No.", "Brand", "Size", "Type", "Serial No.", "Supplier",
+    "Date Installed", "Date Replaced", "Life Span (%)", "Reason", "Remarks", "Plate Number",
+  ];
+  const records = state.tires.items;
+  if (state.tires.loading) {
+    return '<div class="empty-state" role="status"><strong>Loading tire records…</strong></div>';
+  }
+  if (state.tires.error) {
+    return `<div class="error-card tire-error"><p class="eyebrow">TIRE RECORDS</p><h2>Could not load tire data</h2><p>${escapeHtml(state.tires.error)}</p><button class="button button-primary" data-action="tire-retry" type="button">Try again</button></div>`;
+  }
+  if (!records.length) {
+    return '<div class="empty-state"><span aria-hidden="true">◉</span><strong>No tire records match these filters</strong><small>Add a tire or adjust the filters.</small></div>';
+  }
+  return `<div class="table-wrap tire-table-wrap"><table class="tire-table">
+    <thead><tr>${labels.map((label) => `<th scope="col">${escapeHtml(label)}</th>`).join("")}<th scope="col">Status</th><th scope="col">Actions</th></tr></thead>
+    <tbody>${records.map((row) => {
+      const rowValues = [
+        row.reference_no, row.brand, row.size, row.tire_type, row.serial_no,
+        row.supplier, row.date_installed, row.date_replaced || "—",
+      ];
+      return `<tr>
+        ${rowValues.map((value, index) => `<td data-label="${labels[index]}">${escapeHtml(value || "—")}</td>`).join("")}
+        <td data-label="Life Span (%)">${tireLifeMarkup(row)}</td>
+        <td data-label="Reason"><span class="tire-cell-detail" title="${escapeHtml(row.reason || "")}">${escapeHtml(row.reason || "—")}</span></td>
+        <td data-label="Remarks"><span class="tire-cell-detail" title="${escapeHtml(row.remarks || "")}">${escapeHtml(row.remarks || "—")}</span></td>
+        <td data-label="Plate Number"><strong>${escapeHtml(row.plate_number || "—")}</strong><small class="tire-asset-type">${escapeHtml(row.asset_type || "")}</small></td>
+        <td data-label="Status">${tireStatusBadge(row.status)}</td>
+        <td data-label="Actions" class="tire-actions">
+          <button class="button button-secondary button-small" type="button" data-action="tire-view" data-id="${escapeHtml(row.id)}">View</button>
+          ${state.data.user?.role === "administrator" ? `
+            <button class="button button-secondary button-small" type="button" data-action="tire-edit" data-id="${escapeHtml(row.id)}">Edit</button>
+            ${row.status === "installed" ? `<button class="button button-secondary button-small" type="button" data-action="tire-replace" data-id="${escapeHtml(row.id)}">Replace</button><button class="button button-secondary button-small tire-remove-button" type="button" data-action="tire-remove" data-id="${escapeHtml(row.id)}">Remove</button>` : ""}
+          ` : ""}
+        </td>
+      </tr>`;
+    }).join("")}</tbody>
+  </table></div>`;
+}
+
+function updateTireAssetOptions(form) {
+  const assetType = form.elements.namedItem("asset_type")?.value;
+  const select = form.elements.namedItem("asset_id");
+  if (!select) return;
+  const records = assetType === "truck"
+    ? state.data.vehicles || []
+    : assetType === "trailer" ? state.data.trailers || [] : [];
+  select.innerHTML = `<option value="">${records.length ? "Select a plate number" : "No matching assets available"}</option>${records.map((record) =>
+    `<option value="${escapeHtml(assetType)}:${escapeHtml(record.id)}">${escapeHtml(record.plate_number)}</option>`,
+  ).join("")}`;
+  select.disabled = records.length === 0;
+}
+
+function tireFormField(name, label, type = "text", value = "", options = {}) {
+  const id = `tire-${options.form || "record"}-${name}`;
+  const required = options.required ? "required" : "";
+  const min = options.min !== undefined ? `min="${escapeHtml(options.min)}"` : "";
+  const max = options.max !== undefined ? `max="${escapeHtml(options.max)}"` : "";
+  const step = options.step ? `step="${escapeHtml(options.step)}"` : "";
+  const placeholder = options.placeholder ? `placeholder="${escapeHtml(options.placeholder)}"` : "";
+  if (type === "textarea") {
+    return `<label class="form-field" for="${id}"><span>${escapeHtml(label)}${options.required ? " *" : ""}</span><textarea id="${id}" name="${name}" rows="3" ${required}>${escapeHtml(value)}</textarea></label>`;
+  }
+  return `<label class="form-field" for="${id}"><span>${escapeHtml(label)}${options.required ? " *" : ""}</span><input id="${id}" name="${name}" type="${type}" value="${escapeHtml(value)}" ${min} ${max} ${step} ${placeholder} ${required} /></label>`;
+}
+
+function tireRecordFormMarkup(mode, row = {}) {
+  const isReplace = mode === "replace";
+  const isEdit = mode === "edit";
+  const formId = isReplace ? "tire-replace-form" : isEdit ? "tire-edit-form" : "tire-record-form";
+  const title = isReplace ? "Replace tire" : isEdit ? "Edit tire details" : "Add tire record";
+  const fields = [];
+  if (!isEdit) {
+    if (!isReplace) {
+      fields.push(`<label class="form-field" for="tire-record-asset-type"><span>Asset Type *</span><select id="tire-record-asset-type" name="asset_type" required><option value="">Select asset type</option><option value="truck">Truck</option><option value="trailer">Trailer</option></select></label>`);
+      fields.push(`<label class="form-field" for="tire-record-asset_id"><span>Plate Number *</span><select id="tire-record-asset_id" name="asset_id" required><option value="">Select asset type first</option></select></label>`);
+    } else {
+      fields.push(`<label class="form-field" for="tire-replace-plate"><span>Assigned asset</span><input id="tire-replace-plate" value="${escapeHtml(`${row.plate_number || "—"} · ${capitalize(row.asset_type || "")}`)}" readonly /></label>`);
+      fields.push(tireFormField("date_replaced", "Replacement Date", "date", businessToday, { required: true, form: "replace" }));
+      fields.push(tireFormField("reason", "Replacement Reason", "text", "", { required: true, form: "replace" }));
+    }
+  }
+  fields.push(tireFormField("brand", "Brand", "text", isReplace ? row.brand : row.brand || "", { required: true, form: isReplace ? "replace" : isEdit ? "edit" : "record" }));
+  fields.push(tireFormField("size", "Size", "text", row.size || "", { required: true, placeholder: "e.g. 11R22.5", form: isReplace ? "replace" : isEdit ? "edit" : "record" }));
+  fields.push(tireFormField("tire_type", "Type", "text", row.tire_type || "", { required: true, placeholder: "Steer, drive, trailer…", form: isReplace ? "replace" : isEdit ? "edit" : "record" }));
+  fields.push(tireFormField(
+    "serial_no",
+    "Serial No. (optional)",
+    "text",
+    isEdit ? row.serial_no || "" : "",
+    { form: isReplace ? "replace" : isEdit ? "edit" : "record" },
+  ));
+  fields.push(tireFormField("supplier", "Supplier", "text", row.supplier || "", { form: isReplace ? "replace" : isEdit ? "edit" : "record" }));
+  if (isEdit) {
+    fields.push(`<div class="tire-edit-assignment"><strong>Assigned asset</strong><span>${escapeHtml(row.plate_number || "—")} · ${escapeHtml(capitalize(row.asset_type || ""))}</span><small>Installed ${escapeHtml(row.date_installed || "—")}; assignment and installation history cannot be edited.</small></div>`);
+  } else if (!isReplace) {
+    fields.push(tireFormField("date_installed", "Date Installed", "date", businessToday, { required: true, form: "record" }));
+  }
+  fields.push(tireFormField(
+    "remaining_lifespan_pct",
+    "Life Span (%)",
+    "number",
+    isReplace ? 100 : (row.remaining_lifespan_pct ?? 100),
+    { required: true, min: 0, max: 100, step: "0.1", form: isReplace ? "replace" : isEdit ? "edit" : "record" },
+  ));
+  if (isEdit && row.reason) fields.push(tireFormField("reason", "Reason", "text", row.reason, { form: "edit" }));
+  fields.push(tireFormField("remarks", "Remarks", "textarea", row.remarks || "", { form: isReplace ? "replace" : isEdit ? "edit" : "record" }));
+  return `<div class="dialog-header"><div><p class="eyebrow">TIRE MONITORING</p><h2 id="tire-dialog-title">${title}</h2></div><button class="icon-button dialog-close" data-action="close-tire-dialog" type="button" aria-label="Close tire form">×</button></div>
+    <form class="dialog-form tire-record-form" id="${formId}" data-tire-id="${escapeHtml(row.id || "")}">
+      <div class="dialog-fields">${fields.join("")}</div>
+      ${isReplace ? '<p class="field-hint">The replaced tire remains in the history, and the new tire is assigned to the same asset.</p>' : ""}
+      <p class="field-hint">Life span is the recorded remaining-life percentage; inspect tread and tire condition physically.</p>
+      <p class="dialog-error" role="alert" hidden></p>
+      <div class="dialog-actions"><button class="button button-secondary" data-action="close-tire-dialog" type="button">Cancel</button><button class="button button-primary" type="submit">${isReplace ? "Confirm replacement" : isEdit ? "Save changes" : "Save tire"}</button></div>
+    </form>`;
+}
+
+function renderTireMonitoring() {
+  const tires = state.tires;
+  const summary = tires.summary || {};
+  const summaryValue = (key) => tires.summary
+    ? formatNumber(summary[key] || 0)
+    : "—";
+  const admin = state.data.user?.role === "administrator";
+  const selectedType = tires.asset_type;
+  const assets = selectedType === "truck" ? state.data.vehicles || []
+    : selectedType === "trailer" ? state.data.trailers || [] : [];
+  const maxPage = Math.max(1, Math.ceil(tires.total / tires.page_size));
+  return `
+    ${header("FUEL & MAINTENANCE", "Tire Monitoring Sheet", "Track truck and trailer tire assignments, replacement history, and estimated remaining service life.", `<button class="button button-secondary" data-action="tire-export" type="button" ${tires.loading ? "disabled" : ""}>Export CSV</button><button class="button button-primary" data-action="tire-add" type="button" ${tires.loading ? "disabled" : ""}><span aria-hidden="true">＋</span> Add Tire</button>`)}
+    <section class="tire-monitoring-page">
+      <div class="stats-grid tire-summary-grid">
+        ${statCard("Total Tire Records", summaryValue("total_records"), "blue", "◉")}
+        ${statCard("Currently Installed", summaryValue("installed_tires"), "green", "✓")}
+        ${statCard("Near End of Lifespan", summaryValue("near_end_tires"), "pink", "⌁", `At or below ${tires.warning_percent}% remaining`)}
+        ${statCard("Replaced Tires", summaryValue("replaced_tires"), "sky", "↻")}
+      </div>
+      <section class="panel records-panel tire-records-panel">
+        <div class="panel-heading records-heading">
+          <div><p class="eyebrow">TIRE HISTORY</p><h2>Records</h2></div>
+          <span class="record-count">${formatNumber(tires.total)} ${tires.total === 1 ? "record" : "records"}</span>
+        </div>
+        <form class="tire-filters" id="tire-filter-form">
+          <label class="search-box tire-search"><span class="sr-only">Search tires</span><span aria-hidden="true">⌕</span><input type="search" id="tire-search" name="search" placeholder="Reference, brand, size, serial, supplier…" value="${escapeHtml(tires.search)}" /></label>
+          <label class="form-field"><span>Asset Type</span><select name="asset_type" data-tire-filter><option value="">All assets</option><option value="truck" ${selectedType === "truck" ? "selected" : ""}>Truck</option><option value="trailer" ${selectedType === "trailer" ? "selected" : ""}>Trailer</option></select></label>
+          <label class="form-field"><span>Plate Number</span><select name="asset_id" data-tire-filter ${selectedType ? "" : "disabled"}><option value="">All plates</option>${assets.map((asset) => `<option value="${escapeHtml(asset.id)}" ${String(asset.id) === tires.asset_id ? "selected" : ""}>${escapeHtml(asset.plate_number)}</option>`).join("")}</select></label>
+          <label class="form-field"><span>Tire Status</span><select name="status" data-tire-filter><option value="">All statuses</option><option value="installed" ${tires.status === "installed" ? "selected" : ""}>Installed</option><option value="replaced" ${tires.status === "replaced" ? "selected" : ""}>Replaced</option><option value="removed" ${tires.status === "removed" ? "selected" : ""}>Removed</option></select></label>
+          <label class="form-field"><span>Installed From</span><input type="date" name="date_from" value="${escapeHtml(tires.date_from)}" data-tire-filter /></label>
+          <label class="form-field"><span>Installed To</span><input type="date" name="date_to" value="${escapeHtml(tires.date_to)}" data-tire-filter /></label>
+          <label class="form-field"><span>Life Span Min (%)</span><input type="number" name="lifespan_min" min="0" max="100" value="${escapeHtml(tires.lifespan_min)}" data-tire-filter /></label>
+          <label class="form-field"><span>Life Span Max (%)</span><input type="number" name="lifespan_max" min="0" max="100" value="${escapeHtml(tires.lifespan_max)}" data-tire-filter /></label>
+          <label class="form-field"><span>Condition</span><select name="condition" data-tire-filter><option value="">Any condition</option><option value="near_end" ${tires.condition === "near_end" ? "selected" : ""}>Near end (≤ ${tires.warning_percent}%)</option><option value="above_warning" ${tires.condition === "above_warning" ? "selected" : ""}>Above warning level</option></select></label>
+          <label class="form-field"><span>Sort By</span><select name="sort_by" data-tire-filter><option value="date_installed" ${tires.sort_by === "date_installed" ? "selected" : ""}>Installation date</option><option value="lifespan" ${tires.sort_by === "lifespan" ? "selected" : ""}>Lifespan</option><option value="brand" ${tires.sort_by === "brand" ? "selected" : ""}>Brand</option><option value="plate" ${tires.sort_by === "plate" ? "selected" : ""}>Plate number</option></select></label>
+          <label class="form-field"><span>Sort Direction</span><select name="sort_dir" data-tire-filter><option value="desc" ${tires.sort_dir === "desc" ? "selected" : ""}>Descending</option><option value="asc" ${tires.sort_dir === "asc" ? "selected" : ""}>Ascending</option></select></label>
+          <button class="button button-secondary button-small tire-reset-button" type="button" data-action="tire-reset">Reset filters</button>
+        </form>
+        ${tireMonitoringTable()}
+        <div class="tire-pagination" aria-label="Tire record pages">
+          <span>Page ${tires.page} of ${maxPage} · ${formatNumber(tires.total)} records</span>
+          <div><button class="button button-secondary button-small" type="button" data-action="tire-page" data-page="${tires.page - 1}" ${tires.page <= 1 || tires.loading ? "disabled" : ""}>Previous</button><button class="button button-secondary button-small" type="button" data-action="tire-page" data-page="${tires.page + 1}" ${tires.page >= maxPage || tires.loading ? "disabled" : ""}>Next</button></div>
+        </div>
+      </section>
+      <p class="tire-lifespan-note">Life Span (%) is the recorded estimate of remaining tire life. New tires default to 100%; update the percentage after inspections or service. It does not replace physical tread inspection.</p>
+      <dialog class="record-dialog tire-dialog" id="tire-dialog" aria-labelledby="tire-dialog-title"><div id="tire-dialog-content"></div></dialog>
+    </section>`;
+}
+
+function tireDialogContent(markup, focusSelector = "input, select, textarea") {
+  const dialog = view.querySelector("#tire-dialog");
+  const content = view.querySelector("#tire-dialog-content");
+  if (!dialog || !content) return null;
+  content.innerHTML = markup;
+  if (!dialog.open) dialog.showModal();
+  content.querySelector(focusSelector)?.focus();
+  return dialog;
+}
+
+function tireHistoryMarkup(entries) {
+  if (!entries.length) return '<p class="tire-history-empty">No audit history is available.</p>';
+  return `<ol class="tire-history-list">${entries.map((entry) => {
+    const timestamp = new Date(entry.created_at);
+    const timeLabel = Number.isNaN(timestamp.getTime())
+      ? entry.created_at || ""
+      : new Intl.DateTimeFormat(undefined, { dateStyle: "medium", timeStyle: "short" }).format(timestamp);
+    const snapshot = entry.new_values && JSON.stringify(entry.new_values, null, 2);
+    return `<li><div><strong>${escapeHtml(capitalize(entry.action || "updated"))}</strong><time>${escapeHtml(timeLabel)}</time></div>
+      <small>Recorded by ${escapeHtml(entry.actor_id || "system")}</small>
+      ${snapshot ? `<details><summary>View recorded details</summary><pre>${escapeHtml(snapshot)}</pre></details>` : ""}
+    </li>`;
+  }).join("")}</ol>`;
+}
+
+async function openTireDetails(tireId) {
+  const dialog = view.querySelector("#tire-dialog");
+  if (!dialog) return;
+  tireDialogContent('<div class="dialog-header"><div><p class="eyebrow">TIRE MONITORING</p><h2 id="tire-dialog-title">Loading tire details…</h2></div><button class="icon-button dialog-close" data-action="close-tire-dialog" type="button" aria-label="Close tire details">×</button></div><p class="loading-card">Loading record and audit history…</p>', ".loading-card");
+  try {
+    const result = await api(`/api/tires/${encodeURIComponent(tireId)}`);
+    const row = result.data;
+    const entries = [
+      ["Reference No.", row.reference_no],
+      ["Asset", `${row.plate_number || "—"} · ${capitalize(row.asset_type || "")}`],
+      ["Status", tireStatusBadge(row.status)],
+      ["Brand", row.brand],
+      ["Size", row.size],
+      ["Type", row.tire_type],
+      ["Serial No.", row.serial_no],
+      ["Supplier", row.supplier],
+      ["Date Installed", row.date_installed],
+      ["Date Replaced", row.date_replaced],
+      ["Replaces Tire", result.replaces ? `${result.replaces.reference_no} · ${result.replaces.brand} ${result.replaces.size}` : null],
+      ["Replacement Tire", result.replacement ? `${result.replacement.reference_no} · ${result.replacement.brand} ${result.replacement.size}` : null],
+      ["Remaining Lifespan", tireLifeMarkup(row)],
+      ["Reason", row.reason],
+      ["Remarks", row.remarks],
+      ["Created", row.created_at],
+    ];
+    const detailRows = entries.map(([label, value]) =>
+      `<div class="tire-detail-row"><dt>${escapeHtml(label)}</dt><dd>${label === "Status" || label === "Remaining Lifespan" ? value || "—" : escapeHtml(value || "—")}</dd></div>`,
+    ).join("");
+    const adminActions = state.data.user?.role === "administrator" ? `
+      <button class="button button-secondary" data-action="tire-edit" data-id="${escapeHtml(row.id)}" type="button">Edit details</button>
+      ${row.status === "installed" ? `<button class="button button-secondary" data-action="tire-replace" data-id="${escapeHtml(row.id)}" type="button">Replace tire</button><button class="button button-secondary tire-remove-button" data-action="tire-remove" data-id="${escapeHtml(row.id)}" type="button">Remove tire</button>` : ""}
+    ` : "";
+    tireDialogContent(`
+      <div class="dialog-header"><div><p class="eyebrow">TIRE MONITORING · ${escapeHtml(row.reference_no)}</p><h2 id="tire-dialog-title">Tire details</h2></div><button class="icon-button dialog-close" data-action="close-tire-dialog" type="button" aria-label="Close tire details">×</button></div>
+      <div class="tire-details-content"><dl class="tire-details-grid">${detailRows}</dl>
+        <section class="tire-history"><h3>Assignment and audit history</h3>${tireHistoryMarkup(result.history || [])}</section>
+        <div class="dialog-actions">${adminActions}<button class="button button-secondary" data-action="close-tire-dialog" type="button">Close</button></div>
+      </div>`, ".tire-details-content");
+  } catch (error) {
+    tireDialogContent(`<div class="dialog-header"><div><p class="eyebrow">TIRE MONITORING</p><h2 id="tire-dialog-title">Could not load details</h2></div><button class="icon-button dialog-close" data-action="close-tire-dialog" type="button" aria-label="Close tire details">×</button></div><div class="tire-details-content"><p class="dialog-error">${escapeHtml(error.message)}</p><button class="button button-secondary" data-action="close-tire-dialog" type="button">Close</button></div>`, ".tire-details-content");
+  }
+}
+
+async function openTireEdit(tireId) {
+  try {
+    const result = await api(`/api/tires/${encodeURIComponent(tireId)}`);
+    tireDialogContent(tireRecordFormMarkup("edit", result.data));
+  } catch (error) {
+    showToast(error.message, "error");
+  }
+}
+
+function openTireRemove(tireId) {
+  const row = state.tires.items.find((item) => String(item.id) === String(tireId));
+  if (!row) return;
+  tireDialogContent(`
+    <div class="dialog-header"><div><p class="eyebrow">TIRE MONITORING</p><h2 id="tire-dialog-title">Remove tire</h2></div><button class="icon-button dialog-close" data-action="close-tire-dialog" type="button" aria-label="Close removal form">×</button></div>
+    <form class="dialog-form tire-record-form" id="tire-remove-form" data-tire-id="${escapeHtml(row.id)}">
+      <p>Remove <strong>${escapeHtml(row.reference_no)}</strong> from <strong>${escapeHtml(row.plate_number || "—")}</strong>. The record will be retained in history.</p>
+      <div class="dialog-fields">${tireFormField("date_replaced", "Removal Date", "date", businessToday, { required: true, form: "remove" })}${tireFormField("reason", "Removal Reason", "text", "", { required: true, form: "remove" })}</div>
+      <p class="dialog-error" role="alert" hidden></p>
+      <div class="dialog-actions"><button class="button button-secondary" data-action="close-tire-dialog" type="button">Cancel</button><button class="button button-primary tire-remove-button" type="submit">Confirm removal</button></div>
+    </form>`);
+}
+
+async function submitTireForm(form) {
+  const mode = form.id === "tire-edit-form" ? "edit"
+    : form.id === "tire-replace-form" ? "replace"
+      : form.id === "tire-remove-form" ? "remove" : "create";
+  if (mode === "replace" && !window.confirm("Replace this tire? The current record will be retained and marked replaced.")) return;
+  if (mode === "remove" && !window.confirm("Remove this tire? Its record will be retained and marked removed.")) return;
+
+  const submit = form.querySelector('button[type="submit"]');
+  const errorMessage = form.querySelector(".dialog-error");
+  const payload = Object.fromEntries(new FormData(form).entries());
+  if (payload.remaining_lifespan_pct !== undefined) {
+    payload.remaining_lifespan_pct = Number(payload.remaining_lifespan_pct);
+  }
+  if (mode === "create") {
+    const [assetType, rawId] = String(payload.asset_id || "").split(":");
+    if (!assetType || !rawId) {
+      errorMessage.textContent = "Select a valid truck or trailer.";
+      errorMessage.hidden = false;
+      return;
+    }
+    delete payload.asset_id;
+    payload.asset_type = assetType;
+    payload[assetType === "truck" ? "vehicle_id" : "trailer_id"] = Number(rawId);
+  }
+  submit.disabled = true;
+  errorMessage.hidden = true;
+  try {
+    const tireId = encodeURIComponent(form.dataset.tireId);
+    const endpoint = mode === "edit" ? `/api/tires/${tireId}`
+      : mode === "replace" ? `/api/tires/${tireId}/replace`
+        : mode === "remove" ? `/api/tires/${tireId}/remove` : "/api/tires";
+    await api(endpoint, {
+      method: mode === "edit" ? "PATCH" : "POST",
+      body: JSON.stringify(payload),
+    });
+    form.closest("dialog")?.close();
+    showToast(mode === "replace" ? "Tire replacement recorded; the previous tire remains in history."
+      : mode === "remove" ? "Tire removal recorded; the tire history was preserved."
+        : mode === "edit" ? "Tire details updated."
+          : "Tire record saved.");
+    state.tires.requestedKey = "";
+    render();
+  } catch (error) {
+    errorMessage.textContent = error.message || "Could not save this tire record.";
+    errorMessage.hidden = false;
+  } finally {
+    if (submit.isConnected) submit.disabled = false;
+  }
+}
+
+async function exportTireMonitoring(button) {
+  const params = new URLSearchParams();
+  for (const key of [
+    "search", "asset_type", "asset_id", "status", "date_from", "date_to",
+    "lifespan_min", "lifespan_max", "condition", "sort_by", "sort_dir",
+  ]) {
+    if (state.tires[key]) params.set(key, state.tires[key]);
+  }
+  params.set("export", "csv");
+  button.disabled = true;
+  try {
+    const response = await fetch(`/api/tires?${params.toString()}`, { cache: "no-store" });
+    if (!response.ok) {
+      const result = await response.json().catch(() => ({}));
+      if (response.status === 401) returnToSignIn();
+      throw new Error(result.error || `Export failed (${response.status})`);
+    }
+    const objectUrl = URL.createObjectURL(await response.blob());
+    const link = document.createElement("a");
+    link.href = objectUrl;
+    link.download = "tire-monitoring.csv";
+    link.click();
+    URL.revokeObjectURL(objectUrl);
+  } catch (error) {
+    showToast(error.message || "Could not export tire records.", "error");
+  } finally {
+    if (button.isConnected) button.disabled = false;
+  }
+}
+
+async function loadDispatchWorkflow({ force = false } = {}) {
+  if ((state.dispatch.loading && !force) || (state.dispatch.loaded && !force)) return;
+  const requestId = ++state.dispatch.requestId;
+  const controller = new AbortController();
+  const timeoutId = window.setTimeout(() => controller.abort(), 20000);
+  state.dispatch.loading = true;
+  state.dispatch.error = "";
+  try {
+    const params = new URLSearchParams({
+      queue: state.dispatch.tab,
+      page: String(state.dispatch.page),
+      page_size: "25",
+      search: state.dispatch.search,
+    });
+    const requests = [
+      api(`/api/dispatch/movements?${params.toString()}`, { signal: controller.signal }),
+      api("/api/dispatch/locations", { signal: controller.signal }),
+    ];
+    if (state.data.user?.role === "administrator") {
+      requests.push(
+        api("/api/dispatch/users", { signal: controller.signal }),
+        api("/api/dispatch/assignments", { signal: controller.signal }),
+      );
+    }
+    const [movementResult, locationResult, userResult, assignmentResult] = await Promise.all(requests);
+    if (requestId !== state.dispatch.requestId) return;
+    state.dispatch.movements = movementResult.movements || [];
+    state.dispatch.total = Number(movementResult.total || 0);
+    state.dispatch.locations = locationResult.locations || [];
+    state.dispatch.users = userResult?.users || [];
+    state.dispatch.assignments = assignmentResult?.assignments || [];
+    state.dispatch.loaded = true;
+  } catch (error) {
+    if (requestId === state.dispatch.requestId) {
+      state.dispatch.error = controller.signal.aborted
+        ? "The dispatch service did not respond within 20 seconds. Check that the server is running and the location-dispatch database migration has been applied, then retry."
+        : error.message || "Could not load dispatch movements.";
+    }
+  } finally {
+    window.clearTimeout(timeoutId);
+    if (requestId === state.dispatch.requestId) {
+      state.dispatch.loading = false;
+      if (state.page === "trips") render();
+    }
+  }
+}
+
+function dispatchStatusLabel(status) {
+  return ({
+    awaiting_arrival: "Awaiting Arrival",
+    arrival_submitted: "Arrival Submitted",
+    needs_correction: "Needs Correction",
+    completed: "Completed",
+  })[status] || "Unknown";
+}
+
+function dispatchDateTime(value) {
+  if (!value) return "—";
+  const parsed = new Date(value);
+  return Number.isNaN(parsed.getTime())
+    ? String(value)
+    : new Intl.DateTimeFormat(undefined, { dateStyle: "medium", timeStyle: "short" }).format(parsed);
+}
+
+function dispatchLocalDateTimeNow() {
+  const parts = new Intl.DateTimeFormat("en-GB", {
+    timeZone: "Asia/Manila",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    hourCycle: "h23",
+  }).formatToParts(new Date());
+  const values = Object.fromEntries(parts.map((part) => [part.type, part.value]));
+  return `${values.year}-${values.month}-${values.day}T${values.hour}:${values.minute}`;
+}
+
+function dispatchMovementCard(movement, mode) {
+  const isAdmin = state.data.user?.role === "administrator";
+  const isVerified = Boolean(movement.ism_no && movement.arrival_verified_at);
+  const status = dispatchStatusLabel(movement.status);
+  const isArrivalQueue = mode === "arrivals";
+  const locationLine = `${movement.origin_location_name || movement.origin_location_id} → ${movement.destination_location_name || movement.destination_location_id}`;
+  const detailLines = [
+    ["Truck", movement.truck_plate || `#${movement.truck_id}`],
+    ["Driver", movement.driver_name || "—"],
+    ["Trailer", movement.trailer_plate || `#${movement.trailer_id}`],
+    ["Load", `${movement.load_type} · ${formatNumber(movement.pallet_quantity)} pallets`],
+    ["Departed", dispatchDateTime(movement.departure_at)],
+    ...(movement.arrival_at ? [["Arrived", dispatchDateTime(movement.arrival_at)]] : []),
+    ...(movement.ism_no ? [["ISM", movement.ism_no]] : []),
+  ];
+  const manifestLinks = [
+    movement.departure_manifest_path
+      ? `<a href="/api/dispatch/movements/${encodeURIComponent(movement.id)}/documents/departure" target="_blank" rel="noopener">Departure manifest</a>`
+      : "",
+    movement.arrival_manifest_path
+      ? `<a href="/api/dispatch/movements/${encodeURIComponent(movement.id)}/documents/arrival" target="_blank" rel="noopener">Arrival manifest</a>`
+      : "",
+    movement.fuel_invoice_path
+      ? `<a href="/api/dispatch/movements/${encodeURIComponent(movement.id)}/documents/fuel_invoice" target="_blank" rel="noopener">Fuel invoice</a>`
+      : "",
+  ].filter(Boolean).join(" · ");
+  let actions = "";
+  if (isArrivalQueue && !isAdmin && !isVerified
+      && ["awaiting_arrival", "needs_correction"].includes(movement.status)) {
+    actions = `
+      <form class="dispatch-verify-form" data-movement-id="${escapeHtml(movement.id)}">
+        <label class="form-field"><span>Enter ISM from the physical manifest</span><input name="ism_no" autocomplete="off" required maxlength="120" /></label>
+        <p class="dialog-error" role="alert" hidden></p>
+        <button class="button button-primary" type="submit">Verify ISM</button>
+      </form>`;
+  } else if (isArrivalQueue && !isAdmin && isVerified
+      && ["awaiting_arrival", "needs_correction"].includes(movement.status)) {
+    actions = `
+      <form class="dispatch-arrival-form" data-movement-id="${escapeHtml(movement.id)}">
+        <div class="dialog-fields">
+          <label class="form-field"><span>Actual arrival date and time</span><input name="arrival_at" type="datetime-local" required /></label>
+          <label class="form-field"><span>Arrival fuel expense (optional)</span><input name="arrival_fuel_expense" type="number" min="0" step="0.01" /></label>
+          <label class="form-field"><span>Arrival manifest / documentation</span><input name="arrival_manifest" type="file" accept="image/jpeg,image/png,image/webp" capture="environment" required /></label>
+        </div>
+        <p class="dialog-error" role="alert" hidden></p>
+        <button class="button button-primary" type="submit">Submit arrival for review</button>
+      </form>`;
+  } else if (isAdmin && movement.status === "arrival_submitted") {
+    actions = `
+      <div class="dispatch-review-actions">
+        <button class="button button-primary" type="button" data-action="dispatch-finalize" data-id="${escapeHtml(movement.id)}">Finalize movement</button>
+        <button class="button button-secondary" type="button" data-action="dispatch-correction-toggle" data-id="${escapeHtml(movement.id)}">Request correction</button>
+      </div>
+      <form class="dispatch-correction-form" data-movement-id="${escapeHtml(movement.id)}" hidden>
+        <label class="form-field"><span>Correction reason</span><textarea name="reason" rows="2" required maxlength="1000"></textarea></label>
+        <p class="dialog-error" role="alert" hidden></p>
+        <button class="button button-secondary" type="submit">Send correction request</button>
+      </form>`;
+  }
+  return `<article class="panel dispatch-movement-card">
+    <div class="dispatch-movement-heading">
+      <div><p class="eyebrow">${escapeHtml(movement.origin_location_id)} → ${escapeHtml(movement.destination_location_id)}</p><h3>${escapeHtml(locationLine)}</h3></div>
+      <span class="badge badge-${escapeHtml(movement.status)}">${escapeHtml(status)}</span>
+    </div>
+    <dl class="dispatch-movement-details">${detailLines.map(([label, value]) =>
+      `<div><dt>${escapeHtml(label)}</dt><dd>${escapeHtml(value)}</dd></div>`,
+    ).join("")}</dl>
+    ${isArrivalQueue && !isAdmin && !isVerified
+      ? '<p class="dispatch-ism-hidden">ISM is hidden until you verify the physical manifest.</p>'
+      : ""}
+    ${manifestLinks ? `<p class="dispatch-document-links">${manifestLinks}</p>` : ""}
+    ${actions}
+    <div><button class="button button-secondary button-small" type="button" data-action="dispatch-history" data-id="${escapeHtml(movement.id)}">View movement history</button></div>
+    <div class="dispatch-history" data-history-for="${escapeHtml(movement.id)}" hidden></div>
+  </article>`;
+}
+
+function dispatchDepartureForm() {
+  const isAdmin = state.data.user?.role === "administrator";
+  const originOptions = state.dispatch.locations.filter((location) =>
+    isAdmin || location.can_depart,
+  );
+  const originId = state.dispatch.departureOrigin || originOptions[0]?.id || "";
+  const destinationOptions = (state.data.truck_routes || [])
+    .filter((route) => route.active !== false && route.origin_code === originId)
+    .map((route) => ({
+      id: route.destination_code,
+      name: route.destination_name,
+    }));
+  const uniqueDestinations = [...new Map(destinationOptions.map((item) => [item.id, item])).values()];
+  const trucks = (state.data.vehicles || []).filter((item) =>
+    ["active", "available", "assigned"].includes(item.status),
+  );
+  const trailers = (state.data.trailers || []).filter((item) =>
+    item.status === "active" && Number(item.pallet_capacity) > 0,
+  );
+  const drivers = (state.data.drivers || []).filter((item) =>
+    item.status === "active",
+  );
+  const canCreate = originOptions.length > 0 && uniqueDestinations.length > 0
+    && trucks.length > 0 && trailers.length > 0 && drivers.length > 0;
+  return `<section class="panel dispatch-form-panel">
+    <div class="panel-heading"><div><p class="eyebrow">NEW DEPARTURE</p><h2>Create a movement</h2></div></div>
+    ${!originOptions.length
+      ? '<p class="empty-state">No departure location is assigned to this account. Ask an administrator to configure access.</p>'
+      : ""}
+    <form class="dispatch-departure-form">
+      <div class="dialog-fields">
+        <label class="form-field"><span>Origin</span><select name="origin_location_id" data-dispatch-origin required>
+          ${originOptions.map((location) => `<option value="${escapeHtml(location.id)}" ${location.id === originId ? "selected" : ""}>${escapeHtml(location.name)} (${escapeHtml(location.id)})</option>`).join("")}
+        </select></label>
+        <label class="form-field"><span>Destination</span><select name="destination_location_id" required>
+          <option value="">Select destination</option>
+          ${uniqueDestinations.map((location) => `<option value="${escapeHtml(location.id)}">${escapeHtml(location.name)} (${escapeHtml(location.id)})</option>`).join("")}
+        </select></label>
+        <label class="form-field"><span>ISM number</span><input name="ism_no" required maxlength="120" autocomplete="off" /></label>
+        <label class="form-field"><span>Truck</span><select name="truck_id" required><option value="">Select truck</option>
+          ${trucks.map((truck) => `<option value="${escapeHtml(truck.id)}">${escapeHtml(truck.plate_number)} · ${escapeHtml(truck.make || "")} ${escapeHtml(truck.model || "")}</option>`).join("")}
+        </select></label>
+        <label class="form-field"><span>Driver</span><select name="driver_id" required><option value="">Select driver</option>
+          ${drivers.map((driver) => `<option value="${escapeHtml(driver.id)}">${escapeHtml(driver.name)}</option>`).join("")}
+        </select></label>
+        <label class="form-field"><span>Trailer</span><select name="trailer_id" required><option value="">Select trailer</option>
+          ${trailers.map((trailer) => `<option value="${escapeHtml(trailer.id)}">${escapeHtml(trailer.plate_number)} · ${escapeHtml(trailer.pallet_capacity || "Capacity unknown")}</option>`).join("")}
+        </select></label>
+        <label class="form-field"><span>Load type</span><select name="load_type" required><option value="">Select load type</option><option value="FULLS">FULLS</option><option value="EMPTIES">EMPTIES</option></select></label>
+        <label class="form-field"><span>Pallet quantity</span><input name="pallet_quantity" type="number" min="1" step="1" required /></label>
+        <label class="form-field"><span>Departure date and time</span><input name="departure_at" type="datetime-local" value="${dispatchLocalDateTimeNow()}" required /></label>
+        <label class="form-field"><span>Fuel allocation (₱)</span><input name="fuel_allocation" type="number" min="0" step="0.01" /></label>
+        <label class="form-field"><span>Actual fuel expense (₱)</span><input name="actual_fuel_expense" type="number" min="0" step="0.01" /></label>
+        <label class="form-field"><span>Fuel remarks</span><input name="fuel_remarks" maxlength="500" /></label>
+        <label class="form-field"><span>Departure manifest / required documentation</span><input name="departure_manifest" type="file" accept="image/jpeg,image/png,image/webp" capture="environment" required /></label>
+        <label class="form-field"><span>Fuel invoice (if applicable)</span><input name="fuel_invoice" type="file" accept="image/jpeg,image/png,image/webp" capture="environment" /></label>
+      </div>
+      <p class="dialog-error dispatch-form-error" role="alert" hidden></p>
+      <button class="button button-primary" type="submit" ${canCreate ? "" : "disabled"}>Save departure</button>
+    </form>
+    <p class="page-description dispatch-availability-message" role="status" ${canCreate ? "hidden" : ""}>${!uniqueDestinations.length ? "No active route is configured from this origin." : "Active trucks, drivers, and trailers are required before a departure can be created."}</p>
+  </section>`;
+}
+
+function dispatchAdminSetup() {
+  if (state.data.user?.role !== "administrator") return "";
+  const locations = state.dispatch.locations;
+  const users = state.dispatch.users;
+  return `<section class="panel dispatch-admin-setup">
+    <div class="panel-heading"><div><p class="eyebrow">ADMINISTRATION</p><h2>Dispatcher access and locations</h2></div></div>
+    <div class="dispatch-admin-forms">
+      <form class="dispatch-assignment-form">
+        <h3>Assign a dispatcher</h3>
+        <label class="form-field"><span>Dispatcher account</span><select name="user_id" required><option value="">Select account</option>
+          ${users.map((user) => `<option value="${escapeHtml(user.user_id)}">${escapeHtml(user.email || user.full_name || user.user_id)}</option>`).join("")}
+        </select></label>
+        <label class="form-field"><span>Location</span><select name="location_id" required><option value="">Select location</option>
+          ${locations.map((location) => `<option value="${escapeHtml(location.id)}">${escapeHtml(location.name)} (${escapeHtml(location.id)})</option>`).join("")}
+        </select></label>
+        <label class="dispatch-permission"><input name="can_depart" type="checkbox" checked /> May create departures</label>
+        <label class="dispatch-permission"><input name="can_arrive" type="checkbox" checked /> May receive arrivals</label>
+        <p class="dialog-error" role="alert" hidden></p>
+        <button class="button button-secondary" type="submit" ${users.length ? "" : "disabled"}>Save assignment</button>
+        ${users.length ? "" : '<small>Dispatcher accounts must first be marked as dispatchers in Auth metadata. Location permissions are granted only when an administrator assigns them.</small>'}
+      </form>
+      <form class="dispatch-location-form">
+        <h3>Configure a location</h3>
+        <label class="form-field"><span>Stable location ID</span><input name="id" required maxlength="32" pattern="[A-Z0-9_-]+" placeholder="e.g. DAV1" /></label>
+        <label class="form-field"><span>Display name</span><input name="name" required maxlength="120" /></label>
+        <p class="dialog-error" role="alert" hidden></p>
+        <button class="button button-secondary" type="submit">Save location</button>
+      </form>
+    </div>
+    <div class="dispatch-assignment-list">
+      ${state.dispatch.assignments.length
+        ? state.dispatch.assignments.map((assignment) => `<p><strong>${escapeHtml(assignment.email || assignment.user_id)}</strong> · ${escapeHtml(assignment.location_name)} (${escapeHtml(assignment.location_id)}) · ${assignment.can_depart ? "Departures" : ""}${assignment.can_depart && assignment.can_arrive ? " / " : ""}${assignment.can_arrive ? "Arrivals" : ""}</p>`).join("")
+        : '<p class="empty-state">No dispatcher location assignments are configured yet.</p>'}
+    </div>
+  </section>`;
+}
+
+function renderDispatchWorkflow() {
+  if (state.dispatch.error && !state.dispatch.loaded) {
+    return `${header("LOCATION DISPATCH", "Movement workflow", "Securely hand off each movement from departure through arrival.", '<button class="button button-secondary" data-action="dispatch-reload" type="button">Retry</button>')}<section class="error-card"><p>${escapeHtml(state.dispatch.error)}</p></section>`;
+  }
+  if (!state.dispatch.loaded && !state.dispatch.loading) {
+    loadDispatchWorkflow();
+  }
+  if (state.dispatch.loading && !state.dispatch.loaded) {
+    return `${header("LOCATION DISPATCH", "Movement workflow", "Securely hand off each movement from departure through arrival.")}<section class="panel"><p>Loading dispatch workflow…</p></section>`;
+  }
+
+  const isAdmin = state.data.user?.role === "administrator";
+  const tab = state.dispatch.tab;
+  const eligible = state.dispatch.movements;
+  const pageSize = 25;
+  const pageCount = Math.max(1, Math.ceil(state.dispatch.total / pageSize));
+  state.dispatch.page = Math.min(state.dispatch.page, pageCount);
+  const pageRows = eligible;
+  const pageMarkup = pageCount > 1 ? `<nav class="pagination" aria-label="Dispatch movements pages">
+    <button class="button button-secondary button-small" data-action="dispatch-page" data-page="${Math.max(1, state.dispatch.page - 1)}" ${state.dispatch.page === 1 ? "disabled" : ""}>Previous</button>
+    <span>Page ${state.dispatch.page} of ${pageCount}</span>
+    <button class="button button-secondary button-small" data-action="dispatch-page" data-page="${Math.min(pageCount, state.dispatch.page + 1)}" ${state.dispatch.page === pageCount ? "disabled" : ""}>Next</button>
+  </nav>` : "";
+  const listMarkup = pageRows.length
+    ? `<div class="dispatch-movement-list">${pageRows.map((row) => dispatchMovementCard(row, tab)).join("")}</div>${pageMarkup}`
+    : `<div class="empty-state"><span>↗</span><strong>No ${tab === "departures" ? "departures" : tab === "arrivals" ? "incoming movements" : "completed movements"} found</strong><small>${state.dispatch.search ? "Try another search." : "New movements will appear here when they match this workflow."}</small></div>`;
+  const legacyRows = isAdmin
+    ? `<section class="panel records-panel"><div class="panel-heading"><div><p class="eyebrow">HISTORICAL RECORDS</p><h2>Trips recorded before the dispatch workflow</h2></div></div>
+        ${tableMarkup(state.data.trips || [], RESOURCE_CONFIG.trips.columns, null, { empty: "No historical trip records" })}</section>`
+    : "";
+  return `
+    ${header("LOCATION DISPATCH", "Departure → Arrival", "One movement ID. The receiving dispatcher verifies the manifest before arrival; only admins finalize financial trips.", '<button class="button button-secondary" data-action="dispatch-reload" type="button">Refresh</button>')}
+    ${isAdmin ? dispatchAdminSetup() : ""}
+    ${tab === "departures" ? dispatchDepartureForm() : ""}
+    <section class="panel records-panel dispatch-queue-panel">
+      <div class="panel-heading records-heading">
+        <div><p class="eyebrow">MOVEMENT QUEUES</p><h2>${tab === "departures" ? "Departures" : tab === "arrivals" ? "Arrivals" : "Completed Trips"}</h2></div>
+        <label class="search-box"><span class="sr-only">Search movements</span><span aria-hidden="true">⌕</span><input type="search" id="dispatch-search" placeholder="Search movements" value="${escapeHtml(state.dispatch.search)}" /></label>
+      </div>
+      <nav class="trip-view-tabs" aria-label="Dispatch workflow">
+        ${[["departures", "Departures"], ["arrivals", "Arrivals"], ["completed", "Completed Trips"]].map(([key, label]) =>
+          `<button class="trip-view-tab ${tab === key ? "trip-view-tab-active" : ""}" type="button" data-action="dispatch-tab" data-tab="${key}" aria-pressed="${tab === key}">${label}</button>`,
+        ).join("")}
+      </nav>
+      <p class="record-count">${formatNumber(state.dispatch.total)} ${state.dispatch.total === 1 ? "movement" : "movements"}</p>
+      ${listMarkup}
+    </section>
+    ${tab === "completed" ? legacyRows : ""}`;
+}
+
+async function uploadDispatchDocument(movementId, kind, file) {
+  if (!file || file.size === 0) {
+    throw new Error(`${kind === "arrival" ? "Arrival" : "Departure"} documentation is required.`);
+  }
+  const body = new FormData();
+  body.append("image", file);
+  await api(
+    `/api/dispatch/movements/${encodeURIComponent(movementId)}/documents/${kind}`,
+    { method: "POST", body },
+  );
+}
+
+async function submitDispatchDeparture(form) {
+  if (form.dataset.submitting === "true") return;
+  form.dataset.submitting = "true";
+  const submit = form.querySelector('button[type="submit"]');
+  const errorElement = form.querySelector(".dispatch-form-error");
+  submit.disabled = true;
+  errorElement.hidden = true;
+  try {
+    let movementId = form.dataset.movementId;
+    if (!movementId) {
+      const values = Object.fromEntries(new FormData(form).entries());
+      const result = await api("/api/dispatch/movements", {
+        method: "POST",
+        body: JSON.stringify({
+          origin_location_id: values.origin_location_id,
+          destination_location_id: values.destination_location_id,
+          ism_no: values.ism_no,
+          truck_id: values.truck_id,
+          driver_id: values.driver_id,
+          trailer_id: values.trailer_id,
+          load_type: values.load_type,
+          pallet_quantity: values.pallet_quantity,
+          departure_at: values.departure_at,
+          fuel_allocation: values.fuel_allocation || null,
+          actual_fuel_expense: values.actual_fuel_expense || null,
+          fuel_remarks: values.fuel_remarks || null,
+        }),
+      });
+      movementId = result.id;
+      if (!movementId) throw new Error("Departure was saved without a movement ID.");
+      form.dataset.movementId = movementId;
+      for (const control of form.elements) {
+        if (!["departure_manifest", "fuel_invoice"].includes(control.name)) control.disabled = true;
+      }
+    }
+    if (form.dataset.departureUploaded !== "true") {
+      await uploadDispatchDocument(
+        movementId, "departure", form.elements.namedItem("departure_manifest").files?.[0],
+      );
+      form.dataset.departureUploaded = "true";
+      form.elements.namedItem("departure_manifest").disabled = true;
+    }
+    const invoice = form.elements.namedItem("fuel_invoice").files?.[0];
+    if (invoice && form.dataset.fuelInvoiceUploaded !== "true") {
+      await uploadDispatchDocument(movementId, "fuel_invoice", invoice);
+      form.dataset.fuelInvoiceUploaded = "true";
+      form.elements.namedItem("fuel_invoice").disabled = true;
+    }
+    showToast("Departure saved. It will enter the receiving queue with the required manifest.");
+    state.dispatch.loaded = false;
+    state.dispatch.loading = false;
+    await loadDispatchWorkflow({ force: true });
+  } catch (error) {
+    errorElement.textContent = form.dataset.movementId
+      ? `Movement ${form.dataset.movementId} was saved, but its documentation was not fully uploaded. Retry to finish without creating a duplicate. ${error.message}`
+      : error.message || "Could not save this departure.";
+    errorElement.hidden = false;
+  } finally {
+    form.dataset.submitting = "false";
+    if (submit.isConnected) {
+      submit.disabled = false;
+      submit.textContent = form.dataset.movementId ? "Retry document upload" : "Save departure";
+    }
+  }
+}
+
+async function submitDispatchVerification(form) {
+  if (form.dataset.submitting === "true") return;
+  form.dataset.submitting = "true";
+  const submit = form.querySelector('button[type="submit"]');
+  const errorElement = form.querySelector('[role="alert"]');
+  submit.disabled = true;
+  errorElement.hidden = true;
+  try {
+    const result = await api(
+      `/api/dispatch/movements/${encodeURIComponent(form.dataset.movementId)}/verify`,
+      {
+        method: "POST",
+        body: JSON.stringify({
+          ism_no: form.elements.namedItem("ism_no").value,
+        }),
+      },
+    );
+    if (!result?.verified) {
+      errorElement.textContent = "The ISM did not match. Check the physical manifest and try again.";
+      errorElement.hidden = false;
+      return;
+    }
+    showToast("ISM verified. The departure details are now available for arrival entry.");
+    state.dispatch.loaded = false;
+    await loadDispatchWorkflow({ force: true });
+  } catch (error) {
+    errorElement.textContent = error.message || "Could not verify the ISM.";
+    errorElement.hidden = false;
+  } finally {
+    form.dataset.submitting = "false";
+    if (submit.isConnected) submit.disabled = false;
+  }
+}
+
+async function submitDispatchArrival(form) {
+  if (form.dataset.submitting === "true") return;
+  form.dataset.submitting = "true";
+  const submit = form.querySelector('button[type="submit"]');
+  const errorElement = form.querySelector('[role="alert"]');
+  submit.disabled = true;
+  errorElement.hidden = true;
+  try {
+    if (form.dataset.arrivalUploaded !== "true") {
+      await uploadDispatchDocument(
+        form.dataset.movementId,
+        "arrival",
+        form.elements.namedItem("arrival_manifest").files?.[0],
+      );
+      form.dataset.arrivalUploaded = "true";
+      form.elements.namedItem("arrival_manifest").disabled = true;
+    }
+    const values = Object.fromEntries(new FormData(form).entries());
+    await api(
+      `/api/dispatch/movements/${encodeURIComponent(form.dataset.movementId)}/arrival`,
+      {
+        method: "POST",
+        body: JSON.stringify({
+          arrival_at: values.arrival_at,
+          arrival_fuel_expense: values.arrival_fuel_expense || null,
+        }),
+      },
+    );
+    showToast("Arrival submitted for admin review.");
+    state.dispatch.loaded = false;
+    await loadDispatchWorkflow({ force: true });
+  } catch (error) {
+    errorElement.textContent = error.message || "Could not submit this arrival.";
+    errorElement.hidden = false;
+  } finally {
+    form.dataset.submitting = "false";
+    if (submit.isConnected) submit.disabled = false;
+  }
+}
+
+async function submitDispatchAssignment(form) {
+  const submit = form.querySelector('button[type="submit"]');
+  const errorElement = form.querySelector('[role="alert"]');
+  submit.disabled = true;
+  errorElement.hidden = true;
+  try {
+    await api("/api/dispatch/assignments", {
+      method: "POST",
+      body: JSON.stringify({
+        user_id: form.elements.namedItem("user_id").value,
+        location_id: form.elements.namedItem("location_id").value,
+        can_depart: form.elements.namedItem("can_depart").checked,
+        can_arrive: form.elements.namedItem("can_arrive").checked,
+      }),
+    });
+    showToast("Dispatcher location access saved.");
+    state.dispatch.loaded = false;
+    await loadDispatchWorkflow({ force: true });
+  } catch (error) {
+    errorElement.textContent = error.message || "Could not save the assignment.";
+    errorElement.hidden = false;
+  } finally {
+    if (submit.isConnected) submit.disabled = false;
+  }
+}
+
+async function submitDispatchLocation(form) {
+  const submit = form.querySelector('button[type="submit"]');
+  const errorElement = form.querySelector('[role="alert"]');
+  submit.disabled = true;
+  errorElement.hidden = true;
+  try {
+    await api("/api/dispatch/locations", {
+      method: "POST",
+      body: JSON.stringify({
+        id: form.elements.namedItem("id").value.trim().toUpperCase(),
+        name: form.elements.namedItem("name").value.trim(),
+        active: true,
+      }),
+    });
+    showToast("Dispatch location saved.");
+    state.dispatch.loaded = false;
+    await loadDispatchWorkflow({ force: true });
+  } catch (error) {
+    errorElement.textContent = error.message || "Could not save the location.";
+    errorElement.hidden = false;
+  } finally {
+    if (submit.isConnected) submit.disabled = false;
+  }
+}
+
+async function submitDispatchCorrection(form) {
+  const submit = form.querySelector('button[type="submit"]');
+  const errorElement = form.querySelector('[role="alert"]');
+  submit.disabled = true;
+  errorElement.hidden = true;
+  try {
+    await api(
+      `/api/dispatch/movements/${encodeURIComponent(form.dataset.movementId)}/correction`,
+      {
+        method: "POST",
+        body: JSON.stringify({ reason: form.elements.namedItem("reason").value.trim() }),
+      },
+    );
+    showToast("Correction request recorded in movement history.");
+    state.dispatch.loaded = false;
+    await loadDispatchWorkflow({ force: true });
+  } catch (error) {
+    errorElement.textContent = error.message || "Could not request a correction.";
+    errorElement.hidden = false;
+  } finally {
+    if (submit.isConnected) submit.disabled = false;
+  }
+}
+
+async function finalizeDispatchMovement(button) {
+  if (!window.confirm("Finalize this movement as one canonical trip for revenue and payroll?")) return;
+  button.disabled = true;
+  try {
+    const result = await api(
+      `/api/dispatch/movements/${encodeURIComponent(button.dataset.id)}/finalize`,
+      { method: "POST", body: JSON.stringify({}) },
+    );
+    showToast(`Movement finalized as trip #${result.trip_id}.`);
+    state.dispatch.loaded = false;
+    await loadDispatchWorkflow({ force: true });
+    const refreshed = await api("/api/bootstrap");
+    state.data = refreshed;
+    state.csrfToken = refreshed.csrf_token || state.csrfToken;
+    render();
+  } catch (error) {
+    showToast(error.message || "Could not finalize this movement.", "error");
+  } finally {
+    if (button.isConnected) button.disabled = false;
+  }
+}
+
+async function loadDispatchHistory(button) {
+  const panel = button.closest(".dispatch-movement-card")?.querySelector(".dispatch-history");
+  if (!panel) return;
+  if (!panel.hidden) {
+    panel.hidden = true;
+    button.textContent = "View movement history";
+    return;
+  }
+  panel.hidden = false;
+  panel.innerHTML = "<p>Loading history…</p>";
+  button.disabled = true;
+  try {
+    const result = await api(
+      `/api/dispatch/movements/${encodeURIComponent(button.dataset.id)}/history`,
+    );
+    panel.innerHTML = result.history?.length
+      ? `<ol>${result.history.map((entry) => `<li><strong>${escapeHtml(entry.action.replaceAll("_", " "))}</strong> · ${escapeHtml(dispatchDateTime(entry.created_at))}<br /><small>${escapeHtml(JSON.stringify(entry.details || {}))}</small></li>`).join("")}</ol>`
+      : "<p>No workflow events recorded.</p>";
+    button.textContent = "Hide movement history";
+  } catch (error) {
+    panel.innerHTML = `<p class="dialog-error">${escapeHtml(error.message || "Could not load history.")}</p>`;
+  } finally {
+    button.disabled = false;
+  }
+}
+
+function refreshDispatchDestinations(form) {
+  const origin = form.elements.namedItem("origin_location_id")?.value;
+  const destination = form.elements.namedItem("destination_location_id");
+  if (!destination) return;
+  const currentValue = destination.value;
+  const routes = (state.data.truck_routes || []).filter((route) =>
+    route.active !== false && route.origin_code === origin,
+  );
+  const destinations = [...new Map(routes.map((route) => [
+    route.destination_code,
+    { id: route.destination_code, name: route.destination_name },
+  ])).values()];
+  destination.innerHTML = `<option value="">Select destination</option>${destinations.map((location) =>
+    `<option value="${escapeHtml(location.id)}">${escapeHtml(location.name)} (${escapeHtml(location.id)})</option>`,
+  ).join("")}`;
+  if (destinations.some((location) => location.id === currentValue)) {
+    destination.value = currentValue;
+  }
+  updateDispatchDepartureAvailability(form);
+}
+
+function updateDispatchDepartureAvailability(form) {
+  const origin = form.elements.namedItem("origin_location_id")?.value || "";
+  const destination = form.elements.namedItem("destination_location_id");
+  const submit = form.querySelector('button[type="submit"]');
+  const message = form.parentElement?.querySelector(".dispatch-availability-message");
+  if (!destination || !submit || !message) return;
+
+  const hasActiveRoute = (state.data.truck_routes || []).some((route) =>
+    route.active !== false
+      && route.origin_code === origin
+      && route.destination_code !== origin,
+  );
+  const hasTrucks = (state.data.vehicles || []).some((item) =>
+    ["active", "available", "assigned"].includes(item.status),
+  );
+  const hasTrailers = (state.data.trailers || []).some((item) =>
+    item.status === "active" && Number(item.pallet_capacity) > 0,
+  );
+  const hasDrivers = (state.data.drivers || []).some((item) =>
+    item.status === "active",
+  );
+  const reasons = [];
+  if (!origin) reasons.push("Select an active origin.");
+  if (!hasActiveRoute) reasons.push("No active route is configured from this origin.");
+  if (!hasTrucks || !hasDrivers || !hasTrailers) {
+    reasons.push("Active trucks, drivers, and trailers are required before a departure can be created.");
+  }
+  submit.disabled = reasons.length > 0;
+  message.textContent = reasons.join(" ");
+  message.hidden = reasons.length === 0;
+}
+
+function validateDispatchPalletQuantity(form) {
+  const trailerId = form.elements.namedItem("trailer_id")?.value;
+  const quantity = form.elements.namedItem("pallet_quantity");
+  if (!quantity) return;
+  const trailer = (state.data.trailers || []).find((item) =>
+    String(item.id) === String(trailerId),
+  );
+  const capacity = Number(trailer?.pallet_capacity);
+  if (Number.isFinite(capacity) && capacity > 0) {
+    quantity.max = String(capacity);
+    quantity.setCustomValidity(
+      Number(quantity.value) > capacity
+        ? `Pallet quantity cannot exceed this trailer's capacity of ${capacity}.`
+        : "",
+    );
+  } else {
+    quantity.removeAttribute("max");
+    quantity.setCustomValidity("");
+  }
+}
+
 function renderResource(page) {
+  if (page === "trips") return renderDispatchWorkflow();
+  if (page === "tires") return renderTireMonitoring();
   if (page === "vehicles") return renderVehicleManagement();
   const config = RESOURCE_CONFIG[page];
   const listKey = page === "fuel" ? "fuel_logs" : page;
@@ -2536,7 +3628,7 @@ function render() {
   navigation.hidden = false;
   const isDedicatedAddTripPage =
     window.location.pathname === "/dispatcher/add-trip" && !window.location.hash;
-  const dispatcherPages = new Set(["dashboard", "trips", "fuel", "maintenance"]);
+  const dispatcherPages = new Set(["dashboard", "trips", "fuel", "maintenance", "tires"]);
   const isDispatcher = state.data.user?.role === "dispatcher";
   if (isDedicatedAddTripPage) {
     state.page = "trips";
@@ -2568,7 +3660,7 @@ function render() {
   document.querySelectorAll("[data-nav-category]").forEach((group) => {
     group.classList.toggle("has-active-page", Boolean(group.querySelector(".nav-link.active")));
   });
-  if (isDedicatedAddTripPage) {
+  if (isDedicatedAddTripPage && !isDispatcher) {
     const config = RESOURCE_CONFIG.trips;
     const needsReferences = config.fields.some(
       (field) =>
@@ -2587,6 +3679,12 @@ function render() {
   if (state.page === "revenue" && !state.revenue.loading
       && state.revenue.reportKey !== revenueQueryKey()) {
     loadRevenueReport();
+  }
+  if (state.page === "tires" && (
+    state.tires.requestedKey !== tireQueryKey()
+    || (!state.tires.loading && !state.tires.summary && !state.tires.error)
+  )) {
+    loadTireMonitoring();
   }
   view.querySelectorAll('form[data-form="trips"]:not(.trip-wizard-form), .trip-edit-form').forEach((form) => {
     refreshTripDestinationOptions(form);
@@ -2876,6 +3974,55 @@ function openTripDetails(tripId) {
         <dd>${escapeHtml(value)}</dd>
       </div>`)
     .join("");
+  const departureIsSet = Boolean(trip.time_out);
+  const arrivalIsSet = Boolean(trip.time_in);
+  const tripTimeControlsMarkup = `
+    <div class="trip-detail-actions trip-time-actions">
+      <button class="button button-secondary" data-action="record-trip-time-out" type="button" ${departureIsSet ? "disabled" : ""}>
+        ${departureIsSet ? "Departure recorded" : "Record departure"}
+      </button>
+      <button class="button button-secondary" data-action="record-trip-time-in" type="button" ${arrivalIsSet ? "disabled" : ""}>
+        ${arrivalIsSet ? "Arrival recorded" : "Record arrival"}
+      </button>
+    </div>
+    <form class="trip-time-record-form" data-trip-id="${escapeHtml(trip.id)}" data-time-kind="out" hidden>
+      <div class="dialog-fields">
+        <label class="form-field">
+          <span>Departure time</span>
+          <input name="time_value" type="time" required value="${trip.time_out || ""}" />
+        </label>
+        <label class="form-field">
+          <span>Departure location</span>
+          <select name="location" required>
+            ${(state.data?.warehouses || []).map((warehouse) => `<option value="${escapeHtml(warehouse.name || warehouse.code || warehouse)}" ${warehouse.name === trip.origin || warehouse.code === trip.origin ? "selected" : ""}>${escapeHtml(warehouse.name || warehouse.code || warehouse)}</option>`).join("") || `<option value="${escapeHtml(trip.origin || "")}">${escapeHtml(trip.origin || "Choose origin")}</option>`}
+          </select>
+        </label>
+      </div>
+      <p class="dialog-error" role="alert" hidden></p>
+      <div class="dialog-actions">
+        <button class="button button-secondary" data-action="cancel-trip-time-record" type="button">Cancel</button>
+        <button class="button button-primary" type="submit">Save departure</button>
+      </div>
+    </form>
+    <form class="trip-time-record-form" data-trip-id="${escapeHtml(trip.id)}" data-time-kind="in" hidden>
+      <div class="dialog-fields">
+        <label class="form-field">
+          <span>Arrival time</span>
+          <input name="time_value" type="time" required value="${trip.time_in || ""}" />
+        </label>
+        <label class="form-field">
+          <span>Arrival location</span>
+          <select name="location" required>
+            ${(state.data?.warehouses || []).map((warehouse) => `<option value="${escapeHtml(warehouse.name || warehouse.code || warehouse)}" ${warehouse.name === trip.destination || warehouse.code === trip.destination ? "selected" : ""}>${escapeHtml(warehouse.name || warehouse.code || warehouse)}</option>`).join("") || `<option value="${escapeHtml(trip.destination || "")}">${escapeHtml(trip.destination || "Choose destination")}</option>`}
+          </select>
+        </label>
+      </div>
+      <p class="dialog-error" role="alert" hidden></p>
+      <div class="dialog-actions">
+        <button class="button button-secondary" data-action="cancel-trip-time-record" type="button">Cancel</button>
+        <button class="button button-primary" type="submit">Save arrival</button>
+      </div>
+    </form>`;
   const imageMarkup = trip.manifest_image_url
     ? `<section class="trip-manifest-preview">
         <h3>Load manifest</h3>
@@ -2893,6 +4040,7 @@ function openTripDetails(tripId) {
       : field);
   dialog.querySelector(".trip-details-content").innerHTML = `
     <dl class="trip-details-grid">${detailsMarkup || "<p>No trip details available.</p>"}</dl>
+    ${tripTimeControlsMarkup}
     <div class="trip-detail-actions">
       <button class="button button-secondary" data-action="edit-trip" type="button">Edit trip details</button>
     </div>
@@ -2987,6 +4135,35 @@ async function updateTripRecord(form) {
     errorMessage.textContent = error.message || "Could not update this trip.";
     errorMessage.hidden = false;
     submit.disabled = false;
+  }
+}
+
+async function recordTripTime(form, endpoint) {
+  if (!form || !form.reportValidity()) return;
+  const tripId = form.dataset.tripId;
+  const timeValue = form.elements.time_value?.value || "";
+  const locationValue = form.elements.location?.value || "";
+  const button = form.querySelector('button[type="submit"]');
+  const errorMessage = form.querySelector(".dialog-error");
+  button.disabled = true;
+  errorMessage.hidden = true;
+  try {
+    const result = await api(`/api/trips/${encodeURIComponent(tripId)}${endpoint}`, {
+      method: "POST",
+      body: JSON.stringify({
+        time_value: timeValue,
+        location: locationValue,
+      }),
+    });
+    const record = result?.data || { ...state.data.trips.find((item) => String(item.id) === String(tripId)), id: tripId };
+    upsertResourceRecord("trips", record);
+    showToast(endpoint.includes("time-out") ? "Departure recorded." : "Arrival recorded.");
+    render();
+    openTripDetails(tripId);
+  } catch (error) {
+    errorMessage.textContent = error.message || "Could not record this trip time.";
+    errorMessage.hidden = false;
+    button.disabled = false;
   }
 }
 
@@ -3448,6 +4625,48 @@ async function exportTripHistory() {
 }
 
 view.addEventListener("submit", (event) => {
+  const dispatchDeparture = event.target.closest(".dispatch-departure-form");
+  if (dispatchDeparture) {
+    event.preventDefault();
+    if (dispatchDeparture.reportValidity()) submitDispatchDeparture(dispatchDeparture);
+    return;
+  }
+  const dispatchVerify = event.target.closest(".dispatch-verify-form");
+  if (dispatchVerify) {
+    event.preventDefault();
+    if (dispatchVerify.reportValidity()) submitDispatchVerification(dispatchVerify);
+    return;
+  }
+  const dispatchArrival = event.target.closest(".dispatch-arrival-form");
+  if (dispatchArrival) {
+    event.preventDefault();
+    if (dispatchArrival.reportValidity()) submitDispatchArrival(dispatchArrival);
+    return;
+  }
+  const dispatchAssignment = event.target.closest(".dispatch-assignment-form");
+  if (dispatchAssignment) {
+    event.preventDefault();
+    if (dispatchAssignment.reportValidity()) submitDispatchAssignment(dispatchAssignment);
+    return;
+  }
+  const dispatchLocation = event.target.closest(".dispatch-location-form");
+  if (dispatchLocation) {
+    event.preventDefault();
+    if (dispatchLocation.reportValidity()) submitDispatchLocation(dispatchLocation);
+    return;
+  }
+  const dispatchCorrection = event.target.closest(".dispatch-correction-form");
+  if (dispatchCorrection) {
+    event.preventDefault();
+    if (dispatchCorrection.reportValidity()) submitDispatchCorrection(dispatchCorrection);
+    return;
+  }
+  const tireForm = event.target.closest(".tire-record-form");
+  if (tireForm) {
+    event.preventDefault();
+    if (tireForm.reportValidity()) submitTireForm(tireForm);
+    return;
+  }
   const revenueForm = event.target.closest("form[data-revenue-form]");
   if (revenueForm && ["status", "adjustment"].includes(revenueForm.dataset.revenueForm)) {
     event.preventDefault();
@@ -3492,6 +4711,10 @@ view.addEventListener("submit", (event) => {
 });
 
 view.addEventListener("input", (event) => {
+  const dispatchForm = event.target.closest(".dispatch-departure-form");
+  if (dispatchForm && event.target.name === "pallet_quantity") {
+    validateDispatchPalletQuantity(dispatchForm);
+  }
   const wizardForm = event.target.closest(".trip-wizard-form");
   if (wizardForm) {
     state.tripWizard.dirty = true;
@@ -3529,6 +4752,33 @@ view.addEventListener("input", (event) => {
     nextInput?.setSelectionRange(position, position);
     return;
   }
+  if (event.target.id === "tire-search") {
+    state.tires.search = event.target.value;
+    state.tires.page = 1;
+    window.clearTimeout(searchRenderTimer);
+    searchRenderTimer = window.setTimeout(() => {
+      state.tires.requestedKey = "";
+      render();
+    }, 220);
+    return;
+  }
+  if (event.target.id === "dispatch-search") {
+    const position = event.target.selectionStart;
+    const restoreFocus = document.activeElement === event.target;
+    state.dispatch.search = event.target.value.trim();
+    state.dispatch.page = 1;
+    window.clearTimeout(searchRenderTimer);
+    searchRenderTimer = window.setTimeout(() => {
+      state.dispatch.loaded = false;
+      loadDispatchWorkflow({ force: true }).then(() => {
+        if (!restoreFocus) return;
+        const nextInput = document.querySelector("#dispatch-search");
+        nextInput?.focus();
+        nextInput?.setSelectionRange(position, position);
+      });
+    }, 140);
+    return;
+  }
   if (event.target.id !== "record-search") return;
   const position = event.target.selectionStart;
   const restoreFocus = document.activeElement === event.target;
@@ -3546,6 +4796,95 @@ view.addEventListener("input", (event) => {
 view.addEventListener("click", (event) => {
   const button = event.target.closest("[data-action]");
   if (!button) return;
+  if (button.dataset.action === "dispatch-tab") {
+    state.dispatch.tab = button.dataset.tab;
+    state.dispatch.page = 1;
+    state.dispatch.loaded = false;
+    loadDispatchWorkflow({ force: true });
+    return;
+  }
+  if (button.dataset.action === "dispatch-page") {
+    state.dispatch.page = Number(button.dataset.page) || 1;
+    state.dispatch.loaded = false;
+    loadDispatchWorkflow({ force: true });
+    return;
+  }
+  if (button.dataset.action === "dispatch-reload") {
+    state.dispatch.loaded = false;
+    loadDispatchWorkflow({ force: true });
+    return;
+  }
+  if (button.dataset.action === "dispatch-finalize") {
+    finalizeDispatchMovement(button);
+    return;
+  }
+  if (button.dataset.action === "dispatch-correction-toggle") {
+    const form = button.closest(".dispatch-movement-card")?.querySelector(".dispatch-correction-form");
+    if (form) {
+      form.hidden = false;
+      form.querySelector("textarea")?.focus();
+    }
+    return;
+  }
+  if (button.dataset.action === "dispatch-history") {
+    loadDispatchHistory(button);
+    return;
+  }
+  if (button.dataset.action === "tire-add") {
+    const dialog = tireDialogContent(tireRecordFormMarkup("create"));
+    if (dialog) updateTireAssetOptions(dialog.querySelector("#tire-record-form"));
+    return;
+  }
+  if (button.dataset.action === "tire-view") {
+    openTireDetails(button.dataset.id);
+    return;
+  }
+  if (button.dataset.action === "tire-edit") {
+    openTireEdit(button.dataset.id);
+    return;
+  }
+  if (button.dataset.action === "tire-replace") {
+    const row = state.tires.items.find((item) => String(item.id) === String(button.dataset.id));
+    if (row) tireDialogContent(tireRecordFormMarkup("replace", row));
+    return;
+  }
+  if (button.dataset.action === "tire-remove") {
+    openTireRemove(button.dataset.id);
+    return;
+  }
+  if (button.dataset.action === "tire-export") {
+    exportTireMonitoring(button);
+    return;
+  }
+  if (button.dataset.action === "close-tire-dialog") {
+    button.closest("dialog")?.close();
+    return;
+  }
+  if (button.dataset.action === "tire-page") {
+    state.tires.page = Math.max(1, Number(button.dataset.page) || 1);
+    state.tires.requestedKey = "";
+    render();
+    return;
+  }
+  if (button.dataset.action === "tire-reset") {
+    Object.assign(state.tires, {
+      page: 1, search: "", asset_type: "", asset_id: "", status: "",
+      date_from: "", date_to: "", lifespan_min: "", lifespan_max: "",
+      condition: "", sort_by: "date_installed", sort_dir: "desc",
+      requestedKey: "",
+    });
+    render();
+    return;
+  }
+  if (button.dataset.action === "tire-retry" || button.dataset.action === "refresh") {
+    if (state.page === "tires") {
+      state.tires.requestedKey = "";
+      render();
+    } else {
+      loadData({ force: true });
+    }
+    return;
+  }
   if (button.dataset.action === "fleet-section") {
     state.vehicleSection = button.dataset.section === "trailers" ? "trailers" : "trucks";
     render();
@@ -3715,6 +5054,28 @@ view.addEventListener("click", (event) => {
     form.hidden = true;
     form.closest(".trip-details-content").querySelector('[data-action="edit-trip"]').hidden = false;
   }
+  if (button.dataset.action === "record-trip-time-out") {
+    const content = button.closest(".trip-details-content");
+    const form = content?.querySelector('.trip-time-record-form[data-time-kind="out"]');
+    if (!form) return;
+    form.hidden = false;
+    form.querySelector("input, select")?.focus();
+    return;
+  }
+  if (button.dataset.action === "record-trip-time-in") {
+    const content = button.closest(".trip-details-content");
+    const form = content?.querySelector('.trip-time-record-form[data-time-kind="in"]');
+    if (!form) return;
+    form.hidden = false;
+    form.querySelector("input, select")?.focus();
+    return;
+  }
+  if (button.dataset.action === "cancel-trip-time-record") {
+    const form = button.closest(".trip-time-record-form");
+    if (!form) return;
+    form.hidden = true;
+    return;
+  }
   if (button.dataset.action === "delete") deleteRecord(button);
 });
 
@@ -3762,6 +5123,16 @@ view.addEventListener("cancel", (event) => {
 }, true);
 
 view.addEventListener("change", (event) => {
+  if (event.target.matches("#tire-record-asset-type")) {
+    updateTireAssetOptions(event.target.form);
+  }
+  if (event.target.matches("[data-dispatch-origin]")) {
+    refreshDispatchDestinations(event.target.form);
+  }
+  if (event.target.form?.matches(".dispatch-departure-form")
+      && ["trailer_id", "pallet_quantity"].includes(event.target.name)) {
+    validateDispatchPalletQuantity(event.target.form);
+  }
   const form = event.target.closest(".trip-wizard-form");
   if (!form) return;
   state.tripWizard.dirty = true;
@@ -3805,6 +5176,18 @@ view.addEventListener("keydown", (event) => {
 });
 
 view.addEventListener("change", (event) => {
+  const tireFilters = event.target.closest("#tire-filter-form");
+  if (tireFilters && event.target.matches("[data-tire-filter]")) {
+    const values = Object.fromEntries(new FormData(tireFilters).entries());
+    if (event.target.name === "asset_type") values.asset_id = "";
+    for (const [key, value] of Object.entries(values)) {
+      if (key in state.tires) state.tires[key] = value;
+    }
+    state.tires.page = 1;
+    state.tires.requestedKey = "";
+    render();
+    return;
+  }
   if (event.target.matches("[data-trip-select]")) {
     const tripId = String(event.target.dataset.tripSelect);
     if (event.target.checked) state.selectedTripIds.add(tripId);

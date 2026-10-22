@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import hmac
+import csv
 import logging
+import math
 import os
 import secrets
 import time
@@ -9,14 +11,14 @@ import uuid
 import warnings
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
-from io import BytesIO
+from io import BytesIO, StringIO
 from typing import Any
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from flask import Flask, g, jsonify, redirect, request, send_file, send_from_directory, session, url_for
+from flask import Flask, Response, g, jsonify, redirect, request, send_file, send_from_directory, session, stream_with_context, url_for
 from dotenv import dotenv_values
 from PIL import Image, UnidentifiedImageError
-from supabase import Client, create_client
+from supabase import Client, ClientOptions, create_client
 
 from excel_report import (
     build_excel_report,
@@ -45,6 +47,11 @@ app.config["MAX_CONTENT_LENGTH"] = max(
 app.config["DOCUMENT_IMAGE_BUCKET"] = os.environ.get(
     "DOCUMENT_IMAGE_BUCKET", "fleet-trip-documents"
 )
+app.config["TIRE_LIFESPAN_WARNING_PERCENT"] = int(
+    os.environ.get("TIRE_LIFESPAN_WARNING_PERCENT", "20")
+)
+if not 0 <= app.config["TIRE_LIFESPAN_WARNING_PERCENT"] <= 100:
+    raise ValueError("TIRE_LIFESPAN_WARNING_PERCENT must be between 0 and 100.")
 app.config["SESSION_COOKIE_HTTPONLY"] = True
 app.config["SESSION_COOKIE_SAMESITE"] = "Lax"
 app.config["SESSION_COOKIE_SECURE"] = os.environ.get("COOKIE_SECURE", "").strip().lower() in {
@@ -86,6 +93,80 @@ def get_auth_client() -> Client:
         return request_client
     except Exception as exc:
         raise FleetManagementError(f"Could not initialize Supabase Auth: {exc}") from exc
+
+
+def get_dispatch_client() -> Client:
+    request_client = getattr(g, "supabase_dispatch_client", None)
+    if request_client is not None:
+        return request_client
+    access_token = getattr(g, "dispatch_access_token", None)
+    project_url = _supabase_setting("SUPABASE_URL")
+    anon_key = _supabase_setting("SUPABASE_ANON_KEY")
+    if not access_token:
+        raise FleetManagementError("Your sign-in expired. Please sign in again.")
+    if not project_url or not anon_key:
+        raise FleetManagementError(
+            "Supabase dispatch access is not configured. Set SUPABASE_URL and "
+            "SUPABASE_ANON_KEY in the project .env file."
+        )
+    try:
+        request_client = create_client(
+            _supabase_project_url(project_url),
+            anon_key,
+            options=ClientOptions(postgrest_client_timeout=15),
+        )
+        request_client.options.headers["Authorization"] = f"Bearer {access_token}"
+        request_client.postgrest.auth(access_token)
+        g.supabase_dispatch_client = request_client
+        return request_client
+    except Exception as exc:
+        raise FleetManagementError(f"Could not initialize secure dispatch access: {exc}") from exc
+
+
+def _dispatch_rpc(function_name: str, params: dict[str, Any] | None = None) -> Any:
+    try:
+        return get_dispatch_client().rpc(function_name, params or {}).execute().data
+    except FleetManagementError:
+        raise
+    except Exception as exc:
+        logger.warning("Secure dispatch RPC %s failed.", function_name, exc_info=True)
+        message = str(getattr(exc, "message", "") or "")
+        code = str(getattr(exc, "code", "") or "")
+        status = getattr(exc, "status", None)
+        if code == "PGRST202":
+            raise FleetManagementError(
+                f"Dispatch database function '{function_name}' is missing. "
+                "Apply the latest location-dispatch migration."
+            ) from exc
+        if code == "42501":
+            raise FleetManagementError(
+                f"Database permission denied during dispatch operation '{function_name}' "
+                "(42501). Apply the latest location-dispatch grants."
+            ) from exc
+        if message and any(
+            phrase in message.lower()
+            for phrase in (
+                "authorized", "required", "must be", "select an active",
+                "configured", "verify", "manifests", "earlier than",
+                "not ready", "not available", "correction reason",
+                "capacity", "different", "complete all",
+            )
+        ):
+            raise FleetManagementError(message) from exc
+        if status in {401, 403}:
+            raise FleetManagementError(
+                message or "You are not authorized to perform this dispatch action."
+            ) from exc
+        if message:
+            raise FleetManagementError(message) from exc
+        if code:
+            raise FleetManagementError(
+                f"Dispatch database request '{function_name}' failed ({code})."
+            ) from exc
+        raise FleetManagementError(
+            "The secure dispatch operation could not be completed. Check the migration "
+            "and try again."
+        ) from exc
 
 
 def get_manager() -> FleetManager:
@@ -130,8 +211,13 @@ def _authorize_dispatcher_request() -> Any:
         "/api/export/trips",
     }:
         resource = request.path.split("/")[2] if len(request.path.split("/")) > 2 else ""
-        if resource not in {"trips", "fuel", "maintenance"}:
+        if resource not in {"trips", "fuel", "maintenance", "tires", "dispatch"}:
             return _json_error("Dispatchers are not authorized to access this function.", 403)
+        if resource == "trips" and request.method != "GET":
+            return _json_error(
+                "Use the Departure → Arrival workflow for trip changes.",
+                403,
+            )
         if request.method == "DELETE":
             return _json_error("Dispatchers cannot delete submitted records.", 403)
         is_trip_update = (
@@ -158,11 +244,14 @@ def _secure_cookies() -> bool:
 
 @app.teardown_request
 def close_auth_client(_error: BaseException | None) -> None:
-    request_client = getattr(g, "supabase_auth_client", None)
-    if request_client is None:
-        return
-    request_client.auth.close()
-    request_client.postgrest.session.close()
+    for request_client in (
+        getattr(g, "supabase_auth_client", None),
+        getattr(g, "supabase_dispatch_client", None),
+    ):
+        if request_client is None:
+            continue
+        request_client.auth.close()
+        request_client.postgrest.session.close()
 
 
 @app.before_request
@@ -225,6 +314,7 @@ def enforce_authentication() -> Any:
             user = getattr(user_response, "user", None)
             if user and str(getattr(user, "id", "")) == str(session.get("user_id")):
                 session["last_activity"] = time.time()
+                g.dispatch_access_token = access_token
                 role = _role_for_auth_user(user)
                 session["user_role"] = role
                 g.current_user = {
@@ -247,6 +337,7 @@ def enforce_authentication() -> Any:
             user = getattr(refreshed, "user", None)
             if refreshed_session and user and str(getattr(user, "id", "")) == str(session.get("user_id")):
                 g.auth_tokens = refreshed_session
+                g.dispatch_access_token = refreshed_session.access_token
                 session["last_activity"] = time.time()
                 role = _role_for_auth_user(user)
                 session["user_role"] = role
@@ -335,14 +426,18 @@ def handle_request_too_large(_error: Any) -> tuple[Any, int]:
 
 @app.route("/")
 def index() -> Any:
-    return send_from_directory(STATIC_DIR, "index.html")
+    response = send_from_directory(STATIC_DIR, "index.html")
+    response.headers["Cache-Control"] = "no-store"
+    return response
 
 
 @app.route("/dispatcher/add-trip")
 def dispatcher_add_trip() -> Any:
     if not session.get("user_id"):
         return redirect(url_for("login_page"))
-    return send_from_directory(STATIC_DIR, "index.html")
+    response = send_from_directory(STATIC_DIR, "index.html")
+    response.headers["Cache-Control"] = "no-store"
+    return response
 
 
 @app.route("/login")
@@ -515,6 +610,304 @@ def bootstrap() -> Any:
     )
 
 
+def _dispatch_timestamp(value: Any, field_name: str) -> str:
+    text = str(value or "").strip()
+    if not text:
+        raise ValueError(f"{field_name} is required.")
+    try:
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise ValueError(f"{field_name} must be a valid date and time.") from exc
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=BUSINESS_TIMEZONE)
+    return parsed.isoformat()
+
+
+def _payload_boolean(payload: dict[str, Any], key: str, default: bool = False) -> bool:
+    value = payload.get(key, default)
+    if not isinstance(value, bool):
+        raise ValueError(f"{key.replace('_', ' ').capitalize()} must be true or false.")
+    return value
+
+
+def _dispatch_error_response(exc: FleetManagementError) -> tuple[Any, int]:
+    message = str(exc)
+    lowered = message.lower()
+    status = 403 if any(
+        word in lowered for word in (
+            "not authorized", "not have access", "only an administrator",
+            "only the originating", "only the verified",
+        )
+    ) else 400
+    if "sign-in expired" in lowered:
+        status = 401
+    if any(
+        marker in lowered
+        for marker in (
+            "migration", "secure dispatch operation", "permission denied",
+            "42501", "database function",
+        )
+    ):
+        status = 503
+    return _json_error(message, status)
+
+
+@app.route("/api/dispatch/movements", methods=["GET", "POST"])
+def dispatch_movements() -> Any:
+    if request.method == "GET":
+        try:
+            queue = request.args.get("queue", "departures")
+            page = int(request.args.get("page", "1"))
+            page_size = int(request.args.get("page_size", "25"))
+            if queue not in {"departures", "arrivals", "completed"}:
+                return _json_error("Select a valid movement queue.", 400)
+            if page < 1 or page_size < 1 or page_size > 100:
+                return _json_error("Invalid movement page request.", 400)
+            result = _dispatch_rpc("list_dispatch_movements_page", {
+                "p_queue": queue,
+                "p_page": page,
+                "p_page_size": page_size,
+                "p_search": request.args.get("search", "")[:120],
+            }) or {}
+        except FleetManagementError as exc:
+            return _dispatch_error_response(exc)
+        except ValueError:
+            return _json_error("Invalid movement page request.", 400)
+        return jsonify({
+            "movements": result.get("movements") or [],
+            "total": result.get("total") or 0,
+            "page": page,
+            "page_size": page_size,
+        })
+
+    try:
+        payload = _body()
+        movement_id = _dispatch_rpc("create_dispatch_movement", {
+            "p_origin_location_id": _required_text(payload, "origin_location_id").upper(),
+            "p_destination_location_id": _required_text(payload, "destination_location_id").upper(),
+            "p_ism_no": _required_text(payload, "ism_no"),
+            "p_truck_id": _integer(payload, "truck_id"),
+            "p_driver_id": _integer(payload, "driver_id"),
+            "p_trailer_id": _integer(payload, "trailer_id"),
+            "p_load_type": _required_text(payload, "load_type").upper(),
+            "p_pallet_quantity": _integer(payload, "pallet_quantity"),
+            "p_departure_at": _dispatch_timestamp(payload.get("departure_at"), "Departure date and time"),
+            "p_fuel_allocation": _optional_number(payload, "fuel_allocation"),
+            "p_actual_fuel_expense": _optional_number(payload, "actual_fuel_expense"),
+            "p_fuel_remarks": _optional_text(payload, "fuel_remarks"),
+        })
+    except ValueError as exc:
+        return _json_error(str(exc), 400)
+    except FleetManagementError as exc:
+        return _dispatch_error_response(exc)
+    return jsonify({"id": movement_id}), 201
+
+
+@app.route("/api/dispatch/movements/<uuid:movement_id>/verify", methods=["POST"])
+def verify_dispatch_movement(movement_id: uuid.UUID) -> Any:
+    try:
+        payload = _body()
+        result = _dispatch_rpc("verify_dispatch_ism", {
+            "p_movement_id": str(movement_id),
+            "p_submitted_ism": _required_text(payload, "ism_no"),
+        })
+    except ValueError as exc:
+        return _json_error(str(exc), 400)
+    except FleetManagementError as exc:
+        return _dispatch_error_response(exc)
+    return jsonify(result)
+
+
+@app.route("/api/dispatch/movements/<uuid:movement_id>/arrival", methods=["POST"])
+def submit_dispatch_movement_arrival(movement_id: uuid.UUID) -> Any:
+    try:
+        payload = _body()
+        _dispatch_rpc("submit_dispatch_arrival", {
+            "p_movement_id": str(movement_id),
+            "p_arrival_at": _dispatch_timestamp(payload.get("arrival_at"), "Arrival date and time"),
+            "p_arrival_fuel_expense": _optional_number(payload, "arrival_fuel_expense"),
+        })
+    except ValueError as exc:
+        return _json_error(str(exc), 400)
+    except FleetManagementError as exc:
+        return _dispatch_error_response(exc)
+    return jsonify({"message": "Arrival submitted for admin review."})
+
+
+@app.route(
+    "/api/dispatch/movements/<uuid:movement_id>/documents/<kind>",
+    methods=["GET", "POST"],
+)
+def upload_dispatch_movement_document(movement_id: uuid.UUID, kind: str) -> Any:
+    if kind not in {"departure", "arrival", "fuel_invoice"}:
+        return _json_error("Unsupported dispatch document type.", 400)
+    if request.method == "GET":
+        try:
+            rows = _dispatch_rpc("list_dispatch_movements") or []
+            movement = next(
+                (row for row in rows if str(row.get("id")) == str(movement_id)),
+                None,
+            )
+            if movement is None:
+                return _json_error("Movement was not found or is not accessible.", 404)
+            path_field = {
+                "departure": "departure_manifest_path",
+                "arrival": "arrival_manifest_path",
+                "fuel_invoice": "fuel_invoice_path",
+            }[kind]
+            object_path = movement.get(path_field)
+            if not object_path:
+                return _json_error("No document has been uploaded for this movement.", 404)
+            image_bytes = get_dispatch_client().storage.from_(
+                app.config["DOCUMENT_IMAGE_BUCKET"]
+            ).download(object_path)
+        except FleetManagementError as exc:
+            return _dispatch_error_response(exc)
+        except Exception:
+            logger.exception("Could not retrieve dispatch document.")
+            return _json_error("Could not retrieve the document. Please retry.", 503)
+        extension = os.path.splitext(object_path)[1].lower()
+        response = send_file(
+            BytesIO(image_bytes),
+            mimetype={
+                ".jpg": "image/jpeg",
+                ".png": "image/png",
+                ".webp": "image/webp",
+            }.get(extension, "application/octet-stream"),
+            as_attachment=False,
+            download_name=f"{kind}-{movement_id}{extension}",
+            max_age=0,
+        )
+        response.headers["X-Content-Type-Options"] = "nosniff"
+        response.headers["Content-Security-Policy"] = "default-src 'none'; img-src 'self'; sandbox"
+        return response
+
+    image_file = request.files.get("image")
+    if image_file is None:
+        return _json_error("Attach an image using the 'image' field.", 400)
+    try:
+        image_bytes, mime_type, extension = _validated_image(image_file)
+    except ValueError as exc:
+        return _json_error(str(exc), 400)
+
+    object_path = f"{movement_id}/{kind}/{uuid.uuid4().hex}.{extension}"
+    client = None
+    uploaded = False
+    try:
+        client = get_dispatch_client()
+        client.storage.from_(app.config["DOCUMENT_IMAGE_BUCKET"]).upload(
+            object_path, image_bytes, {"content-type": mime_type, "upsert": "false"}
+        )
+        uploaded = True
+        _dispatch_rpc("attach_dispatch_document", {
+            "p_movement_id": str(movement_id),
+            "p_document_kind": kind,
+            "p_object_path": object_path,
+        })
+    except FleetManagementError as exc:
+        if uploaded and client is not None:
+            try:
+                client.storage.from_(app.config["DOCUMENT_IMAGE_BUCKET"]).remove([object_path])
+            except Exception:
+                logger.exception("Could not clean up rejected dispatch document %s.", object_path)
+        return _dispatch_error_response(exc)
+    except Exception:
+        if uploaded and client is not None:
+            try:
+                client.storage.from_(app.config["DOCUMENT_IMAGE_BUCKET"]).remove([object_path])
+            except Exception:
+                logger.exception("Could not clean up failed dispatch document %s.", object_path)
+        logger.exception("Could not upload dispatch document.")
+        return _json_error("Could not save the document. Please retry.", 503)
+    return jsonify({"message": "Document uploaded successfully."}), 201
+
+
+@app.route("/api/dispatch/movements/<uuid:movement_id>/finalize", methods=["POST"])
+def finalize_dispatch_movement(movement_id: uuid.UUID) -> Any:
+    try:
+        trip_id = _dispatch_rpc("finalize_dispatch_movement", {
+            "p_movement_id": str(movement_id),
+        })
+    except FleetManagementError as exc:
+        return _dispatch_error_response(exc)
+    return jsonify({"trip_id": trip_id})
+
+
+@app.route("/api/dispatch/movements/<uuid:movement_id>/correction", methods=["POST"])
+def request_dispatch_correction(movement_id: uuid.UUID) -> Any:
+    try:
+        payload = _body()
+        _dispatch_rpc("request_dispatch_correction", {
+            "p_movement_id": str(movement_id),
+            "p_reason": _required_text(payload, "reason"),
+        })
+    except ValueError as exc:
+        return _json_error(str(exc), 400)
+    except FleetManagementError as exc:
+        return _dispatch_error_response(exc)
+    return jsonify({"message": "Correction requested."})
+
+
+@app.route("/api/dispatch/movements/<uuid:movement_id>/history")
+def dispatch_movement_history(movement_id: uuid.UUID) -> Any:
+    try:
+        response = get_dispatch_client().table("dispatch_movement_audit").select(
+            "id,actor_id,action,details,created_at"
+        ).eq("movement_id", str(movement_id)).order("created_at", desc=True).execute()
+    except Exception:
+        logger.exception("Could not load dispatch movement audit history.")
+        return _json_error("Could not load movement history. Please retry.", 503)
+    return jsonify({"history": response.data or []})
+
+
+@app.route("/api/dispatch/locations", methods=["GET", "POST"])
+def dispatch_locations() -> Any:
+    try:
+        if request.method == "GET":
+            locations = _dispatch_rpc("list_dispatch_locations") or []
+            return jsonify({"locations": locations})
+        payload = _body()
+        _dispatch_rpc("manage_dispatch_location", {
+            "p_location_id": _required_text(payload, "id").upper(),
+            "p_name": _required_text(payload, "name"),
+            "p_active": _payload_boolean(payload, "active", True),
+        })
+    except FleetManagementError as exc:
+        return _dispatch_error_response(exc)
+    except ValueError as exc:
+        return _json_error(str(exc), 400)
+    return jsonify({"message": "Dispatch location saved."}), 201
+
+
+@app.route("/api/dispatch/users")
+def dispatch_users() -> Any:
+    try:
+        users = _dispatch_rpc("list_dispatcher_users") or []
+    except FleetManagementError as exc:
+        return _dispatch_error_response(exc)
+    return jsonify({"users": users})
+
+
+@app.route("/api/dispatch/assignments", methods=["GET", "POST"])
+def dispatch_assignments() -> Any:
+    try:
+        if request.method == "GET":
+            assignments = _dispatch_rpc("list_dispatcher_assignments") or []
+            return jsonify({"assignments": assignments})
+        payload = _body()
+        _dispatch_rpc("manage_dispatch_location_assignment", {
+            "p_user_id": _required_text(payload, "user_id"),
+            "p_location_id": _required_text(payload, "location_id").upper(),
+            "p_can_depart": _payload_boolean(payload, "can_depart"),
+            "p_can_arrive": _payload_boolean(payload, "can_arrive"),
+        })
+    except ValueError as exc:
+        return _json_error(str(exc), 400)
+    except FleetManagementError as exc:
+        return _dispatch_error_response(exc)
+    return jsonify({"message": "Dispatcher location assignment saved."}), 201
+
+
 def _add_document_links(
     rows: list[dict[str, Any]], path_field: str, url_field: str, endpoint: str
 ) -> None:
@@ -638,6 +1031,11 @@ def _handle_document_image(kind: str, record_id: int) -> Any:
             image_bytes, mime_type, extension = _validated_image(image_file)
         except ValueError as exc:
             return _json_error(str(exc), 400)
+        except FleetManagementError as exc:
+            validation_error = _tire_database_validation_error(exc)
+            if validation_error:
+                return _json_error(validation_error, 400)
+            raise
         owner_id = str(record.get("created_by") or (g.current_user or {}).get("id") or "admin")
         object_path = f"{upload_bucket_folder}/{actual_record_id}/{owner_id}/{uuid.uuid4().hex}.{extension}"
         storage = get_manager().client.storage.from_(app.config["DOCUMENT_IMAGE_BUCKET"])
@@ -728,6 +1126,58 @@ def trip_edit_history(trip_id: int) -> Any:
             return _json_error(message, 403)
         raise
     return jsonify({"history": history})
+
+
+@app.route("/api/trips/<int:trip_id>/time-out", methods=["POST"])
+def record_trip_time_out_endpoint(trip_id: int) -> Any:
+    try:
+        payload = _body()
+        actor = g.current_user or {}
+        editor_id = str(actor.get("id") or session.get("user_id") or "")
+        record = get_manager().record_trip_time_out(
+            trip_id,
+            time_value=payload.get("time_value") if "time_value" in payload else payload.get("time_out"),
+            location=payload.get("location"),
+            edited_by=editor_id,
+            editor_email=actor.get("email") or session.get("email"),
+            user_id=editor_id if _is_dispatcher() else None,
+        )
+    except ValueError as exc:
+        return _json_error(str(exc), 400)
+    except FleetManagementError as exc:
+        message = str(exc)
+        if "not found" in message.lower():
+            return _json_error(message, 403 if _is_dispatcher() else 404)
+        if "do not have access" in message.lower():
+            return _json_error(message, 403)
+        return _json_error(message, 400)
+    return jsonify({"data": record})
+
+
+@app.route("/api/trips/<int:trip_id>/time-in", methods=["POST"])
+def record_trip_time_in_endpoint(trip_id: int) -> Any:
+    try:
+        payload = _body()
+        actor = g.current_user or {}
+        editor_id = str(actor.get("id") or session.get("user_id") or "")
+        record = get_manager().record_trip_time_in(
+            trip_id,
+            time_value=payload.get("time_value") if "time_value" in payload else payload.get("time_in"),
+            location=payload.get("location"),
+            edited_by=editor_id,
+            editor_email=actor.get("email") or session.get("email"),
+            user_id=editor_id if _is_dispatcher() else None,
+        )
+    except ValueError as exc:
+        return _json_error(str(exc), 400)
+    except FleetManagementError as exc:
+        message = str(exc)
+        if "not found" in message.lower():
+            return _json_error(message, 403 if _is_dispatcher() else 404)
+        if "do not have access" in message.lower():
+            return _json_error(message, 403)
+        return _json_error(message, 400)
+    return jsonify({"data": record})
 
 
 @app.route("/api/trips/<int:trip_id>", methods=["PATCH"])
@@ -896,10 +1346,531 @@ def _optional_text(payload: dict[str, Any], field: str) -> str | None:
     return str(value).strip() or None if value is not None else None
 
 
+def _tire_date(value: Any, field: str, required: bool = False) -> str | None:
+    text = str(value or "").strip()
+    if not text:
+        if required:
+            raise ValueError(f"{field.replace('_', ' ').capitalize()} is required")
+        return None
+    try:
+        return date.fromisoformat(text).isoformat()
+    except ValueError as exc:
+        raise ValueError(f"{field.replace('_', ' ').capitalize()} must be a valid date") from exc
+
+
+def _tire_text(payload: dict[str, Any], field: str, required: bool = False) -> str | None:
+    value = _optional_text(payload, field)
+    if required and not value:
+        raise ValueError(f"{field.replace('_', ' ').capitalize()} is required")
+    if value and len(value) > 240:
+        raise ValueError(f"{field.replace('_', ' ').capitalize()} must be 240 characters or fewer")
+    return value
+
+
+def _tire_lifespan_percent(payload: dict[str, Any]) -> float:
+    value = _optional_number(payload, "remaining_lifespan_pct", 100.0)
+    if value is None or not math.isfinite(value) or not 0 <= value <= 100:
+        raise ValueError("Life span must be a percentage between 0 and 100")
+    return round(value, 2)
+
+
+def _tire_asset(payload: dict[str, Any]) -> tuple[str, int]:
+    asset_type = str(payload.get("asset_type") or "").strip().lower()
+    if asset_type not in {"truck", "trailer"}:
+        raise ValueError("Asset type must be Truck or Trailer")
+    field = "vehicle_id" if asset_type == "truck" else "trailer_id"
+    asset_id = _integer(payload, field)
+    if asset_id <= 0:
+        raise ValueError("Select a valid truck or trailer")
+    manager = get_manager()
+    table = "vehicles" if asset_type == "truck" else "trailers"
+    response = manager._execute(
+        manager.client.table(table).select("id").eq("id", asset_id).limit(1)
+    )
+    if not response.data:
+        raise ValueError(f"The selected {asset_type} was not found")
+    return asset_type, asset_id
+
+
+def _tire_record_payload(payload: dict[str, Any], actor_id: str) -> dict[str, Any]:
+    if any(key in payload for key in ("created_by", "updated_by", "reference_no", "status")):
+        raise ValueError("Ownership, reference number, and tire status are assigned by the system.")
+
+    installed = _tire_date(payload.get("date_installed"), "date_installed", required=True)
+    replaced = _tire_date(payload.get("date_replaced"), "date_replaced")
+    reason = _tire_text(payload, "reason")
+    if replaced and replaced < installed:
+        raise ValueError("Replacement date cannot be before the installation date")
+    if replaced and not reason:
+        raise ValueError("A reason is required when recording a replaced tire")
+
+    values: dict[str, Any] = {
+        "brand": _tire_text(payload, "brand", required=True),
+        "size": _tire_text(payload, "size", required=True),
+        "tire_type": _tire_text(payload, "tire_type", required=True),
+        "serial_no": _tire_text(payload, "serial_no"),
+        "supplier": _tire_text(payload, "supplier"),
+        "date_installed": installed,
+        "remaining_lifespan_pct": _tire_lifespan_percent(payload),
+        "reason": reason,
+        "remarks": _tire_text(payload, "remarks"),
+        "created_by": actor_id,
+        "updated_by": actor_id,
+    }
+    asset_type, asset_id = _tire_asset(payload)
+    wrong_asset_field = "trailer_id" if asset_type == "truck" else "vehicle_id"
+    if payload.get(wrong_asset_field) not in (None, ""):
+        raise ValueError(f"A {asset_type} tire record cannot also reference a different asset type")
+    values["asset_type"] = asset_type
+    values["vehicle_id"] = asset_id if asset_type == "truck" else None
+    values["trailer_id"] = asset_id if asset_type == "trailer" else None
+    values["date_replaced"] = replaced
+    values["status"] = "replaced" if replaced else "installed"
+    return values
+
+
+def _tire_query_from_request():
+    args = request.args
+    manager = get_manager()
+    query = manager.client.table("tire_monitoring_sheet").select("*", count="exact")
+    if _is_dispatcher():
+        query = query.eq(
+            "created_by",
+            str((g.current_user or {}).get("id") or session.get("user_id") or ""),
+        )
+
+    search = args.get("search", "").strip()
+    safe_search = "".join(
+        character if character.isalnum() or character in " -" else " "
+        for character in search
+    ).strip()
+    if safe_search:
+        term = f"%{safe_search}%"
+        query = query.or_(
+            ",".join(
+                f"{field}.ilike.{term}"
+                for field in (
+                    "reference_no", "brand", "size", "serial_no", "supplier", "plate_number"
+                )
+            )
+        )
+
+    asset_type = args.get("asset_type", "").strip().lower()
+    if asset_type:
+        if asset_type not in {"truck", "trailer"}:
+            raise ValueError("Asset type filter must be Truck or Trailer")
+        query = query.eq("asset_type", asset_type)
+    asset_value = args.get("asset_id", "").strip()
+    if asset_value:
+        asset_id = _integer({"asset_id": asset_value}, "asset_id")
+        if asset_id <= 0 or asset_type not in {"truck", "trailer"}:
+            raise ValueError("Choose an asset type and a valid plate number")
+        query = query.eq("vehicle_id" if asset_type == "truck" else "trailer_id", asset_id)
+
+    status = args.get("status", "").strip().lower()
+    if status:
+        if status not in {"installed", "replaced", "removed"}:
+            raise ValueError("Status filter must be Installed, Replaced, or Removed")
+        query = query.eq("status", status)
+
+    installed_from = _tire_date(args.get("date_from"), "date_from")
+    installed_to = _tire_date(args.get("date_to"), "date_to")
+    if installed_from and installed_to and installed_from > installed_to:
+        raise ValueError("Installation date range is invalid")
+    if installed_from:
+        query = query.gte("date_installed", installed_from)
+    if installed_to:
+        query = query.lte("date_installed", installed_to)
+
+    minimum = args.get("lifespan_min", "").strip()
+    maximum = args.get("lifespan_max", "").strip()
+    try:
+        minimum_value = float(minimum) if minimum else None
+        maximum_value = float(maximum) if maximum else None
+        if any(
+            value is not None and not 0 <= value <= 100
+            for value in (minimum_value, maximum_value)
+        ):
+            raise ValueError
+    except ValueError as exc:
+        raise ValueError("Lifespan filters must be percentages between 0 and 100") from exc
+    if minimum_value is not None and maximum_value is not None:
+        if minimum_value > maximum_value:
+            raise ValueError("Lifespan range is invalid")
+    if minimum_value is not None:
+        query = query.gte("remaining_lifespan_pct", minimum_value)
+    if maximum_value is not None:
+        query = query.lte("remaining_lifespan_pct", maximum_value)
+
+    condition = args.get("condition", "").strip().lower()
+    if condition == "near_end":
+        query = query.lte(
+            "remaining_lifespan_pct", app.config["TIRE_LIFESPAN_WARNING_PERCENT"]
+        )
+    elif condition == "above_warning":
+        query = query.gt(
+            "remaining_lifespan_pct", app.config["TIRE_LIFESPAN_WARNING_PERCENT"]
+        )
+    elif condition:
+        raise ValueError("Condition filter is invalid")
+    return query
+
+
+def _tire_visible_record(tire_id: int) -> dict[str, Any] | None:
+    manager = get_manager()
+    query = manager.client.table("tire_monitoring_sheet").select("*").eq("id", tire_id)
+    if _is_dispatcher():
+        query = query.eq(
+            "created_by",
+            str((g.current_user or {}).get("id") or session.get("user_id") or ""),
+        )
+    response = manager._execute(query.limit(1))
+    return dict(response.data[0]) if response.data else None
+
+
+def _tire_database_validation_error(error: FleetManagementError) -> str | None:
+    message = str(error)
+    normalized = message.lower()
+    if "duplicate key" in normalized or "unique constraint" in normalized:
+        return "That tire serial number or reference number is already in use."
+    for expected in (
+        "only an installed tire can be replaced",
+        "only an installed tire can be removed",
+        "replacement date cannot be before the installation date",
+        "removal date cannot be before the installation date",
+        "a replacement reason is required",
+        "a removal reason is required",
+        "life span must be a percentage between 0 and 100",
+        "was not found",
+    ):
+        if expected in normalized:
+            return message.removeprefix("Supabase request failed: ")
+    return None
+
+
+def _tire_csv_value(value: Any) -> Any:
+    if isinstance(value, str) and value.startswith(("=", "+", "-", "@", "\t", "\r")):
+        return f"'{value}"
+    return value
+
+
+def _tire_csv_response() -> Response:
+    query = _tire_query_from_request()
+    sort_fields = {
+        "date_installed": "date_installed",
+        "lifespan": "remaining_lifespan_pct",
+        "brand": "brand",
+        "plate": "plate_number",
+    }
+    sort_by = request.args.get("sort_by", "date_installed")
+    sort_dir = request.args.get("sort_dir", "desc").lower()
+    if sort_by not in sort_fields or sort_dir not in {"asc", "desc"}:
+        raise ValueError("Sort field or direction is invalid")
+    columns = (
+        "reference_no", "brand", "size", "tire_type", "serial_no", "supplier",
+        "date_installed", "date_replaced", "remaining_lifespan_pct", "reason",
+        "remarks", "plate_number", "asset_type", "status",
+    )
+
+    @stream_with_context
+    def rows():
+        buffer = StringIO()
+        writer = csv.writer(buffer)
+        writer.writerow(
+            [
+                "Reference No.", "Brand", "Size", "Type", "Serial No.", "Supplier",
+                "Date Installed", "Date Replaced", "Life Span (%)", "Reason",
+                "Remarks", "Plate Number", "Asset Type", "Status",
+            ]
+        )
+        yield buffer.getvalue()
+        offset = 0
+        while True:
+            page = get_manager()._execute(
+                _tire_query_from_request()
+                .order(sort_fields[sort_by], desc=sort_dir == "desc")
+                .order("id", desc=True)
+                .range(offset, offset + 999)
+            ).data or []
+            for record in page:
+                buffer.seek(0)
+                buffer.truncate(0)
+                writer.writerow([_tire_csv_value(record.get(column)) for column in columns])
+                yield buffer.getvalue()
+            if len(page) < 1000:
+                break
+            offset += 1000
+
+    return Response(
+        rows(),
+        mimetype="text/csv; charset=utf-8",
+        headers={"Content-Disposition": 'attachment; filename="tire-monitoring.csv"'},
+    )
+
+
 def _payroll_period_from_request(payload: dict[str, Any]) -> tuple[str, str]:
     start_date = _required_text(payload, "start_date")
     end_date = _required_text(payload, "end_date")
     return start_date, end_date
+
+
+@app.route("/api/tires", methods=["GET", "POST"])
+def tire_monitoring_records() -> Any:
+    manager = get_manager()
+    if request.method == "POST":
+        try:
+            payload = _body()
+            actor_id = str((g.current_user or {}).get("id") or session.get("user_id") or "")
+            if not actor_id:
+                return _json_error("Authenticated user identity is missing.", 403)
+            values = _tire_record_payload(payload, actor_id)
+            inserted = manager._execute(
+                manager.client.table("tire_monitoring").insert(values).select("id")
+            )
+            record_id = inserted.data[0]["id"]
+            record = _tire_visible_record(int(record_id))
+            if record is None:
+                raise FleetManagementError("Supabase did not return the inserted tire record")
+            return jsonify({"data": record}), 201
+        except ValueError as exc:
+            return _json_error(str(exc), 400)
+        except FleetManagementError as exc:
+            validation_error = _tire_database_validation_error(exc)
+            if validation_error:
+                return _json_error(validation_error, 400)
+            raise
+
+    try:
+        if request.args.get("export", "").lower() == "csv":
+            return _tire_csv_response()
+        page = _integer({"page": request.args.get("page", "1")}, "page")
+        page_size = _integer({"page_size": request.args.get("page_size", "25")}, "page_size")
+        if page < 1 or not 1 <= page_size <= 100:
+            raise ValueError("Page must be positive and page size must be between 1 and 100")
+        sort_fields = {
+            "date_installed": "date_installed",
+            "lifespan": "remaining_lifespan_pct",
+            "brand": "brand",
+            "plate": "plate_number",
+        }
+        sort_by = request.args.get("sort_by", "date_installed")
+        if sort_by not in sort_fields:
+            raise ValueError("Sort field is invalid")
+        sort_dir = request.args.get("sort_dir", "desc").lower()
+        if sort_dir not in {"asc", "desc"}:
+            raise ValueError("Sort direction must be asc or desc")
+
+        query = _tire_query_from_request()
+        query = query.order(sort_fields[sort_by], desc=sort_dir == "desc").order("id", desc=True)
+        offset = (page - 1) * page_size
+        response = manager._execute(query.range(offset, offset + page_size - 1))
+        summary_response = manager._execute(
+            manager.client.rpc(
+                "get_tire_monitoring_summary",
+                {
+                    "p_user_id": (
+                        str((g.current_user or {}).get("id") or session.get("user_id") or "")
+                        if _is_dispatcher()
+                        else None
+                    ),
+                    "p_warning_percent": app.config["TIRE_LIFESPAN_WARNING_PERCENT"],
+                },
+            )
+        )
+        summary_rows = summary_response.data or []
+        summary = dict(summary_rows[0]) if summary_rows else {}
+        return jsonify(
+            {
+                "data": response.data or [],
+                "page": page,
+                "page_size": page_size,
+                "total": response.count or 0,
+                "summary": summary,
+                "warning_percent": app.config["TIRE_LIFESPAN_WARNING_PERCENT"],
+            }
+        )
+    except ValueError as exc:
+        return _json_error(str(exc), 400)
+    except FleetManagementError as exc:
+        validation_error = _tire_database_validation_error(exc)
+        if validation_error:
+            return _json_error(validation_error, 400)
+        raise
+
+
+@app.route("/api/tires/<int:tire_id>", methods=["GET", "PATCH"])
+def tire_monitoring_record(tire_id: int) -> Any:
+    manager = get_manager()
+    record = _tire_visible_record(tire_id)
+    if record is None:
+        return _json_error("Tire record not found or you do not have access.", 404)
+    if request.method == "GET":
+        history_response = manager._execute(
+            manager.client.table("tire_monitoring_history")
+            .select("id,action,actor_id,old_values,new_values,created_at")
+            .eq("tire_id", tire_id)
+            .order("created_at", desc=True)
+            .limit(100)
+        )
+        replaces = None
+        replaces_tire_id = record.get("replaces_tire_id")
+        if replaces_tire_id is not None:
+            replaces = _tire_visible_record(int(replaces_tire_id))
+
+        replacement_query = (
+            manager.client.table("tire_monitoring")
+            .select("id")
+            .eq("replaces_tire_id", tire_id)
+            .limit(1)
+        )
+        if _is_dispatcher():
+            replacement_query = replacement_query.eq(
+                "created_by",
+                str((g.current_user or {}).get("id") or session.get("user_id") or ""),
+            )
+        replacement_rows = manager._execute(replacement_query).data or []
+        replacement = (
+            _tire_visible_record(int(replacement_rows[0]["id"]))
+            if replacement_rows
+            else None
+        )
+        return jsonify(
+            {
+                "data": record,
+                "history": history_response.data or [],
+                "replaces": replaces,
+                "replacement": replacement,
+            }
+        )
+    if _is_dispatcher():
+        return _json_error("Dispatchers cannot edit submitted tire records.", 403)
+
+    try:
+        payload = _body()
+        if any(
+            key in payload
+            for key in (
+                "id", "reference_no", "asset_type", "vehicle_id", "trailer_id",
+                "date_installed", "date_replaced", "status", "created_by",
+            )
+        ):
+            raise ValueError("Asset assignment and lifecycle history cannot be changed by editing.")
+        actor_id = str((g.current_user or {}).get("id") or session.get("user_id") or "")
+        values = {
+            "brand": _tire_text(payload, "brand", required=True),
+            "size": _tire_text(payload, "size", required=True),
+            "tire_type": _tire_text(payload, "tire_type", required=True),
+            "serial_no": _tire_text(payload, "serial_no"),
+            "supplier": _tire_text(payload, "supplier"),
+            "remaining_lifespan_pct": _tire_lifespan_percent(payload),
+            "reason": _tire_text(payload, "reason"),
+            "remarks": _tire_text(payload, "remarks"),
+            "updated_by": actor_id,
+        }
+        updated = manager._execute(
+            manager.client.table("tire_monitoring")
+            .update(values)
+            .eq("id", tire_id)
+            .select("id")
+        )
+        if not updated.data:
+            return _json_error("Tire record not found.", 404)
+        return jsonify({"data": _tire_visible_record(tire_id)})
+    except ValueError as exc:
+        return _json_error(str(exc), 400)
+    except FleetManagementError as exc:
+        validation_error = _tire_database_validation_error(exc)
+        if validation_error:
+            return _json_error(validation_error, 400)
+        raise
+
+
+@app.route("/api/tires/<int:tire_id>/replace", methods=["POST"])
+def replace_tire_monitoring_record(tire_id: int) -> Any:
+    if _is_dispatcher():
+        return _json_error("Only administrators can replace installed tire records.", 403)
+    try:
+        payload = _body()
+        forbidden = {
+            "id", "reference_no", "asset_type", "vehicle_id", "trailer_id",
+            "date_installed", "date_replaced", "status", "created_by", "updated_by",
+        }
+        if forbidden.intersection(payload):
+            raise ValueError("Replacement identity and assignment are managed by the system.")
+        replaced_on = _tire_date(payload.get("date_replaced"), "date_replaced", required=True)
+        reason = _tire_text(payload, "reason", required=True)
+        actor_id = str((g.current_user or {}).get("id") or session.get("user_id") or "")
+        result = get_manager()._execute(
+            get_manager().client.rpc(
+                "replace_tire_monitoring",
+                {
+                    "p_tire_id": tire_id,
+                    "p_date_replaced": replaced_on,
+                    "p_reason": reason,
+                    "p_brand": _tire_text(payload, "brand", required=True),
+                    "p_size": _tire_text(payload, "size", required=True),
+                    "p_tire_type": _tire_text(payload, "tire_type", required=True),
+                    "p_serial_no": _tire_text(payload, "serial_no"),
+                    "p_supplier": _tire_text(payload, "supplier"),
+                    "p_remaining_lifespan_pct": _tire_lifespan_percent(payload),
+                    "p_remarks": _tire_text(payload, "remarks"),
+                    "p_actor_id": actor_id,
+                },
+            )
+        )
+        rows = result.data or []
+        if not rows:
+            raise FleetManagementError("Supabase did not return the replacement tire records")
+        old_record = _tire_visible_record(tire_id)
+        new_id = (rows[0].get("new_record") or {}).get("id")
+        new_record = _tire_visible_record(int(new_id)) if new_id is not None else None
+        if old_record is None or new_record is None:
+            raise FleetManagementError("Supabase did not return the completed replacement history")
+        return jsonify({"old_record": old_record, "new_record": new_record})
+    except ValueError as exc:
+        return _json_error(str(exc), 400)
+    except FleetManagementError as exc:
+        validation_error = _tire_database_validation_error(exc)
+        if validation_error:
+            return _json_error(validation_error, 400)
+        raise
+
+
+@app.route("/api/tires/<int:tire_id>/remove", methods=["POST"])
+def remove_tire_monitoring_record(tire_id: int) -> Any:
+    if _is_dispatcher():
+        return _json_error("Only administrators can remove installed tire records.", 403)
+    try:
+        payload = _body()
+        if any(
+            key in payload
+            for key in ("id", "reference_no", "asset_type", "vehicle_id", "trailer_id", "status")
+        ):
+            raise ValueError("Tire assignment and status are managed by the system.")
+        actor_id = str((g.current_user or {}).get("id") or session.get("user_id") or "")
+        rows = get_manager()._execute(
+            get_manager().client.rpc(
+                "remove_tire_monitoring",
+                {
+                    "p_tire_id": tire_id,
+                    "p_date_replaced": _tire_date(
+                        payload.get("date_replaced"), "date_replaced", required=True
+                    ),
+                    "p_reason": _tire_text(payload, "reason", required=True),
+                    "p_actor_id": actor_id,
+                },
+            )
+        ).data or []
+        if not rows:
+            raise FleetManagementError("Supabase did not return the removed tire record")
+        return jsonify({"data": _tire_visible_record(tire_id)})
+    except ValueError as exc:
+        return _json_error(str(exc), 400)
+    except FleetManagementError as exc:
+        validation_error = _tire_database_validation_error(exc)
+        if validation_error:
+            return _json_error(validation_error, 400)
+        raise
 
 
 @app.route("/api/payroll")

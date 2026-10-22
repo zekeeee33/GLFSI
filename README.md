@@ -5,7 +5,8 @@ styling, and a vanilla JavaScript single-page frontend. Flask provides a JSON
 API and securely connects to Supabase; the Supabase service key never goes into
 browser code.
 
-It tracks vehicles, drivers, assignments, maintenance, fuel purchases, and trips.
+It tracks vehicles, drivers, assignments, maintenance, fuel purchases, tire service
+history, and trips.
 The web interface supports light and dark themes, follows the device preference
 by default, and remembers the selected theme in the browser.
 
@@ -45,6 +46,12 @@ and maintenance ID counters past existing records, which prevents duplicate
 IDs after CSV imports. Existing records remain unowned and are visible only to
 administrators.
 
+For location-based dispatch, run
+[`supabase_dispatch_origin_access_migration.sql`](./supabase_dispatch_origin_access_migration.sql)
+after [`supabase_location_dispatch_migration.sql`](./supabase_location_dispatch_migration.sql).
+Reapply the origin-access migration to existing projects to update the paginated
+dispatch listing; it now computes the eligible movements once per page request.
+
 Run [`supabase_fuel_allocation_migration.sql`](./supabase_fuel_allocation_migration.sql)
 after the base trips/routes schema and dispatcher ownership migration. It adds
 the `fuel_logs.trip_id` foreign key and allocation fields; rerun it for existing
@@ -79,6 +86,32 @@ Any former capacity values on trucks are copied to
 trailers. Earlier hauling-rate snapshots that may have used truck capacity are
 preserved in `legacy_trip_rate_review`, cleared from the active trip-rate fields,
 and marked unresolved until reviewed against an actual trailer.
+
+## Tire Monitoring Sheet
+
+After the truck/trailer migration, run
+[`supabase_tire_monitoring_migration.sql`](./supabase_tire_monitoring_migration.sql)
+in the Supabase SQL Editor. It adds the tire record and immutable audit-history
+tables, truck/trailer foreign keys, lifecycle checks, indexes, RLS policies, and
+the server-side summary, lifespan, replacement, and removal functions. The
+migration is additive and does not delete existing fleet records.
+
+Administrators can view all tire records, add and edit details, replace installed
+tires, and record removals. Dispatchers can see and add only tire records they
+created; they cannot edit, replace, or remove submitted records. Tire records
+cannot be deleted through the application. A replacement keeps the old record,
+sets its replacement date and reason, and atomically registers the new tire on
+the same truck or trailer. The new record links back to the tire it replaces,
+and both records remain accessible from their details and audit history.
+Database constraints and RLS complement the Flask authorization checks.
+
+Life Span (%) is entered and maintained directly as the estimated percentage
+remaining; no lifespan-days field or elapsed-days calculation is used. New tires
+default to 100%, and the input is validated between 0% and 100%. The warning
+threshold defaults to 20% remaining and can be configured server-side with
+`TIRE_LIFESPAN_WARNING_PERCENT`. Update the percentage after inspection; it is
+not a substitute for physical tread inspection. Tire lists use server-side
+filtering and pagination, and filtered results can be exported to CSV.
 
 ## Revenue dashboard setup
 
@@ -124,12 +157,13 @@ administrator-controlled. The application never accepts `administrator` from
 User Metadata as an authorization grant. Users without an explicit dispatcher
 role retain the existing administrator access model.
 
-Dispatchers can access their own trips, fuel logs, and maintenance records and
-the shared vehicle/driver choices needed to submit them. Payroll, system
-exports, fleet-wide pages, and delete requests are denied by the server as well
-as hidden in the dispatcher interface. The dedicated trip-entry page is available
-at `/dispatcher/add-trip` and opens the same verified trip wizard and business
-logic used in the in-app Add Trip flow.
+Dispatchers can access their own trips, fuel logs, maintenance records, and tire
+records, plus the shared vehicle/driver choices needed to submit them. Payroll,
+system exports, fleet registry pages, and delete requests are denied by the
+server as well as hidden in the dispatcher interface. Tire history is scoped to
+the dispatcher who created each record. The dedicated trip-entry page is
+available at `/dispatcher/add-trip` and opens the same verified trip wizard and
+business logic used in the in-app Add Trip flow.
 
 Trip entry accepts an optional load-manifest image, and fuel-log entry accepts
 an optional invoice image. JPG, PNG, and WEBP files are decoded and validatedon the server and limited to 10 MB by default. Set
