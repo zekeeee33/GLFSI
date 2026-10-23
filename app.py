@@ -37,12 +37,6 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 STATIC_DIR = os.path.join(BASE_DIR, "static")
 
 app = Flask(__name__, static_folder=STATIC_DIR, static_url_path="/static")
-app.config["SERVE_VITE_FRONTEND"] = os.environ.get(
-    "SERVE_VITE_FRONTEND", ""
-).strip().lower() in {"1", "true", "yes", "on"}
-app.config["VITE_FRONTEND_DIR"] = os.environ.get(
-    "VITE_FRONTEND_DIR", os.path.join(BASE_DIR, "frontend-dist")
-)
 app.config["SECRET_KEY"] = os.environ.get("SECRET_KEY") or secrets.token_hex(32)
 app.config["DOCUMENT_IMAGE_MAX_BYTES"] = int(
     os.environ.get("DOCUMENT_IMAGE_MAX_BYTES", str(10 * 1024 * 1024))
@@ -216,16 +210,9 @@ def _authorize_dispatcher_request() -> Any:
         "/api/bootstrap",
         "/api/export/trips",
     }:
-        path_parts = request.path.split("/")
-        resource = (
-            path_parts[3]
-            if len(path_parts) > 3 and path_parts[2] == "data"
-            else path_parts[2] if len(path_parts) > 2 else ""
-        )
+        resource = request.path.split("/")[2] if len(request.path.split("/")) > 2 else ""
         if resource not in {"trips", "fuel", "maintenance", "tires", "dispatch"}:
             return _json_error("Dispatchers are not authorized to access this function.", 403)
-        if request.path.startswith("/api/data/") and request.method != "GET":
-            return _json_error("Dispatcher data pages are read-only.", 403)
         if resource == "trips" and request.method != "GET":
             return _json_error(
                 "Use the Departure → Arrival workflow for trip changes.",
@@ -437,26 +424,9 @@ def handle_request_too_large(_error: Any) -> tuple[Any, int]:
     return _json_error("The uploaded image exceeds the request size limit.", 413)
 
 
-def _serve_frontend_page(filename: str) -> Any:
-    if not app.config["SERVE_VITE_FRONTEND"]:
-        return send_from_directory(STATIC_DIR, filename)
-
-    frontend_dir = app.config["VITE_FRONTEND_DIR"]
-    if not os.path.isfile(os.path.join(frontend_dir, filename)):
-        logger.error("Vite frontend build is missing required file: %s", filename)
-        return _json_error(
-            "Vite frontend serving is enabled, but the production build is missing. "
-            "Run `npm run build` before starting Flask.",
-            503,
-        )
-    return send_from_directory(frontend_dir, filename)
-
-
 @app.route("/")
 def index() -> Any:
-    response = _serve_frontend_page("index.html")
-    if isinstance(response, tuple):
-        return response
+    response = send_from_directory(STATIC_DIR, "index.html")
     response.headers["Cache-Control"] = "no-store"
     return response
 
@@ -465,27 +435,8 @@ def index() -> Any:
 def dispatcher_add_trip() -> Any:
     if not session.get("user_id"):
         return redirect(url_for("login_page"))
-    response = _serve_frontend_page("index.html")
-    if isinstance(response, tuple):
-        return response
+    response = send_from_directory(STATIC_DIR, "index.html")
     response.headers["Cache-Control"] = "no-store"
-    return response
-
-
-@app.route("/assets/<path:filename>")
-def vite_frontend_asset(filename: str) -> Any:
-    if not app.config["SERVE_VITE_FRONTEND"]:
-        return _json_error("Not found", 404)
-
-    assets_dir = os.path.join(app.config["VITE_FRONTEND_DIR"], "assets")
-    if not os.path.isdir(assets_dir):
-        return _json_error(
-            "Vite frontend serving is enabled, but the production assets are missing. "
-            "Run `npm run build` before starting Flask.",
-            503,
-        )
-    response = send_from_directory(assets_dir, filename)
-    response.headers["Cache-Control"] = "public, max-age=31536000, immutable"
     return response
 
 
@@ -493,10 +444,10 @@ def vite_frontend_asset(filename: str) -> Any:
 def login_page() -> Any:
     if request.args.get("expired") == "1":
         _clear_auth()
-        return _serve_frontend_page("login.html")
+        return send_from_directory(STATIC_DIR, "login.html")
     if session.get("user_id"):
         return redirect(url_for("index"))
-    return _serve_frontend_page("login.html")
+    return send_from_directory(STATIC_DIR, "login.html")
 
 
 @app.route("/api/auth/csrf")
@@ -577,30 +528,6 @@ def auth_me() -> Any:
 def bootstrap() -> Any:
     fleet = get_manager()
     user_id = str((g.current_user or {}).get("id") or session.get("user_id") or "")
-    if request.args.get("mode") == "initial":
-        dispatcher = _is_dispatcher()
-        try:
-            data = fleet.bootstrap_payload(
-                user_id=user_id if dispatcher else None,
-                today=time.strftime("%Y-%m-%d"),
-                dispatcher=dispatcher,
-            )
-        except FleetManagementError as exc:
-            logger.warning("Could not load initial bootstrap data: %s", exc)
-            return _json_error(str(exc), 503)
-
-        data.update(
-            {
-                "assignments": [],
-                "maintenance": [],
-                "fuel_logs": [],
-                "trips": [],
-                "csrf_token": session.get("csrf_token"),
-                "user": g.current_user,
-            }
-        )
-        return jsonify(data)
-
     if _is_dispatcher():
         if not user_id:
             return _json_error("Authenticated dispatcher identity is missing.", 403)
@@ -681,141 +608,6 @@ def bootstrap() -> Any:
             "user": g.current_user,
         }
     )
-
-
-@app.route(
-    "/api/data/<any(trips,fuel,maintenance,assignments):resource>",
-    methods=["GET"],
-)
-def paginated_resource_data(resource: str) -> Any:
-    if _is_dispatcher() and resource not in {"trips", "fuel", "maintenance"}:
-        return _json_error("Dispatchers are not authorized to access this data.", 403)
-
-    try:
-        page = int(request.args.get("page", "1"))
-        page_size = int(request.args.get("page_size", "50"))
-    except ValueError:
-        return _json_error("Page and page size must be whole numbers.", 400)
-    if page < 1 or page > 100_000:
-        return _json_error("Page must be between 1 and 100000.", 400)
-    if page_size < 1 or page_size > 100:
-        return _json_error("Page size must be between 1 and 100.", 400)
-
-    search = request.args.get("search", "").strip()
-    if len(search) > 100:
-        return _json_error("Search must be 100 characters or fewer.", 400)
-
-    filters: list[tuple[str, Any] | tuple[str, str, Any]] = []
-    date_field = {
-        "trips": "shipment_date",
-        "fuel": "logged_on",
-        "maintenance": "performed_on",
-        "assignments": "assigned_date",
-    }[resource]
-    for argument, operator in (("date_from", "gte"), ("date_to", "lte")):
-        value = request.args.get(argument, "").strip()
-        if not value:
-            continue
-        try:
-            date.fromisoformat(value)
-        except ValueError:
-            return _json_error(
-                f"{argument.replace('_', ' ').capitalize()} must be a valid date.",
-                400,
-            )
-        filters.append((operator, date_field, value))
-
-    resource_filters = {
-        "driver_id": {
-            "trips": "driver_id",
-            "assignments": "driver_id",
-        },
-        "vehicle_id": {
-            "fuel": "vehicle_id",
-            "maintenance": "vehicle_id",
-            "assignments": "vehicle_id",
-        },
-    }
-    for argument, resources in resource_filters.items():
-        column = resources.get(resource)
-        value = request.args.get(argument, "").strip()
-        if not value:
-            continue
-        if column is None:
-            return _json_error(
-                f"{argument.replace('_', ' ').capitalize()} is not supported for {resource}.",
-                400,
-            )
-        try:
-            parsed_value = int(value)
-        except ValueError:
-            return _json_error(
-                f"{argument.replace('_', ' ').capitalize()} must be a whole number.",
-                400,
-            )
-        if parsed_value < 1:
-            return _json_error(
-                f"{argument.replace('_', ' ').capitalize()} must be positive.",
-                400,
-            )
-        filters.append((column, parsed_value))
-
-    if resource == "trips":
-        for field in ("origin", "destination"):
-            value = request.args.get(field, "").strip()
-            if value:
-                filters.append((field, value))
-    elif resource == "fuel":
-        value = request.args.get("trip_id", "").strip()
-        if value:
-            try:
-                trip_id = int(value)
-            except ValueError:
-                return _json_error("Trip ID must be a whole number.", 400)
-            if trip_id < 1:
-                return _json_error("Trip ID must be positive.", 400)
-            filters.append(("trip_id", trip_id))
-
-    user_id = str((g.current_user or {}).get("id") or session.get("user_id") or "")
-    try:
-        rows, total = get_manager().list_resource_page(
-            resource=resource,
-            page=page,
-            page_size=page_size,
-            user_id=user_id if _is_dispatcher() else None,
-            search=search,
-            filters=filters,
-        )
-    except FleetManagementError as exc:
-        logger.warning("Could not load paginated %s data: %s", resource, exc)
-        return _json_error(str(exc), 503)
-
-    if resource == "trips":
-        _add_document_links(rows, "manifest_object_path", "manifest_image_url", "trip_manifest_image")
-        _add_document_links(rows, "fuel_invoice_object_path", "fuel_invoice_image_url", "trip_fuel_invoice_image")
-    elif resource == "fuel":
-        _add_document_links(rows, "invoice_object_path", "invoice_image_url", "fuel_invoice_image")
-
-    payload: dict[str, Any] = {
-        "data": rows,
-        "pagination": {
-            "page": page,
-            "page_size": page_size,
-            "total": total,
-            "pages": (total + page_size - 1) // page_size,
-        },
-    }
-    if resource == "trips":
-        fuel_rows = [
-            row.pop("related_fuel")
-            for row in rows
-            if row.get("related_fuel") is not None
-        ]
-        _add_document_links(
-            fuel_rows, "invoice_object_path", "invoice_image_url", "fuel_invoice_image"
-        )
-        payload["fuel_logs"] = fuel_rows
-    return jsonify(payload)
 
 
 def _dispatch_timestamp(value: Any, field_name: str) -> str:
