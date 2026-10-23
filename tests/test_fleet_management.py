@@ -17,6 +17,98 @@ from payroll import calculate_driver_payroll, period_date, trip_rate
 from werkzeug.exceptions import MethodNotAllowed
 
 
+class TripDeletionTests(unittest.TestCase):
+    def test_admin_can_delete_historical_trip_and_dispatcher_cannot(self):
+        delete_trip = Mock()
+        manager = SimpleNamespace(delete_trip=delete_trip)
+        with patch.dict(
+            web_app.app.config,
+            {"TESTING": True, "TEST_AUTH_BYPASS": True},
+        ), patch.object(web_app, "get_manager", return_value=manager):
+            client = web_app.app.test_client()
+            with client.session_transaction() as browser_session:
+                browser_session["csrf_token"] = "test-csrf-token"
+
+            response = client.delete(
+                "/api/trips/42",
+                headers={"X-CSRF-Token": "test-csrf-token"},
+            )
+
+            self.assertEqual(response.status_code, 200)
+            self.assertEqual(response.json["message"], "Record deleted")
+            delete_trip.assert_called_once_with(42)
+
+            with patch.object(web_app, "_is_dispatcher", return_value=True):
+                dispatcher_response = client.delete(
+                    "/api/trips/42",
+                    headers={"X-CSRF-Token": "test-csrf-token"},
+                )
+
+            self.assertEqual(dispatcher_response.status_code, 403)
+            delete_trip.assert_called_once_with(42)
+
+    def test_dispatch_linked_trip_delete_returns_clear_integrity_message(self):
+        manager = FleetManager(client=Mock())
+        with patch.object(
+            manager,
+            "_delete",
+            side_effect=FleetManagementError(
+                "Supabase request failed: {'code': '23503', "
+                "'constraint': 'dispatch_movements_canonical_trip_id_fkey'}"
+            ),
+        ):
+            with self.assertRaisesRegex(
+                FleetManagementError,
+                "linked to a completed dispatch movement",
+            ):
+                manager.delete_trip(233)
+
+    def test_dispatch_linked_trip_delete_api_returns_actionable_error(self):
+        manager = SimpleNamespace(
+            delete_trip=Mock(
+                side_effect=FleetManagementError(
+                    "This trip is linked to a completed dispatch movement and "
+                    "cannot be deleted. The movement history must be preserved."
+                )
+            )
+        )
+        with patch.dict(
+            web_app.app.config,
+            {"TESTING": True, "TEST_AUTH_BYPASS": True},
+        ), patch.object(web_app, "get_manager", return_value=manager):
+            client = web_app.app.test_client()
+            with client.session_transaction() as browser_session:
+                browser_session["csrf_token"] = "test-csrf-token"
+            response = client.delete(
+                "/api/trips/233",
+                headers={"X-CSRF-Token": "test-csrf-token"},
+            )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertIn(
+            "linked to a completed dispatch movement",
+            response.json["error"],
+        )
+
+    def test_admin_historical_trip_rows_include_delete_action(self):
+        app_js_path = os.path.join(
+            os.path.dirname(__file__), "..", "static", "app.js"
+        )
+        with open(app_js_path, encoding="utf-8") as app_js_file:
+            app_js = app_js_file.read()
+
+        legacy_rows = app_js.split("const legacyRows = isAdmin", 1)[1].split(
+            "return `", 1
+        )[0]
+        self.assertIn(
+            "tableMarkup(state.data.trips || [], RESOURCE_CONFIG.trips.columns, "
+            "RESOURCE_CONFIG.trips.api",
+            legacy_rows,
+        )
+        self.assertIn('rowAction: "trip-details"', legacy_rows)
+        self.assertIn('data-action="delete"', app_js)
+
+
 class PayrollCalculationTests(unittest.TestCase):
     def test_manifest_fields_are_extracted_from_reference_layout(self):
         text = """
@@ -256,7 +348,7 @@ class PayrollCalculationTests(unittest.TestCase):
             app_js,
         )
         self.assertIn('if (page === "trips") return renderDispatchWorkflow();', app_js)
-        self.assertIn('app.js?v=location-dispatch-7', index_html)
+        self.assertIn('app.js?v=location-dispatch-9', index_html)
         self.assertIn("window.setTimeout(() => controller.abort(), 20000)", app_js)
         self.assertIn("The dispatch service did not respond within 20 seconds.", app_js)
         render_workflow = app_js.split("function renderDispatchWorkflow() {", 1)[1].split(
@@ -272,6 +364,32 @@ class PayrollCalculationTests(unittest.TestCase):
                 "function validateDispatchPalletQuantity", 1
             )[0],
         )
+
+    def test_dispatcher_dashboard_uses_limited_authorized_queues_and_masks_ism(self):
+        app_js_path = os.path.join(
+            os.path.dirname(__file__), "..", "static", "app.js"
+        )
+        with open(app_js_path, encoding="utf-8") as app_js_file:
+            app_js = app_js_file.read()
+
+        dashboard_loader = app_js.split(
+            "async function loadDispatcherDashboard", 1
+        )[1].split("function renderDispatcherDashboard", 1)[0]
+        movement_card = app_js.split(
+            "function dispatchMovementCard", 1
+        )[1].split("function dispatchDepartureForm", 1)[0]
+        self.assertIn(
+            "/api/dispatch/movements?queue=arrivals&page=1&page_size=5",
+            dashboard_loader,
+        )
+        self.assertIn(
+            "/api/dispatch/movements?queue=departures&page=1&page_size=5",
+            dashboard_loader,
+        )
+        self.assertIn('api("/api/dispatch/locations"', dashboard_loader)
+        self.assertIn("canViewIsm && movement.ism_no", movement_card)
+        self.assertIn("movement.arrival_verified_at", movement_card)
+        self.assertIn("Record Arrival for Review", movement_card)
 
     def test_dispatcher_code_migration_assigns_matching_dav_location(self):
         migration_path = os.path.join(
