@@ -65,6 +65,10 @@ is recorded for each administrator. Admins can filter, open, and mark their
 notifications as read. The notification center refreshes unread counts every
 12 seconds while the app is open.
 
+Run [`supabase_dispatch_completed_trip_deletion_migration.sql`](./supabase_dispatch_completed_trip_deletion_migration.sql)
+after the location-dispatch, payroll, and revenue migrations to allow
+administrators to delete completed dispatch trips.
+
 ## Directional truck route rates
 
 After the base schema, trips, existing truck-rate, and payroll migrations are installed,
@@ -291,11 +295,11 @@ and [`static/app.js`](./static/app.js), plus the sign-in screen in
 [`static/login.html`](./static/login.html). The JavaScript client uses the
 same-origin `/api/` endpoints for data.
 
-Administrators can delete existing trips from the **Completed Trips** view in
-the historical trip records table. Deletion requires confirmation and can be
-rejected when the trip is still referenced by protected financial records or a
-completed dispatch movement. Dispatch-linked trips are retained to preserve
-their movement history.
+Administrators can delete completed dispatch movements from the **Completed
+Trips** queue. Deletion requires confirmation and removes the linked trip,
+dispatch audit history, and uploaded documents. It is rejected when protected
+financial records such as payroll still reference the trip. Unlinked historical
+trips can be deleted from the historical trip records table.
 Dispatchers cannot delete trips.
 
 ### Dispatcher dashboard
@@ -305,10 +309,31 @@ shows a small preview of authorized arrival and outbound queues, and provides
 shortcuts to record departures or open pending arrivals. Queue counts and
 location names come from the authenticated dispatch endpoints; the dashboard
 requests only the first five movements per queue and leaves full filtering and
-pagination to the Trips workflow. ISM values remain hidden until the existing
+pagination to the Movement Queues page under Dispatch. ISM values remain hidden until the existing
 server-side verification flow permits them. The current movement model starts
 when a departure is recorded, so the dashboard labels those records as open
 outbound movements rather than presenting a separate pending-departure status.
+
+### Dispatcher load catalog
+
+The Add Trip departure form uses `public.load_catalog` for selectable trailer
+contents. Import the beverage list with `supabase_load_catalog_import.sql`, then
+run `supabase_dispatch_load_catalog_migration.sql` after the location dispatch
+migration. The migration adds catalog and movement RPCs so selected products,
+pack sizes, and per-product pallet quantities are saved atomically with each
+movement and shown in the movement queues. Add Trip presents departure entry as
+a seven-step wizard; its searchable, section-filtered product cards support
+multiple catalog items and count each selected product in pallets. The overall
+trailer pallet quantity remains a separate field. `FULLS` movements require at
+least one catalog product, while `EMPTIES` movements do not.
+If the migration was run previously, run it again after updating the app so the
+database RPC accepts and stores per-product `pallet_quantity` values.
+In dispatcher departures, fuel allocation is recorded in liters and actual fuel
+expense is recorded in pesos. When the movement is finalized, the allocation is
+saved as fuel-log quantity rather than as a currency allocation.
+After updating this behavior on an existing Supabase project, rerun
+`supabase_location_dispatch_migration.sql` so the finalization RPC saves the
+allocated liters to `fuel_logs.quantity`.
 
 ### Tailwind CSS assets
 
